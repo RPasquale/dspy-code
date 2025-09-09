@@ -1,0 +1,26 @@
+{"query": "find references to the", "workspace": ".", "logs": "logs", "targets": ["the"]}
+{"query": "find references to self", "workspace": ".", "logs": "logs", "targets": ["self"]}
+{"query": "find references to u20", "workspace": ".", "logs": "logs", "targets": ["u20"]}
+{"query": "find references to none", "workspace": ".", "logs": "logs", "targets": ["none"]}
+{"query": "find references to sha256", "workspace": ".", "logs": "logs", "targets": ["sha256"]}
+{"query": "find references to for", "workspace": ".", "logs": "logs", "targets": ["for"]}
+{"query": "find references to str", "workspace": ".", "logs": "logs", "targets": ["str"]}
+{"query": "find references to _anon", "workspace": ".", "logs": "logs", "targets": ["_anon"]}
+{"query": "find references to return", "workspace": ".", "logs": "logs", "targets": ["return"]}
+{"query": "find references to not", "workspace": ".", "logs": "logs", "targets": ["not"]}
+{"query": "extract symbol unified_diff_from_texts from dspy_agent/diffutil.py", "workspace": ".", "logs": "logs", "targets": ["unified_diff_from_texts"]}
+{"query": "extract symbol unified_diff_file_vs_text from dspy_agent/diffutil.py", "workspace": ".", "logs": "logs", "targets": ["unified_diff_file_vs_text"]}
+{"query": "extract symbol _list_files from dspy_agent/code_snapshot.py", "workspace": ".", "logs": "logs", "targets": ["_list_files"]}
+{"query": "extract symbol _read_head_tail from dspy_agent/code_snapshot.py", "workspace": ".", "logs": "logs", "targets": ["_read_head_tail"]}
+{"query": "extract symbol _py_outline from dspy_agent/code_snapshot.py", "workspace": ".", "logs": "logs", "targets": ["_py_outline"]}
+{"query": "extract symbol build_code_snapshot from dspy_agent/code_snapshot.py", "workspace": ".", "logs": "logs", "targets": ["build_code_snapshot"]}
+{"query": "extract symbol EmbIndexItem from dspy_agent/embeddings_index.py", "workspace": ".", "logs": "logs", "targets": ["EmbIndexItem"]}
+{"query": "extract symbol _cosine from dspy_agent/embeddings_index.py", "workspace": ".", "logs": "logs", "targets": ["_cosine"]}
+{"query": "extract symbol _embed_texts from dspy_agent/embeddings_index.py", "workspace": ".", "logs": "logs", "targets": ["_embed_texts"]}
+{"query": "extract symbol build_emb_index from dspy_agent/embeddings_index.py", "workspace": ".", "logs": "logs", "targets": ["build_emb_index"]}
+{"query": "investigate in logs: timeout", "workspace": ".", "logs": "logs", "targets": ["timeout"]}
+{"query": "investigate in logs: after", "workspace": ".", "logs": "logs", "targets": ["after"]}
+{"query": "investigate in logs: error", "workspace": ".", "logs": "logs", "targets": ["error"]}
+{"query": "investigate in logs: failed", "workspace": ".", "logs": "logs", "targets": ["failed"]}
+{"query": "investigate in logs: timeouterror", "workspace": ".", "logs": "logs", "targets": ["timeouterror"]}
+{"query": "summarize the codebase architecture", "workspace": ".", "logs": "logs", "targets": ["the", "self", "u20", "none", "sha256"]}

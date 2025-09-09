@@ -1,0 +1,192 @@
+Metadata-Version: 2.4
+Name: dspy-coder
+Version: 0.1.0
+Summary: Simple local coding agent using DSPy that reads logs and proposes plans/commands.
+Author: Your Name
+License: Proprietary
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: dspy-ai>=2.4.9
+Requires-Dist: typer>=0.12.3
+Requires-Dist: rich>=13.7.1
+Requires-Dist: pydantic>=2.7.4
+Requires-Dist: sentence-transformers>=2.7.0
+Requires-Dist: transformers>=4.51.0
+
+DSFy Coder — Simple Local Coding Agent
+
+Overview
+
+- Reads your local logs and builds a concise context.
+- Uses DSPy with a pluggable LLM backend to propose a plan and suggested commands for your task.
+- CLI via `dspy-agent` using uv-managed environment.
+
+Quick Start
+
+1) Ensure Python 3.10+ and uv are installed.
+2) Configure an LLM backend (choose one):
+   - Ollama (local, recommended): install Ollama and pull a model. For DeepSeek Coder 1.3B: `ollama pull deepseek-coder:1.3b`. Run with `--ollama` and `--model deepseek-coder:1.3b`. You may also set `USE_OLLAMA=true`, `OLLAMA_MODEL=deepseek-coder:1.3b`.
+   - OpenAI-compatible server: set `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL` (LM Studio, etc.). Also set `MODEL_NAME`.
+   - Offline preview: set `LOCAL_MODE=true` to run without an LLM (heuristics only).
+3) Install deps:
+   - `uv sync`
+
+Usage
+
+- Show context from logs:
+  - `uv run dspy-agent context --workspace /path/to/repo --logs ./logs --ollama --model deepseek-coder:1.3b`
+
+- Propose plan and commands for a task using logs as context:
+  - `uv run dspy-agent run "fix failing tests" --workspace /path/to/repo --logs ./logs --ollama --model deepseek-coder:1.3b`
+
+Code Context
+
+- Summarize a file or directory:
+  - `dspy-coder codectx --path src/ --workspace /path/to/repo --ollama --model deepseek-coder:1.3b`
+
+Semantic Index
+
+- Build index:
+  - `dspy-coder index --workspace /path/to/repo --smart`
+- Search:
+  - `dspy-coder esearch "http client retry" --workspace /path/to/repo --k 5 --context 4`
+
+Embeddings (optional)
+
+- Option A: DSPy Embeddings provider (e.g., `openai/text-embedding-3-small`).
+  - Build index: `dspy-coder emb-index --workspace /path/to/repo --model openai/text-embedding-3-small --api-key $OPENAI_API_KEY`
+  - Search: `dspy-coder emb-search "retry logic" --workspace /path/to/repo --model openai/text-embedding-3-small --api-key $OPENAI_API_KEY`
+
+- Option B: Local HuggingFace (recommended for Qwen 0.6B)
+  - Install: `uv sync` (adds sentence-transformers>=2.7.0, transformers>=4.51.0)
+  - Use Qwen/Qwen3-Embedding-0.6B locally:
+    - Build index:
+      - `dspy-coder emb-index --workspace /path/to/repo --hf --model Qwen/Qwen3-Embedding-0.6B --device auto --flash`
+    - Search:
+      - `dspy-coder emb-search "retry logic" --workspace /path/to/repo --hf --model Qwen/Qwen3-Embedding-0.6B --device auto --flash`
+  - Notes:
+    - `--device auto` will try GPU if available; use `--device cpu` to force CPU.
+    - `--flash` enables flash_attention_2 when supported (GPU recommended).
+
+Interactive Session
+
+- Start a REPL to pick workspace/logs and run tasks:
+  - `uv run dspy-agent start --workspace /path/to/repo --ollama --model deepseek-coder:1.3b`
+- Inside the REPL:
+  - You can type natural instructions; the agent will choose the best tools and arguments.
+  - `cd <PATH>`: change workspace
+  - `logs [PATH]`: show or set logs path
+  - `ctx`: show context and enhanced context
+  - `plan <TASK>`: propose plan and commands
+  - `ls [PATH]`: list files under current workspace
+  - `tree [PATH] [-d N] [--hidden]`: show directory tree (default depth 2)
+  - `grep <PATTERN> [-f] [-c N] [-g GLOB]* [-x GLOB]* [-F FILE]`
+  - `extract --file F [--symbol NAME | --re REGEX --before N --after N --nth K]`
+  - `codectx [PATH]`: summarize code snapshot
+  - `index`, `esearch <QUERY>`: build and search code index
+  - `emb-index`, `emb-search <QUERY>`: embedding-based index and search (if configured)
+  - `open <PATH>`: open a file in your editor / OS default
+    - Supports `open path/to/file.py:42:7` for common editors (`code`, `subl`, `nvim`, `vim`, `emacs`, `idea`)
+  - `patch <PATCHFILE>`: apply unified diff patch in workspace
+  - `diff <FILE>`: show unified diff between last extract buffer and a file
+  - `gstatus`, `gadd <PATHS...>`, `gcommit -m "message"`: basic git helpers
+  - `write <PATH>`: write last extracted segment to file
+  - `sg [-p PATTERN] [-l LANG] [-r RULE.yaml] [--json]`
+  - `watch [-n SECS] [-t LINES]`: tail and refresh key events
+  - `ollama on|off`, `model <NAME>`: set backend and model
+  - `exit`: quit
+
+Code Search
+
+- Grep-style search over a folder:
+  - `dspy-coder grep "def .*connect" --workspace /path/to/repo --glob "**/*.py" --context 2`
+- Extract from a file:
+  - Python symbol: `dspy-coder extract --file app/service.py --symbol connect`
+  - Regex context: `dspy-coder extract --file app/service.py --regex "timeout after" --before 2 --after 4`
+  - Save directly: add `--out snippets/connect.py`
+- ast-grep integration (if installed):
+  - `dspy-coder sg --pattern "function $A($B) { ... }" --lang js --root /path/to/repo`
+  - Install ast-grep: `brew install ast-grep` or
+    `curl -fsSL https://raw.githubusercontent.com/ast-grep/ast-grep/main/install.sh | bash`
+
+Watching Logs
+
+- One-off command:
+  - `dspy-coder watch --workspace /path/to/repo --interval 2 --tail 20`
+- From REPL:
+  - `watch -n 2 -t 20` (Ctrl-C to stop)
+
+Environment Variables
+
+- `MODEL_NAME` (default: `gpt-4o-mini`): The model name for OpenAI-compatible backends (also used if you do not set Ollama variables).
+- `OPENAI_API_KEY`: API key for OpenAI or compatible server.
+- `OPENAI_BASE_URL`: Base URL for OpenAI-compatible servers (OpenAI/LM Studio, etc.). Not required for Ollama.
+- `LOCAL_MODE` (true/false): If true, skip LLM calls and use heuristics.
+- `USE_OLLAMA` (true/false): Force Ollama mode without passing `--ollama`.
+- `OLLAMA_MODEL`: Default model for Ollama mode (e.g. `deepseek-coder:1.3b`).
+- `OLLAMA_API_KEY`: Optional; any string is accepted. Defaults to `ollama` when needed.
+
+Project Layout
+
+- `dspy_agent/cli.py` — Typer CLI.
+- `dspy_agent/log_reader.py` — Read and extract key events from logs.
+- `dspy_agent/skills/context_builder.py` — Build enhanced context (heuristic or DSPy-backed).
+- `dspy_agent/skills/task_agent.py` — DSPy module to propose a plan and commands.
+- `dspy_agent/config.py`, `dspy_agent/llm.py` — Configuration and LLM wiring.
+
+Notes
+
+- For fully local inference, point `OPENAI_BASE_URL` to a local OpenAI-compatible server (e.g., LM Studio) and provide a model via `MODEL_NAME`.
+- Ollama exposes an OpenAI-compatible API on `http://localhost:11434/v1`. Use `--ollama` or set `USE_OLLAMA=true` and `OPENAI_BASE_URL` accordingly.
+ - You can also launch via `dspy-coder` or `dspy_coder` commands (aliases of `dspy-agent`).
+
+DeepSeek Coder 1.3B via Ollama
+
+- Pull the model:
+  - `ollama pull deepseek-coder:1.3b`
+- Quick test:
+  - `ollama run deepseek-coder:1.3b "Write a Python function to sum a list."`
+- Run the agent with DeepSeek Coder:
+  - `uv run dspy-agent context --logs ./logs --ollama --model deepseek-coder:1.3b`
+  - `uv run dspy-agent run "investigate test flakiness" --logs ./logs --ollama --model deepseek-coder:1.3b`
+
+Alternate quick connect (DSPy snippet):
+
+```python
+import dspy
+lm = dspy.LM("ollama_chat/deepseek-coder:1.3b", api_base="http://localhost:11434", api_key="")
+dspy.configure(lm=lm)
+```
+Training With GEPA
+
+- Prepare a JSONL dataset for the module you want to optimize.
+- Supported modules and example schema (one JSON object per line):
+  - context:
+    - {"task": str, "logs_preview": str, "context_keywords": [str], "key_points_keywords": [str]}
+  - task:
+    - {"task": str, "context": str, "plan_keywords": [str], "commands_keywords": [str]}
+  - code:
+    - {"snapshot": str, "ask": str, "keywords": [str]}
+
+- Run GEPA optimization (uses your LLM for reflection):
+  - `dspy-coder gepa-train --module task --train-jsonl data/task_train.jsonl --auto medium --ollama --model deepseek-coder:1.3b --log-dir .gepa_logs --track-stats`
+  - Save best candidate program:
+    - `dspy-coder gepa-train --module context --train-jsonl data/context_train.jsonl --auto light --save-best prompts/context_best.json`
+
+- Orchestrate tool-selection with GEPA (agent decides which command to run):
+  - JSONL schema per line: `{ "query": str, "workspace": str, "logs": str|null, "targets": [str] }`
+  - `dspy-coder gepa-orchestrator --train-jsonl data/orch_train.jsonl --auto light --ollama --model deepseek-coder:1.3b --log-dir .gepa_orch`
+  - The metric executes safe evaluations of chosen actions (grep/extract/context/codectx/index/esearch/plan) and scores success; GEPA evolves the orchestration prompts using this feedback.
+
+- Notes:
+  - GEPA benefits from a strong reflection model; local small models work but may improve slowly.
+  - The metric here scores keyword coverage and returns textual feedback to guide evolution.
+  - Set `--auto light|medium|heavy` or use `--max-full-evals`/`--max-metric-calls` for budget control.
+- Initialize on a repo (auto-dataset + optional light training):
+  - `dspy-coder init --workspace /path/to/repo --ollama --model deepseek-coder:1.3b --train --budget light`
+  - Datasets written to `<repo>/.dspy_data`: `orch_train.jsonl`, `context_train.jsonl`, `code_train.jsonl`, `task_train.jsonl`.
+  - Then you can run `gepa-orchestrator` or `gepa-train` explicitly for deeper training later.
+
+- Auto-bootstrap:
+  - `dspy-coder init --workspace /path/to/repo --train --budget light`
+  - Creates datasets and runs quick GEPA passes for orchestrator/context/code/task.

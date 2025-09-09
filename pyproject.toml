@@ -1,0 +1,31 @@
+[project]
+name = "dspy-coder"
+version = "0.1.0"
+description = "Simple local coding agent using DSPy that reads logs and proposes plans/commands."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Your Name" }
+]
+dependencies = [
+    "dspy-ai>=2.4.9",
+    "typer>=0.12.3",
+    "rich>=13.7.1",
+    "pydantic>=2.7.4",
+    "sentence-transformers>=2.7.0",
+    "transformers>=4.51.0",
+]
+
+[project.scripts]
+dspy-agent = "dspy_agent.cli:app"
+dspy-coder = "dspy_agent.cli:app"
+dspy_coder = "dspy_agent.cli:app"
+dspy-code = "dspy_agent.cli:code_entry"
+
+[tool.uv]
+dev-dependencies = []
+package = true
+
+[tool.setuptools]
+packages = ["dspy_agent"]
