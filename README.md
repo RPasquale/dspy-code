@@ -18,12 +18,15 @@ Super Simple Setup (Lightweight)
   - `dspy-code lightweight_init --workspace $(pwd) --logs ./logs --db auto`
   - Uses the current directory as workspace; creates `docker/lightweight/`.
 - Build and start:
-  - `docker compose -f docker/lightweight/docker-compose.yml build`
+  - `docker compose -f docker/lightweight/docker-compose.yml build --no-cache`
   - `docker compose -f docker/lightweight/docker-compose.yml up -d`
 - Verify it’s running:
-  - Status: open `http://localhost:8765/health`
-  - Deployment info: `http://localhost:8765/deploy`
-  - Latest container outputs: `http://localhost:8765/containers`
+  - Status page: `http://127.0.0.1:8765`
+  - Health: `http://127.0.0.1:8765/health`
+  - Deployment info: `http://127.0.0.1:8765/deploy`
+  - Latest container outputs: `http://127.0.0.1:8765/containers`
+- Open the interactive CLI inside the agent container:
+  - `docker compose -f docker/lightweight/docker-compose.yml exec -it dspy-agent dspy-agent start --workspace /workspace`
 - Rebuild after code changes (fast loop):
   - `dspy-code lightweight_build`
   - or `./scripts/lightweight_build.sh`
@@ -32,9 +35,13 @@ Optional, recommended
 
 - Enable Kafka (local):
   - Kafka + Zookeeper + Spark are included in lightweight by default.
-  - Enable publishing: `export KAFKA_BOOTSTRAP_SERVERS=localhost:9092`
+  - Host bootstrap: `localhost:29092` (inside containers use `kafka:9092`).
+  - Enable publishing (host tools): `export KAFKA_BOOTSTRAP_SERVERS=localhost:29092`
   - Install client: `uv pip install confluent-kafka`
-  - Create topics: `dspy-code stream_topics` (or `dspy-code deploy_topics --bootstrap localhost:9092`)
+  - Create topics:
+    - Print creation commands: `dspy-agent stream-topics`
+    - Create inside container: `docker compose -f docker/lightweight/docker-compose.yml exec dspy-agent dspy-agent stream-topics-create --bootstrap kafka:9092`
+    - Create from host: `dspy-agent stream-topics-create --bootstrap localhost:29092`
 - Enable RedDB persistence:
   - `export REDDB_URL=http://localhost:8080` (and optionally `REDDB_NAMESPACE`, `REDDB_TOKEN`)
 - Inspect latest agent outputs:
@@ -53,10 +60,15 @@ Streaming Engine (Kafka + Spark)
   - Local tailer publishes `logs.raw.<container>` to Kafka (via LocalBus → Kafka).
   - Spark Structured Streaming job consumes `logs.raw.app`, aggregates error windows, and publishes `logs.ctx.app`.
   - You can run a Kafka worker to process `logs.ctx.<container>` and emit results to `agent.results.<container>`:
-    - `dspy-code worker --topic app --bootstrap localhost:9092`
+    - Inside container: `docker compose -f docker/lightweight/docker-compose.yml exec dspy-agent dspy-agent worker --topic app --bootstrap kafka:9092`
+    - From host (not in Docker): `dspy-agent worker --topic app --bootstrap localhost:29092`
 - Compose services:
   - `kafka`, `zookeeper`, and `spark` services are included and start with the stack.
-  - Spark runs the generated job `scripts/streaming/spark_logs.py` with a checkpoint under `/workspace/.dspy_checkpoints/spark_logs`.
+  - Kafka is reachable at `kafka:9092` from containers and `localhost:29092` from the host.
+  - Spark runs the job `scripts/streaming/spark_logs.py` with a checkpoint under `/workspace/.dspy_checkpoints/spark_logs`.
+  - Smoke test:
+    - Produce: `docker exec -i lightweight-kafka-1 /opt/bitnami/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic logs.raw.backend <<< "hello from backend"`
+    - Watch: `docker compose -f docker/lightweight/docker-compose.yml logs -f spark`
 - Generate or customize Spark job:
   - `dspy-code spark-script --out scripts/streaming/spark_logs.py`
   - The default job filters for error keywords and emits context windows to Kafka.
@@ -225,10 +237,11 @@ Lightweight Containers (Local Dev)
   - This writes:
     - `docker/lightweight/Dockerfile`
     - `docker/lightweight/docker-compose.yml`
-  - Next steps (printed by the CLI):
-    - `docker compose -f docker/lightweight/docker-compose.yml build`
+  - Next steps:
+    - `docker compose -f docker/lightweight/docker-compose.yml build --no-cache`
     - `docker compose -f docker/lightweight/docker-compose.yml up -d`
     - `docker compose -f docker/lightweight/docker-compose.yml logs -f dspy-agent`
+    - Interactive CLI: `docker compose -f docker/lightweight/docker-compose.yml exec -it dspy-agent dspy-agent start --workspace /workspace`
 - Helpful commands:
   - `dspy-agent lightweight_up` (builds and starts; prints manual commands if Docker CLI is unavailable)
   - `dspy-agent lightweight_status` (equivalent of `docker compose ps`)
@@ -241,8 +254,10 @@ Lightweight Containers (Local Dev)
   - Honors env vars (set them in your shell before `docker compose up`, or edit the compose env section):
     - `DB_BACKEND`, `REDDB_URL`, `REDDB_NAMESPACE`, `REDDB_TOKEN`
     - `LOCAL_MODE`, `MODEL_NAME`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OLLAMA_MODEL`
-    - `KAFKA_BOOTSTRAP_SERVERS` (enable Kafka publishing for deployment logs and LocalBus topics)
+    - `KAFKA_BOOTSTRAP_SERVERS` (inside containers defaults to `kafka:9092`; from host use `localhost:29092`)
   - Status server: `http://localhost:8765` (routes: `/health`, `/deploy`, `/containers`)
+  - Stop & clean up:
+    - `docker compose -f docker/lightweight/docker-compose.yml down -v`
 - Validation & robustness:
   - CLI validates paths and provides clear next steps; it never crashes the process if Docker is missing — it prints the exact commands to run manually.
   - LocalBus persistence is best-effort; failures won’t stop the agent.
@@ -266,18 +281,16 @@ Kafka Topics (optional)
   - `deploy.logs.lightweight` — mirrors the RedDB deploy log stream
   - All LocalBus topics (e.g., `logs.raw.*`, `logs.ctx.*`, `agent.results.*`)
 - To create topics, use your Kafka tooling or leverage `dspy-agent stream_topics` to print creation commands for standard topics.
-  - For deployment-only topics: `dspy-agent deploy_topics [--bootstrap localhost:9092]`
+  - For deployment-only topics: `dspy-agent deploy_topics [--bootstrap localhost:29092]`
   - The lightweight Dockerfile tries to install `confluent-kafka`; if it fails, the agent still runs and simply disables Kafka publishing.
 - Install Kafka client support:
   - `uv pip install confluent-kafka`
   - Or system install via your package manager; then `pip install confluent-kafka`.
 
-Optional Local Kafka via Compose Profiles
+Kafka Connectivity (host vs. container)
 
-- The generated `docker-compose.yml` includes a `kafka` profile with Zookeeper and Kafka services.
-- Start with profile enabled:
-  - `docker compose -f docker/lightweight/docker-compose.yml --profile kafka up -d`
-- Then set `KAFKA_BOOTSTRAP_SERVERS=localhost:9092` and rebuild or restart the agent service.
+- Inside containers: use `kafka:9092`.
+- From the host: use `localhost:29092`.
 
 Status HTTP API
 
