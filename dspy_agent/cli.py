@@ -3595,38 +3595,3 @@ def sg(
 
 if __name__ == "__main__":
     app()
-  dspy-worker:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
-      dspy-agent worker --topic app --bootstrap kafka:9092
-    working_dir: /app
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-
-  dspy-router:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      python - <<'PY'
-from dspy_agent.router_worker import RouterWorker
-RouterWorker('kafka:9092').run()
-PY
-    working_dir: /app
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s

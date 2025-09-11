@@ -8,7 +8,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.so
-
+*.pyc
 # Virtual environments
 .venv/
 venv/

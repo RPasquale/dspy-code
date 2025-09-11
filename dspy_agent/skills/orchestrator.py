@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import dspy
+from types import SimpleNamespace
 
 
 TOOLS = [
     "context", "plan", "grep", "extract", "tree", "ls",
-    "codectx", "index", "esearch", "emb-index", "emb-search", "knowledge", "vretr", "intel",
+    "codectx", "index", "esearch", "emb_index", "emb_search", "knowledge", "vretr", "intel",
     "open", "watch", "sg", "patch", "diff", "git_status",
     "git_add", "git_commit"
 ]
@@ -14,7 +15,7 @@ TOOLS = [
 class OrchestrateToolSig(dspy.Signature):
     """Choose the best CLI tool and arguments for the user's intent.
 
-    Tools: context, plan, grep, extract, tree, ls, codectx, index, esearch, emb-index, emb-search, open, watch, sg, patch, diff, git_status, git_add, git_commit
+    Tools: context, plan, grep, extract, tree, ls, codectx, index, esearch, emb_index, emb_search, knowledge, vretr, intel, open, watch, sg, patch, diff, git_status, git_add, git_commit
     Return JSON in args_json with the arguments for that tool.
     Keep choices safe and non-destructive unless explicitly requested by the user.
     """
@@ -34,4 +35,19 @@ class Orchestrator(dspy.Module):
         self.predict = dspy.ChainOfThought(OrchestrateToolSig) if use_cot else dspy.Predict(OrchestrateToolSig)
 
     def forward(self, query: str, state: str):
-        return self.predict(query=query, state=state)
+        # Predict tool selection with error handling and validation
+        try:
+            pred = self.predict(query=query, state=state)
+        except Exception as e:
+            # Sensible default fallback when routing fails
+            return SimpleNamespace(
+                tool="plan",
+                args_json="{}",
+                rationale=f"Fallback to 'plan' due to prediction error: {e}"
+            )
+
+        tool = (getattr(pred, "tool", None) or "").strip()
+        if tool not in TOOLS:
+            raise ValueError(f"Predicted tool '{tool}' is not in supported TOOLS: {', '.join(TOOLS)}")
+
+        return pred
