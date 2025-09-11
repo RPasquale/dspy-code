@@ -907,7 +907,7 @@ services:
     entrypoint: ["/bin/bash", "-lc"]
     # Wait for services before launching agent
     command: >-
-      for i in {1..60}; do
+      for i in {{1..60}}; do
         curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;
         echo "waiting for ollama/kafka..."; sleep 2;
       done;
@@ -1015,7 +1015,7 @@ services:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-lc"]
     command: >-
-      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
       dspy-agent worker --topic app --bootstrap kafka:9092
     working_dir: /app
     healthcheck:
@@ -1032,7 +1032,7 @@ services:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-lc"]
     command: >-
-      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
       dspy-agent worker --topic backend --bootstrap kafka:9092
     working_dir: /app
     healthcheck:
@@ -1049,7 +1049,7 @@ services:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-lc"]
     command: >-
-      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
       dspy-agent worker --topic frontend --bootstrap kafka:9092
     working_dir: /app
   dspy-code-watch:
@@ -3602,7 +3602,7 @@ if __name__ == "__main__":
         condition: service_healthy
     entrypoint: ["/bin/bash", "-lc"]
     command: >-
-      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
       dspy-agent worker --topic app --bootstrap kafka:9092
     working_dir: /app
     healthcheck:
