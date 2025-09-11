@@ -51,6 +51,18 @@ from .embeddings_index import (
     embed_query,
 )
 from .diffutil import unified_diff_file_vs_text
+from .streaming_config import (
+    StreamConfig,
+    load_config as load_stream_cfg,
+    save_config as save_stream_cfg,
+    DEFAULT_CONFIG_PATH as STREAM_CFG_PATH,
+    render_kafka_topic_commands,
+)
+from .streaming_runtime import start_local_stack, autodiscover_logs
+from .kafka_log import get_kafka_logger
+from .deploy import DeploymentLogger
+from .status_http import start_status_server
+from .streaming_kafka import WorkerLoop, KafkaParams
 import threading
 import json as _json
 
@@ -65,6 +77,7 @@ CYBER_THEME = Theme({
 })
 app = typer.Typer(add_completion=False, help="DSPy-based local coding agent")
 console = Console(theme=CYBER_THEME)
+LIGHTWEIGHT_DIR = Path('docker/lightweight')
 
 
 def _print_header(title: str):
@@ -80,7 +93,7 @@ def _banner_text() -> str:
         "██║  ██║╚════██║██╔═══╝   ╚██╔╝     ██║     ██║  ██║██║  ██║ ██╔══╝   \n"
         "██████╔╝███████║██║        ██║      ╚██████╗██████╔╝██████╔╝ ███████╗\n"
         "╚═════╝ ╚══════╝╚═╝        ╚═╝       ╚═════╝╚═════╝ ╚═════╝  ╚══════╝\n"
-        "\n                 DSPY-CODE — Local Cyberpunk Coding Agent\n"
+        "\n                 DSPY-CODE — Trainable Coding Agent\n"
     )
 
 
@@ -386,6 +399,648 @@ def tail_metrics(
         except KeyboardInterrupt:
             console.print("[dim]Stopped tailing.[/dim]")
     console.print(Panel.fit("Flags: --file --interval --module --auto", title="usage", border_style="dim"))
+
+
+# Streaming + Infra helpers
+
+@app.command()
+def stream_init(
+    out: Path = typer.Option(STREAM_CFG_PATH, '--out', help="Path to write stream config JSON"),
+):
+    cfg = StreamConfig.default()
+    save_stream_cfg(cfg, out)
+    console.print(Panel.fit(f"Wrote streaming config to {out}", title="stream config", border_style="accent"))
+    console.print(Panel.fit("Edit containers, topics, and infra settings as needed.", title="next", border_style="dim"))
+
+
+@app.command()
+def stream_topics(
+    cfg_path: Path = typer.Option(STREAM_CFG_PATH, '--config', exists=True, help="Streaming config path"),
+):
+    cfg = load_stream_cfg(cfg_path)
+    cmds = render_kafka_topic_commands(cfg)
+    console.print(Panel.fit("\n".join(cmds), title="kafka topic create commands", border_style="accent"))
+    console.print(Panel.fit("Run these on your Kafka broker nodes or with docker-compose.", title="hint", border_style="dim"))
+
+
+@app.command()
+def deploy_topics(
+    cfg_path: Path = typer.Option(STREAM_CFG_PATH, '--config', exists=False, help="Streaming config path (optional)"),
+    bootstrap: Optional[str] = typer.Option(None, '--bootstrap', help="Kafka bootstrap servers (override)"),
+):
+    """Print topic creation commands for deployment-related topics (lightweight)."""
+    from .streaming_config import StreamConfig
+    cfg = None
+    if cfg_path.exists():
+        try:
+            cfg = load_stream_cfg(cfg_path)
+        except Exception:
+            cfg = None
+    cfg = cfg or StreamConfig.default()
+    # Filter deploy.* topics
+    deploy_topics = [t for t in cfg.kafka.topics if t.name.startswith('deploy.')]  # type: ignore[attr-defined]
+    bs = bootstrap or cfg.kafka.bootstrap_servers
+    lines = [
+        f"kafka-topics --bootstrap-server {bs} --create --topic {t.name} --partitions {t.partitions} --replication-factor {t.replication_factor}"
+        for t in deploy_topics
+    ]
+    console.print(Panel("\n".join(lines), title="deploy topics", border_style="accent"))
+    console.print(Panel.fit("Copy/paste to your Kafka environment.", title="hint", border_style="dim"))
+
+
+@app.command()
+def last(
+    container: str = typer.Option(..., '--container', help="Container name (e.g., backend, frontend, app)"),
+    what: str = typer.Option('all', '--what', help="Which field: summary|plan|key_points|ts|all"),
+):
+    """Show the latest summary/plan for a container from storage (RedDB if configured)."""
+    try:
+        from .db.factory import get_storage as _get_storage
+    except Exception as e:
+        console.print(Panel(str(e), title="storage unavailable", border_style="red")); raise typer.Exit(1)
+    st = _get_storage()
+    if st is None:
+        console.print(Panel("No storage configured. Set REDDB_URL or use --db reddb in 'up'.", title="storage", border_style="yellow"))
+        raise typer.Exit(1)
+    pref = f"last:{container}:"
+    try:
+        data = {
+            'summary': st.get(pref + 'summary'),
+            'key_points': st.get(pref + 'key_points'),
+            'plan': st.get(pref + 'plan'),
+            'ts': st.get(pref + 'ts'),
+        }
+    except Exception as e:
+        console.print(Panel(str(e), title="read failed", border_style="red")); raise typer.Exit(1)
+    if what != 'all':
+        val = data.get(what)
+        if val is None:
+            console.print(Panel("(no data)", title=f"{container}:{what}", border_style="yellow")); raise typer.Exit(0)
+        console.print(Panel(str(val), title=f"{container}:{what}", border_style="cyan")); raise typer.Exit(0)
+    console.print(Panel(str(data.get('summary') or '(no summary)'), title=f"{container}:summary", border_style="cyan"))
+    console.print(Panel(str(data.get('key_points') or '(no key points)'), title=f"{container}:key_points", border_style="green"))
+    console.print(Panel(str(data.get('plan') or '(no plan)'), title=f"{container}:plan", border_style="blue"))
+    console.print(Panel(str(data.get('ts') or '(no ts)'), title=f"{container}:ts", border_style="magenta"))
+
+
+@app.command()
+def spark_script(
+    out: Path = typer.Option(Path("scripts/streaming/spark_logs.py"), '--out', help="Path to write PySpark job"),
+):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    code = '''#!/usr/bin/env python3
+from pyspark.sql import SparkSession, functions as F
+import argparse
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--bootstrap', default='localhost:9092')
+    ap.add_argument('--raw-topic', required=True)
+    ap.add_argument('--ctx-topic', required=True)
+    ap.add_argument('--checkpoint', default='.dspy_checkpoints/spark_logs')
+    args = ap.parse_args()
+
+    spark = SparkSession.builder.appName('dspy-stream-logs').getOrCreate()
+    df = (spark
+          .readStream
+          .format('kafka')
+          .option('kafka.bootstrap.servers', args.bootstrap)
+          .option('subscribe', args.raw_topic)
+          .load())
+    # Basic transform: parse value, extract error keywords, keep recent lines
+    val = df.selectExpr("CAST(value AS STRING) AS line", "timestamp")
+    # Example heuristic: keep ERROR/WARN/Traceback windows
+    hits = val.where(F.lower(F.col('line')).rlike('error|warn|traceback|exception'))
+    agg = (hits.groupBy(F.window('timestamp', '30 seconds'))
+               .agg(F.collect_list('line').alias('lines'))
+               .select(F.to_json(F.struct(F.col('lines').alias('ctx'))).alias('value')))
+    q = (agg.writeStream
+             .format('kafka')
+             .option('kafka.bootstrap.servers', args.bootstrap)
+             .option('topic', args.ctx_topic)
+             .option('checkpointLocation', args.checkpoint)
+             .outputMode('update')
+             .start())
+    q.awaitTermination()
+
+if __name__ == '__main__':
+    main()
+'''
+    out.write_text(code)
+    console.print(Panel.fit(f"Wrote PySpark job to {out}", title="spark", border_style="accent"))
+    console.print(Panel.fit("Example: spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 scripts/streaming/spark_logs.py --raw-topic logs.raw.backend --ctx-topic logs.ctx.backend", title="run", border_style="dim"))
+
+
+@app.command()
+def k8s_render(
+    cfg_path: Path = typer.Option(STREAM_CFG_PATH, '--config', exists=True),
+    out_dir: Path = typer.Option(Path('deploy/k8s'), '--out')
+):
+    cfg = load_stream_cfg(cfg_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Minimal Deployment per container topic (worker)
+    for ct in cfg.containers:
+        name = f"dspy-worker-{ct.container}"
+        dep = {
+            'apiVersion': 'apps/v1',
+            'kind': 'Deployment',
+            'metadata': {'name': name, 'namespace': cfg.k8s.namespace},
+            'spec': {
+                'replicas': cfg.k8s.replicas,
+                'selector': {'matchLabels': {'app': name}},
+                'template': {
+                    'metadata': {'labels': {'app': name}},
+                    'spec': {
+                        'containers': [{
+                            'name': 'agent',
+                            'image': cfg.k8s.image,
+                            'env': [
+                                {'name': 'KAFKA_BOOTSTRAP', 'value': cfg.kafka.bootstrap_servers},
+                                {'name': 'DSPY_FORCE_JSON_OBJECT', 'value': 'true'},
+                                {'name': 'TOPIC', 'value': ct.container},
+                            ],
+                            'args': ['dspy-agent', 'worker', '--topic', ct.container],
+                            'resources': {'requests': cfg.k8s.resources, 'limits': cfg.k8s.resources},
+                        }]
+                    }
+                }
+            }
+        }
+        p = out_dir / f"{name}.yaml"
+        try:
+            try:
+                import yaml as _y  # type: ignore
+            except Exception:
+                _y = None  # type: ignore
+            if _y is not None:
+                p.write_text(_y.safe_dump(dep, sort_keys=False))
+            else:
+                raise RuntimeError('yaml not available')
+        except Exception:
+            # fallback to json
+            import json as _j
+            p.write_text(_j.dumps(dep, indent=2))
+        console.print(f"[green]Rendered {p}")
+    console.print(Panel.fit(f"Render complete in {out_dir}", title="k8s", border_style="accent"))
+
+
+@app.command()
+def worker(
+    topic: str = typer.Option(..., '--topic', help="Container/topic name (e.g., backend, frontend)"),
+    bootstrap: Optional[str] = typer.Option(None, '--bootstrap', help="Kafka bootstrap servers"),
+    group: Optional[str] = typer.Option(None, '--group', help="Kafka consumer group"),
+    config: Path = typer.Option(STREAM_CFG_PATH, '--config', exists=False, help="Streaming config path"),
+):
+    """Run a streaming worker for a topic. Note: requires Kafka client (install confluent-kafka)."""
+    # Minimal stub to avoid hard dependency; provide friendly guidance
+    bs = bootstrap
+    grp = group
+    if config.exists():
+        try:
+            cfg = load_stream_cfg(config)
+            bs = bs or cfg.kafka.bootstrap_servers
+            grp = grp or cfg.kafka.group_id
+        except Exception:
+            pass
+    console.print(Panel.fit(
+        f"topic={topic}\nbootstrap={bs or 'localhost:9092'}\ngroup={grp or 'dspy-code'}\n",
+        title="worker config", border_style="accent"
+    ))
+    try:
+        params = KafkaParams(
+            bootstrap=bs or 'localhost:9092',
+            group=grp or 'dspy-code',
+            in_topic=f'logs.ctx.{topic}',
+            out_topic=f'agent.results.{topic}',
+            container=topic,
+        )
+        loop = WorkerLoop(params)
+        loop.run()
+    except RuntimeError as e:
+        console.print(Panel(str(e), title="worker", border_style="red"))
+        raise typer.Exit(1)
+
+
+@app.command()
+def autodiscover(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Repo root to scan"),
+    out: Path = typer.Option(STREAM_CFG_PATH, '--out', help="Path to write stream config JSON"),
+):
+    discs = autodiscover_logs(workspace)
+    if not discs:
+        console.print(Panel("No log files found. Ensure logs/ or *.log exist.", title="autodiscover", border_style="yellow"))
+        raise typer.Exit(1)
+    # Update default config with discovered containers/services
+    cfg = StreamConfig.default()
+    containers: Dict[str, List[str]] = {}
+    for d in discs:
+        containers.setdefault(d.container, []).append(d.service)
+    cfg.containers = [type('CT', (), {'container': k, 'services': v}) for k, v in containers.items()]  # type: ignore
+    save_stream_cfg(cfg, out)
+    console.print(Panel.fit(f"Discovered {len(discs)} container(s). Wrote {out}", title="autodiscover", border_style="accent"))
+
+
+@app.command()
+def up(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Repo root"),
+    train: bool = typer.Option(True, '--train/--no-train', help="Enable streaming trainer (context dataset)"),
+    db: str = typer.Option("auto", '--db', help="Storage backend: auto|none|reddb"),
+    status: bool = typer.Option(True, '--status/--no-status', help="Run status HTTP server"),
+    status_host: str = typer.Option("0.0.0.0", '--status-host', help="Status server host"),
+    status_port: int = typer.Option(8765, '--status-port', help="Status server port (0 to disable)"),
+):
+    """Start local tailers + aggregators + workers (no Kafka needed). Single command dev stack."""
+    _print_banner()
+    # Optionally wire storage + kafka for persistence
+    storage = None
+    kafka = None
+    try:
+        from .db.factory import get_storage as _get_storage
+        if db.lower() == "none":
+            storage = None
+        elif db.lower() == "reddb":
+            # Force RedDB regardless of env
+            from .db.reddb import RedDBStorage
+            from .config import get_settings
+            s = get_settings()
+            if not s.reddb_url:
+                console.print("[yellow]--db reddb specified but REDDB_URL is not set; falling back to in-memory stub.[/yellow]")
+            storage = RedDBStorage(url=s.reddb_url, namespace=s.reddb_namespace or "dspy")
+        else:
+            storage = _get_storage()
+    except Exception:
+        storage = None
+    try:
+        kafka = get_kafka_logger()
+        if kafka is None:
+            console.print("[dim]Kafka logging disabled (set KAFKA_BOOTSTRAP_SERVERS to enable).[/dim]")
+    except Exception:
+        kafka = None
+    threads, bus = start_local_stack(workspace, None, storage=storage, kafka=kafka)
+    if train:
+        # Discover containers from .dspy_stream.json or autodiscovery
+        try:
+            cfg = load_stream_cfg(STREAM_CFG_PATH) if STREAM_CFG_PATH.exists() else None
+        except Exception:
+            cfg = None
+        containers = [getattr(ct, 'container') for ct in getattr(cfg, 'containers', [])] if cfg else [d.container for d in autodiscover_logs(workspace)]
+        from .streaming_runtime import Trainer
+        trainer = Trainer(workspace, bus, containers, min_batch=3, interval_sec=60.0)
+        trainer.start(); threads.append(trainer)
+    if not threads:
+        console.print(Panel("No tailers/workers started. Run 'dspy-agent autodiscover' and verify logs exist.", title="up", border_style="red"))
+        raise typer.Exit(1)
+    # Start status server (non-blocking)
+    if status and status_port > 0:
+        try:
+            th = start_status_server(status_host, status_port, workspace)
+            threads.append(th)
+            console.print(f"[green]Status server: http://{status_host}:{status_port}[/green]")
+        except Exception as e:
+            console.print(Panel(f"Status server failed: {e}", title="status", border_style="yellow"))
+    console.print(Panel.fit(f"Started {len(threads)} threads (tailers/aggregators/workers). Ctrl-C to stop.", title="local stack", border_style="cyan"))
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        console.print("[dim]Stopping...[/dim]")
+
+
+# -----------------------------
+# Lightweight Containers (Local)
+# -----------------------------
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _validate_paths(ws: Path, logs: Optional[Path]) -> list[str]:
+    errs: list[str] = []
+    # Ensure workspace directory exists
+    if not ws.exists():
+        try:
+            ws.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            errs.append(f"failed to create workspace: {ws} ({e})")
+    elif not ws.is_dir():
+        errs.append(f"workspace is not a directory: {ws}")
+
+    # Ensure logs directory exists if provided
+    if logs:
+        if not logs.exists():
+            try:
+                logs.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                errs.append(f"failed to create logs dir: {logs} ({e})")
+        elif not logs.is_dir():
+            errs.append(f"logs path is not a directory: {logs}")
+    return errs
+
+
+def _docker_available() -> bool:
+    import shutil
+    return shutil.which('docker') is not None
+
+
+def _compose_yaml(image: str, host_ws: Path, host_logs: Optional[Path], db_backend: str) -> str:
+    logs_map = f"\n      - {host_logs.resolve()}:/workspace/logs:ro" if host_logs else ""
+    return f"""
+services:
+  dspy-agent:
+    image: {image}
+    build:
+      context: ../../
+      dockerfile: docker/lightweight/Dockerfile
+    environment:
+      - LOCAL_MODE=false
+      - USE_OLLAMA=true
+      - DB_BACKEND={db_backend}
+      - REDDB_URL
+      - REDDB_NAMESPACE=dspy
+      - REDDB_TOKEN
+      - MODEL_NAME=deepseek-coder:1.3b
+      - OPENAI_API_KEY=
+      - OPENAI_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=deepseek-coder:1.3b
+      - OLLAMA_API_KEY=
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_CLIENT_ID=dspy-agent
+      - KAFKA_TOPIC_PREFIX
+    working_dir: /app
+    # ENTRYPOINT is dspy-agent; do not repeat binary in command
+    command: ["up", "--workspace", "/workspace", "--db", "{db_backend}", "--status", "--status-port", "8765"]
+    volumes:
+      - {host_ws.resolve()}:/workspace:rw{logs_map}
+    ports:
+      - "127.0.0.1:8765:8765"  # reserved for future HTTP status
+    restart: unless-stopped
+    depends_on:
+      - ollama
+      - kafka
+
+  ollama:
+    image: ollama/ollama:latest
+    entrypoint: ["/bin/sh", "-lc"]
+    command: |
+      ollama serve &
+      sleep 3;
+      ollama pull deepseek-coder:1.3b || true;
+      wait
+    ports:
+      - "127.0.0.1:11435:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    ports:
+      - "127.0.0.1:2181:2181"
+
+  kafka:
+    image: bitnami/kafka:3.6
+    depends_on:
+      - zookeeper
+    environment:
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+    ports:
+      - "127.0.0.1:9092:9092"
+
+volumes:
+  ollama: {{}}
+""".strip()
+
+
+def _dockerfile() -> str:
+    return """
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc git curl librdkafka-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml README.md /app/
+COPY dspy_agent /app/dspy_agent
+
+RUN pip install --no-cache-dir uv && \
+    uv pip install --system . && \
+    pip install --no-cache-dir confluent-kafka || true
+
+ENTRYPOINT ["dspy-agent"]
+""".strip()
+
+
+@app.command("lightweight_init")
+def lightweight_init(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=False, help="Host workspace to mount (created if missing; falls back to CWD if unwritable)"),
+    logs: Optional[Path] = typer.Option(None, '--logs', help="Host logs directory to mount read-only (optional; created if missing; disabled if unwritable)", file_okay=False, dir_okay=True),
+    out_dir: Path = typer.Option(LIGHTWEIGHT_DIR, '--out-dir', help="Where to write Dockerfile/compose"),
+    db: str = typer.Option("auto", '--db', help="Storage backend: auto|none|reddb"),
+):
+    # Ensure output dir
+    _ensure_dir(out_dir)
+
+    # Resolve workspace/logs with graceful fallbacks
+    ws = workspace
+    lg = logs
+    warns: list[str] = []
+    try:
+        if not ws.exists():
+            ws.mkdir(parents=True, exist_ok=True)
+        if not ws.is_dir():
+            raise RuntimeError("not a directory")
+    except Exception as e:
+        fallback = Path.cwd()
+        warns.append(f"workspace not usable: {ws} ({e}); falling back to {fallback}")
+        ws = fallback
+    if lg is not None:
+        try:
+            if not lg.exists():
+                lg.mkdir(parents=True, exist_ok=True)
+            if not lg.is_dir():
+                raise RuntimeError("not a directory")
+        except Exception as e:
+            warns.append(f"logs not usable: {lg} ({e}); disabling logs mount")
+            lg = None
+
+    df = out_dir / 'Dockerfile'
+    dc = out_dir / 'docker-compose.yml'
+    try:
+        df.write_text(_dockerfile())
+        dc.write_text(_compose_yaml(image='dspy-lightweight:latest', host_ws=ws, host_logs=lg, db_backend=db))
+    except Exception as e:
+        console.print(Panel(str(e), title="write failed", border_style="red"))
+        raise typer.Exit(1)
+
+    if warns:
+        console.print(Panel("\n".join(f"- {w}" for w in warns), title="adjustments", border_style="yellow"))
+    console.print(Panel.fit(
+        f"Wrote:\n- {df}\n- {dc}", title="lightweight init", border_style="green"
+    ))
+    next_steps = [
+        "1) Review docker/lightweight/docker-compose.yml and adjust env as needed (REDDB_URL, OPENAI_BASE_URL, etc.)",
+        "2) Build the image: docker compose -f docker/lightweight/docker-compose.yml build",
+        "3) Start the stack: docker compose -f docker/lightweight/docker-compose.yml up -d",
+        "4) Logs: docker compose -f docker/lightweight/docker-compose.yml logs -f dspy-agent",
+    ]
+    console.print(Panel("\n".join(next_steps), title="next steps", border_style="cyan"))
+    if not _docker_available():
+        console.print("[yellow]Docker not detected in PATH. Install Docker Desktop or CLI first.[/yellow]")
+    if db.lower() == 'reddb' and not os.getenv('REDDB_URL'):
+        console.print("[yellow]You selected --db reddb but REDDB_URL is not set. The agent will fallback to in-memory until you provide REDDB_URL.[/yellow]")
+
+
+@app.command("lightweight_up")
+def lightweight_up(
+    compose: Path = typer.Option(LIGHTWEIGHT_DIR / 'docker-compose.yml', '--compose', exists=False, help="Path to compose file"),
+    build: bool = typer.Option(True, '--build/--no-build', help="Build image before up"),
+):
+    logger = DeploymentLogger(workspace=Path.cwd(), name="lightweight")
+    if not compose.exists():
+        msg = f"Compose file not found: {compose}. Run 'dspy-agent lightweight_init' first."
+        logger.event("up", "error", msg)
+        console.print(Panel(msg, title="lightweight up", border_style="red"))
+        logger.close()
+        raise typer.Exit(1)
+    if not _docker_available():
+        logger.event("up", "warn", "Docker not detected in PATH")
+        console.print("[yellow]Docker not detected in PATH. Please run the following manually:[/yellow]")
+        console.print(f"docker compose -f {compose} {'build && ' if build else ''}up -d")
+        logger.close()
+        raise typer.Exit(1)
+    try:
+        logger.status("building")
+        logger.set_compose_hash(compose)
+        if build:
+            code = logger.run_stream(["docker", "compose", "-f", str(compose), "build"], phase="build")
+            if code != 0:
+                logger.status("error"); logger.close(); raise typer.Exit(1)
+        logger.status("up")
+        code = logger.run_stream(["docker", "compose", "-f", str(compose), "up", "-d"], phase="up")
+        if code != 0:
+            logger.status("error"); logger.close(); raise typer.Exit(1)
+        console.print("[green]Lightweight stack is up.[/green]")
+        logger.event("up", "info", "Lightweight stack is up")
+    except Exception as e:
+        logger.status("error")
+        console.print(Panel(str(e), title="docker compose failed", border_style="red"))
+    finally:
+        logger.close()
+    raise typer.Exit(0)
+
+
+@app.command("lightweight_down")
+def lightweight_down(
+    compose: Path = typer.Option(LIGHTWEIGHT_DIR / 'docker-compose.yml', '--compose', exists=False),
+):
+    logger = DeploymentLogger(workspace=Path.cwd(), name="lightweight")
+    if not compose.exists():
+        msg = f"Compose file not found: {compose}"
+        logger.event("down", "error", msg)
+        console.print(Panel(msg, title="lightweight down", border_style="red"))
+        logger.close()
+        raise typer.Exit(1)
+    if not _docker_available():
+        logger.event("down", "warn", "Docker not detected in PATH")
+        console.print("[yellow]Docker not detected. Run manually:[/yellow]")
+        console.print(f"docker compose -f {compose} down")
+        logger.close()
+        raise typer.Exit(1)
+    try:
+        logger.status("down")
+        code = logger.run_stream(["docker", "compose", "-f", str(compose), "down"], phase="down")
+        if code != 0:
+            logger.status("error"); logger.close(); raise typer.Exit(1)
+        console.print("[green]Lightweight stack stopped.[/green]")
+        logger.event("down", "info", "Lightweight stack stopped")
+    except Exception as e:
+        logger.status("error")
+        console.print(Panel(str(e), title="docker compose failed", border_style="red"))
+    finally:
+        logger.close()
+    raise typer.Exit(0)
+
+
+@app.command("lightweight_status")
+def lightweight_status(
+    compose: Path = typer.Option(LIGHTWEIGHT_DIR / 'docker-compose.yml', '--compose', exists=False),
+):
+    logger = DeploymentLogger(workspace=Path.cwd(), name="lightweight")
+    if not compose.exists():
+        msg = f"Compose file not found: {compose}"
+        logger.event("status", "error", msg)
+        console.print(Panel(msg, title="lightweight status", border_style="red"))
+        logger.close()
+        raise typer.Exit(1)
+    if not _docker_available():
+        logger.event("status", "warn", "Docker not detected in PATH")
+        console.print("[yellow]Docker not detected. Run manually:[/yellow]")
+        console.print(f"docker compose -f {compose} ps")
+        logger.close()
+        raise typer.Exit(1)
+    try:
+        code = logger.run_stream(["docker", "compose", "-f", str(compose), "ps"], phase="status")
+        if code != 0:
+            logger.status("error")
+    except Exception as e:
+        logger.status("error")
+        console.print(Panel(str(e), title="docker compose failed", border_style="red"))
+    finally:
+        logger.close()
+    raise typer.Exit(0)
+
+
+@app.command("lightweight_build")
+def lightweight_build(
+    compose: Path = typer.Option(LIGHTWEIGHT_DIR / 'docker-compose.yml', '--compose', exists=False, help="Path to compose file"),
+    no_restart: bool = typer.Option(False, '--no-restart', help="Only build, do not restart containers"),
+):
+    """Rebuild the lightweight image and optionally restart, with comprehensive deployment logs.
+
+    Logs are written to logs/deployments/<timestamp>.log and appended to the RedDB stream
+    'deploy.logs.lightweight' when configured.
+    """
+    logger = DeploymentLogger(workspace=Path.cwd(), name="lightweight")
+    if not compose.exists():
+        msg = f"Compose file not found: {compose}. Run 'dspy-agent lightweight_init' first."
+        logger.event("build", "error", msg)
+        console.print(Panel(msg, title="lightweight build", border_style="red"))
+        logger.close(); raise typer.Exit(1)
+    if not _docker_available():
+        logger.event("build", "warn", "Docker not detected in PATH")
+        console.print("[yellow]Docker not detected in PATH. Run manually:[/yellow]")
+        console.print(f"docker compose -f {compose} build && {'true' if no_restart else f'docker compose -f {compose} up -d'}")
+        logger.close(); raise typer.Exit(1)
+    try:
+        logger.status("building")
+        logger.set_compose_hash(compose)
+        code = logger.run_stream(["docker", "compose", "-f", str(compose), "build"], phase="build")
+        if code != 0:
+            logger.status("error"); logger.close(); raise typer.Exit(1)
+        if not no_restart:
+            logger.status("up")
+            code = logger.run_stream(["docker", "compose", "-f", str(compose), "up", "-d"], phase="up")
+            if code != 0:
+                logger.status("error"); logger.close(); raise typer.Exit(1)
+        logger.status("done")
+        logger.event("build", "info", "Build complete")
+        console.print("[green]Lightweight build complete.[/green]")
+    except Exception as e:
+        logger.status("error")
+        console.print(Panel(str(e), title="lightweight build failed", border_style="red"))
+    finally:
+        logger.close()
+    raise typer.Exit(0)
 
 
 @app.command()
@@ -1131,7 +1786,7 @@ def live_train(
                         panels.append(_progress_panel(m, auto, tr[m], va[m], title=f"{m} progress"))
                     return Columns(panels, equal=True, expand=True)
 
-                with Live(_render_group(), refresh_per_second=4, console=console):
+                with Live(_render_group(), refresh_per_second=4, console=console) as live:
                     while any(th.is_alive() for th in threads.values()):
                         try:
                             for m in mods:
@@ -1149,7 +1804,8 @@ def live_train(
                                             except Exception:
                                                 pass
                                         last_pos[m] = f.tell()
-                            # Rich Live auto-renders on update via context manager
+                            # Update combined dashboard after tailing
+                            live.update(_render_group())
                         except Exception:
                             pass
                         time.sleep(1)

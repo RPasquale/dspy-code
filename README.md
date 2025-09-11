@@ -1,12 +1,56 @@
-DSFy Coder — Simple Local Coding Agent
+dspy-code — Trainable Local Coding Agent
 
 Overview
 
 - Reads your local logs and builds a concise context.
 - Uses DSPy with a pluggable LLM backend to propose a plan and suggested commands for your task.
-- CLI via `dspy-agent` using uv-managed environment.
+- CLI via `dspy-code` (alias: `dspy-agent`) using uv-managed environment.
+- Built with DSPy and integrates with RedDB.
 
 Quick Start
+
+Super Simple Setup (Lightweight)
+
+- Prereqs:
+  - Install `Docker` and ensure `docker compose` works.
+  - Install `Python 3.10+` and [`uv`](https://github.com/astral-sh/uv) (`pip install uv` if needed).
+- Initialize the lightweight stack (generates Dockerfile + compose):
+  - `dspy-code lightweight_init --workspace $(pwd) --logs ./logs --db auto`
+  - Uses the current directory as workspace; creates `docker/lightweight/`.
+- Build and start:
+  - `docker compose -f docker/lightweight/docker-compose.yml build`
+  - `docker compose -f docker/lightweight/docker-compose.yml up -d`
+- Verify it’s running:
+  - Status: open `http://localhost:8765/health`
+  - Deployment info: `http://localhost:8765/deploy`
+  - Latest container outputs: `http://localhost:8765/containers`
+- Rebuild after code changes (fast loop):
+  - `dspy-code lightweight_build`
+  - or `./scripts/lightweight_build.sh`
+
+Optional, recommended
+
+- Enable Kafka (local):
+  - Start local Kafka services (compose profile):
+    - `docker compose -f docker/lightweight/docker-compose.yml --profile kafka up -d`
+  - Enable publishing: `export KAFKA_BOOTSTRAP_SERVERS=localhost:9092`
+  - Install client: `uv pip install confluent-kafka`
+  - Create topics: `dspy-code stream_topics` (or `dspy-code deploy_topics --bootstrap localhost:9092`)
+- Enable RedDB persistence:
+  - `export REDDB_URL=http://localhost:8080` (and optionally `REDDB_NAMESPACE`, `REDDB_TOKEN`)
+- Inspect latest agent outputs:
+  - `dspy-code last --container app --what all`
+
+Notes & Tips
+
+- If you pass unwritable paths to `lightweight_init`, the CLI automatically falls back to safe defaults (your current directory) and prints a yellow adjustments panel. You can always edit `docker/lightweight/docker-compose.yml` to mount a different host path.
+- Kafka and RedDB are optional; the agent runs fine without them. When enabled, logs and results stream to Kafka topics and persist to RedDB KV/streams.
+
+Links
+
+- DSPy: https://github.com/stanfordnlp/dspy.git
+- RedDB (open): https://github.com/redbco/redb-open.git
+
 
 1) Ensure Python 3.10+ and uv are installed.
 2) Configure an LLM backend (choose one):
@@ -19,36 +63,36 @@ Quick Start
 Usage
 
 - Show context from logs:
-  - `uv run dspy-agent context --workspace /path/to/repo --logs ./logs --ollama --model deepseek-coder:1.3b`
+  - `uv run dspy-code context --workspace /path/to/repo --logs ./logs --ollama --model deepseek-coder:1.3b`
 
 - Propose plan and commands for a task using logs as context:
-  - `uv run dspy-agent run "fix failing tests" --workspace /path/to/repo --logs ./logs --ollama --model deepseek-coder:1.3b`
+  - `uv run dspy-code run "fix failing tests" --workspace /path/to/repo --logs ./logs --ollama --model deepseek-coder:1.3b`
 
 Code Context
 
 - Summarize a file or directory:
-  - `dspy-coder codectx --path src/ --workspace /path/to/repo --ollama --model deepseek-coder:1.3b`
+  - `dspy-code codectx --path src/ --workspace /path/to/repo --ollama --model deepseek-coder:1.3b`
 
 Semantic Index
 
 - Build index:
-  - `dspy-coder index --workspace /path/to/repo --smart`
+  - `dspy-code index --workspace /path/to/repo --smart`
 - Search:
-  - `dspy-coder esearch "http client retry" --workspace /path/to/repo --k 5 --context 4`
+  - `dspy-code esearch "http client retry" --workspace /path/to/repo --k 5 --context 4`
 
 Embeddings (optional)
 
 - Option A: DSPy Embeddings provider (e.g., `openai/text-embedding-3-small`).
-  - Build index: `dspy-coder emb-index --workspace /path/to/repo --model openai/text-embedding-3-small --api-key $OPENAI_API_KEY`
-  - Search: `dspy-coder emb-search "retry logic" --workspace /path/to/repo --model openai/text-embedding-3-small --api-key $OPENAI_API_KEY`
+  - Build index: `dspy-code emb-index --workspace /path/to/repo --model openai/text-embedding-3-small --api-key $OPENAI_API_KEY`
+  - Search: `dspy-code emb-search "retry logic" --workspace /path/to/repo --model openai/text-embedding-3-small --api-key $OPENAI_API_KEY`
 
 - Option B: Local HuggingFace (recommended for Qwen 0.6B)
   - Install: `uv sync` (adds sentence-transformers>=2.7.0, transformers>=4.51.0)
   - Use Qwen/Qwen3-Embedding-0.6B locally:
     - Build index:
-      - `dspy-coder emb-index --workspace /path/to/repo --hf --model Qwen/Qwen3-Embedding-0.6B --device auto --flash`
+      - `dspy-code emb-index --workspace /path/to/repo --hf --model Qwen/Qwen3-Embedding-0.6B --device auto --flash`
     - Search:
-      - `dspy-coder emb-search "retry logic" --workspace /path/to/repo --hf --model Qwen/Qwen3-Embedding-0.6B --device auto --flash`
+      - `dspy-code emb-search "retry logic" --workspace /path/to/repo --hf --model Qwen/Qwen3-Embedding-0.6B --device auto --flash`
   - Notes:
     - `--device auto` will try GPU if available; use `--device cpu` to force CPU.
     - `--flash` enables flash_attention_2 when supported (GPU recommended).
@@ -56,7 +100,7 @@ Embeddings (optional)
 Interactive Session
 
 - Start a REPL to pick workspace/logs and run tasks:
-  - `uv run dspy-agent start --workspace /path/to/repo --ollama --model deepseek-coder:1.3b`
+  - `uv run dspy-code start --workspace /path/to/repo --ollama --model deepseek-coder:1.3b`
 - Inside the REPL:
   - You can type natural instructions; the agent will choose the best tools and arguments.
   - `cd <PATH>`: change workspace
@@ -112,6 +156,87 @@ Environment Variables
 - `OLLAMA_API_KEY`: Optional; any string is accepted. Defaults to `ollama` when needed.
 - `DSPY_FORCE_JSON_OBJECT` (true/false): Force simple JSON output mode and skip structured-outputs (suppresses "Failed to use structured output format" warnings). Defaults to true for Ollama.
   - Toggle per-run with CLI `--force-json` (or prefer structured with `--structured`).
+
+RedDB Integration (Local)
+
+- Set `REDDB_URL` to enable RedDB-backed persistence for local streaming, or pass `--db reddb` to `up` to force it.
+  - Example: `export REDDB_URL=http://localhost:8080` (adjust per RedDB deployment)
+  - Optional: `REDDB_NAMESPACE` to prefix keys/streams (default `dspy`).
+- When present (or `--db reddb`), `dspy-agent up` wires a RedDB storage adapter and persists:
+  - Append-only event logs for LocalBus topics (e.g., `logs.raw.<container>`, `logs.ctx.<container>`, `agent.results.<container>`).
+  - Key-value slots via the storage adapter API (future use).
+- Notes:
+  - The adapter is a thin stub awaiting the official client; it falls back to in-memory when the client is unavailable, so local dev is unaffected.
+  - Dev/Prod stacks can reuse the same adapter once the RedDB client is finalized.
+  - You can disable persistence with `--db none`.
+
+Lightweight Containers (Local Dev)
+
+- Generate a ready-to-run Docker setup that mounts your workspace and (optionally) logs:
+  - Initialize:
+    - `dspy-agent lightweight_init --workspace /absolute/path/to/your/repo --logs /absolute/path/to/your/logs --db auto`
+  - This writes:
+    - `docker/lightweight/Dockerfile`
+    - `docker/lightweight/docker-compose.yml`
+  - Next steps (printed by the CLI):
+    - `docker compose -f docker/lightweight/docker-compose.yml build`
+    - `docker compose -f docker/lightweight/docker-compose.yml up -d`
+    - `docker compose -f docker/lightweight/docker-compose.yml logs -f dspy-agent`
+- Helpful commands:
+  - `dspy-agent lightweight_up` (builds and starts; prints manual commands if Docker CLI is unavailable)
+  - `dspy-agent lightweight_status` (equivalent of `docker compose ps`)
+  - `dspy-agent lightweight_down` (stops the stack)
+  - `dspy-agent lightweight_build` (rebuild image and optionally restart, with comprehensive logs)
+  - Shell helper: `scripts/lightweight_build.sh [docker/lightweight/docker-compose.yml]`
+- Container behavior:
+  - Runs `dspy-agent up --workspace /workspace --db <auto|none|reddb>`.
+  - Mounts your host repo to `/workspace` (rw). If `--logs` was provided, mounts it read-only at `/workspace/logs`.
+  - Honors env vars (set them in your shell before `docker compose up`, or edit the compose env section):
+    - `DB_BACKEND`, `REDDB_URL`, `REDDB_NAMESPACE`, `REDDB_TOKEN`
+    - `LOCAL_MODE`, `MODEL_NAME`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OLLAMA_MODEL`
+    - `KAFKA_BOOTSTRAP_SERVERS` (enable Kafka publishing for deployment logs and LocalBus topics)
+  - Status server: `http://localhost:8765` (routes: `/health`, `/deploy`, `/containers`)
+- Validation & robustness:
+  - CLI validates paths and provides clear next steps; it never crashes the process if Docker is missing — it prints the exact commands to run manually.
+  - LocalBus persistence is best-effort; failures won’t stop the agent.
+  - Deployment logs are written under `logs/deployments/` and also appended to RedDB stream `deploy.logs.lightweight` when configured.
+  - Quick inspect latest agent outputs: `dspy-agent last --container <name> --what all`
+
+Deployment Data Model
+
+- Streams (append-only):
+  - `deploy.logs.lightweight`: all build/up/down/status output lines with `{ts, phase, level, message}`.
+  - `deploy.events.lightweight`: reserved for higher-level structured events.
+- KV (quick lookups):
+  - `deploy:last:lightweight:status`: `pending|building|up|down|error|done`
+  - `deploy:last:lightweight:image`: last built image tag/ID (reserved)
+  - `deploy:last:lightweight:compose_hash`: SHA256 of the compose file used
+  - `deploy:last:lightweight:ts`: last update timestamp
+
+Kafka Topics (optional)
+
+- If `KAFKA_BOOTSTRAP_SERVERS` is set and `confluent-kafka` is installed, the agent publishes JSON messages to Kafka:
+  - `deploy.logs.lightweight` — mirrors the RedDB deploy log stream
+  - All LocalBus topics (e.g., `logs.raw.*`, `logs.ctx.*`, `agent.results.*`)
+- To create topics, use your Kafka tooling or leverage `dspy-agent stream_topics` to print creation commands for standard topics.
+  - For deployment-only topics: `dspy-agent deploy_topics [--bootstrap localhost:9092]`
+  - The lightweight Dockerfile tries to install `confluent-kafka`; if it fails, the agent still runs and simply disables Kafka publishing.
+- Install Kafka client support:
+  - `uv pip install confluent-kafka`
+  - Or system install via your package manager; then `pip install confluent-kafka`.
+
+Optional Local Kafka via Compose Profiles
+
+- The generated `docker-compose.yml` includes a `kafka` profile with Zookeeper and Kafka services.
+- Start with profile enabled:
+  - `docker compose -f docker/lightweight/docker-compose.yml --profile kafka up -d`
+- Then set `KAFKA_BOOTSTRAP_SERVERS=localhost:9092` and rebuild or restart the agent service.
+
+Status HTTP API
+
+- `GET /health` → `{ "ok": true }`
+- `GET /deploy` → `{ status, ts, compose_hash, image }`
+- `GET /containers` → `{ names: ["..."], containers: { name: { summary, key_points, plan, ts } } }`
 
 Project Layout
 

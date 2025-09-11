@@ -13,6 +13,10 @@ class Settings:
     max_log_bytes: int  # 500 KB per file cap
     # Tool approval mode: "auto" (default) or "manual" (require confirmation before tool calls)
     tool_approval_mode: str
+    # Database configuration (local/dev/prod)
+    db_backend: str  # e.g., "reddb", "none"
+    reddb_url: str | None
+    reddb_namespace: str | None
 
 
 def get_settings() -> Settings:
@@ -23,4 +27,7 @@ def get_settings() -> Settings:
         local_mode=os.getenv("LOCAL_MODE", "false").lower() in {"1", "true", "yes", "on"},
         max_log_bytes=int(os.getenv("MAX_LOG_BYTES", "512000")),
         tool_approval_mode=os.getenv("TOOL_APPROVAL", "auto").lower(),
+        db_backend=os.getenv("DB_BACKEND", os.getenv("REDDB_URL") and "reddb" or "none"),
+        reddb_url=os.getenv("REDDB_URL"),
+        reddb_namespace=os.getenv("REDDB_NAMESPACE"),
     )

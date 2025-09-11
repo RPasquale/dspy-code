@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# Data files and datasets
+*.json
+*.jsonl
+*.csv
+*.tsv
+*.parquet
+*.feather
+
+# Model weights and checkpoints
+*.bin
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.model
+*.weights
+*.onnx
+*.tflite
+*.pb
+*.pkl.gz
+*.joblib
+
+# Project caches & local data
+.dspy_cache/
+.dspy_data/
+.dspy_index/
+.dspy_reports/
+.gepa_*/
+.dspy_checkpoints/
+.dspy_stream.json
+
+# Logs
+logs/
+*.log
+
+# Docker / Compose
+docker/lightweight/*.log
+docker/lightweight/.env
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# UV lockfile is generally committed for reproducibility; comment to ignore
+# uv.lock
+

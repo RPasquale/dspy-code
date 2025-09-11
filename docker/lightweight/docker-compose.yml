@@ -1,0 +1,68 @@
+services:
+  dspy-agent:
+    image: dspy-lightweight:latest
+    build:
+      context: ../../
+      dockerfile: docker/lightweight/Dockerfile
+    environment:
+      - LOCAL_MODE=false
+      - USE_OLLAMA=true
+      - DB_BACKEND=auto
+      - REDDB_URL
+      - REDDB_NAMESPACE=dspy
+      - REDDB_TOKEN
+      - MODEL_NAME=deepseek-coder:1.3b
+      - OPENAI_API_KEY=
+      - OPENAI_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=deepseek-coder:1.3b
+      - OLLAMA_API_KEY=
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_CLIENT_ID=dspy-agent
+      - KAFKA_TOPIC_PREFIX
+    working_dir: /app
+    command: ["up", "--workspace", "/workspace", "--db", "auto", "--status", "--status-port", "8765"]
+    volumes:
+      - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+    ports:
+      - "127.0.0.1:8765:8765"  # reserved for future HTTP status
+    restart: unless-stopped
+    depends_on:
+      - ollama
+      - kafka
+
+  ollama:
+    image: ollama/ollama:latest
+    entrypoint: ["/bin/sh", "-lc"]
+    command: |
+      ollama serve &
+      sleep 3;
+      ollama pull deepseek-coder:1.3b || true;
+      wait
+    ports:
+      - "127.0.0.1:11435:11434"  # host->container; use 11435 to avoid conflicts
+    volumes:
+      - ollama:/root/.ollama
+
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    ports:
+      - "127.0.0.1:2181:2181"
+
+  kafka:
+    image: bitnami/kafka:3.6
+    depends_on:
+      - zookeeper
+    environment:
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+    ports:
+      - "127.0.0.1:9092:9092"
+
+volumes:
+  ollama: {}

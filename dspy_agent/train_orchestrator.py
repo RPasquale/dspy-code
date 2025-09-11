@@ -45,6 +45,8 @@ def load_orchestrator_trainset(jsonl_path: Path) -> List[dspy.Example]:
         lp = Path(logs).resolve() if logs else None
         st = _state_text(ws, lp)
         ex = dspy.Example(query=q, state=st, workspace=str(ws), logs=str(lp) if lp else "", targets=r.get("targets", []))
+        # Mark inputs for DSPy so evaluation knows the input fields.
+        ex = ex.with_inputs("query", "state")
         examples.append(ex)
     return examples
 
@@ -63,6 +65,17 @@ def gepa_metric_for_orchestrator(gold: dspy.Example, pred: dspy.Prediction, trac
     return {"score": float(outcome.score), "feedback": fb}
 
 
+def _score_of(res) -> float:
+    try:
+        if isinstance(res, (int, float)):
+            return float(res)
+        if isinstance(res, dict):
+            return float(res.get("score", 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+
 def make_logging_metric_orchestrator(progress_path: Optional[str]):
     def metric(gold: dspy.Example, pred: dspy.Prediction, trace=None, pred_name=None, pred_trace=None):
         res = gepa_metric_for_orchestrator(gold, pred, trace=trace, pred_name=pred_name, pred_trace=pred_trace)
@@ -74,13 +87,13 @@ def make_logging_metric_orchestrator(progress_path: Optional[str]):
                     "ts": datetime.utcnow().isoformat(),
                     "module": "orchestrator",
                     "split": getattr(gold, "split", "train"),
-                    "score": float(res.get("score", 0.0)),
+                    "score": _score_of(res),
                 }
                 with p.open("a") as f:
                     f.write(json.dumps(rec) + "\n")
             except Exception:
                 pass
-        return res
+        return _score_of(res)
 
     return metric
 

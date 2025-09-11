@@ -1,10 +1,10 @@
 [project]
-name = "dspy-coder"
+name = "dspy-code"
 version = "0.1.0"
 description = "Simple local coding agent using DSPy that reads logs and proposes plans/commands."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
+license = { text = "Apache-2.0" }
 authors = [
     { name = "Your Name" }
 ]
@@ -23,9 +23,15 @@ dspy-coder = "dspy_agent.cli:app"
 dspy_coder = "dspy_agent.cli:app"
 dspy-code = "dspy_agent.cli:code_entry"
 
+[project.urls]
+Homepage = "https://github.com/RPasquale/dspy_stuff"
+Repository = "https://github.com/RPasquale/dspy_stuff.git"
+DSPy = "https://github.com/stanfordnlp/dspy.git"
+RedDB = "https://github.com/redbco/redb-open.git"
+
 [tool.uv]
 dev-dependencies = []
 package = true
 
 [tool.setuptools]
-packages = ["dspy_agent"]
+packages = ["dspy_agent", "dspy_agent.skills", "dspy_agent.db"]

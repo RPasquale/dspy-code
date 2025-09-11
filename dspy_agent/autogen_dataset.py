@@ -128,7 +128,13 @@ def split_jsonl_rows(
     src_rows = _dedup_rows(rows) if dedup else list(rows)
     # Optional stratified splitting
     parts: Dict[str, List[Dict]] = {"train": [], "val": [], "test": []}
-    if stratify_by:
+    n = len(src_rows)
+    if n <= 3 and n > 0:
+        # Small-sample guard: put all into train to avoid empty splits
+        parts["train"] = list(src_rows)
+        parts["val"] = []
+        parts["test"] = []
+    elif stratify_by:
         groups: Dict[str, List[Dict]] = {}
         for r in src_rows:
             key = str(r.get(stratify_by, "_none"))

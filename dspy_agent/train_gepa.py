@@ -42,6 +42,7 @@ def load_examples_for_module(module: str, jsonl_path: Path) -> List[dspy.Example
                 context_keywords=r.get("context_keywords", []),
                 key_points_keywords=r.get("key_points_keywords", []),
             )
+            ex = ex.with_inputs("task", "logs_preview")
         elif module == "task":
             ex = dspy.Example(
                 task=r.get("task", ""),
@@ -49,12 +50,14 @@ def load_examples_for_module(module: str, jsonl_path: Path) -> List[dspy.Example
                 plan_keywords=r.get("plan_keywords", []),
                 commands_keywords=r.get("commands_keywords", []),
             )
+            ex = ex.with_inputs("task", "context")
         elif module == "code":
             ex = dspy.Example(
                 snapshot=r.get("snapshot", ""),
                 ask=r.get("ask", "Summarize this code snapshot."),
                 keywords=r.get("keywords", []),
             )
+            ex = ex.with_inputs("snapshot", "ask")
         else:
             raise ValueError(f"Unknown module: {module}")
         out.append(ex)
@@ -125,6 +128,17 @@ def metric_for_module(module: str) -> Callable:
     return {"context": metric_context, "task": metric_task, "code": metric_code}[module]
 
 
+def _score_of(res) -> float:
+    try:
+        if isinstance(res, (int, float)):
+            return float(res)
+        if isinstance(res, dict):
+            return float(res.get("score", 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+
 def make_logging_metric(module: str, progress_path: Optional[str]) -> Callable:
     base_metric = metric_for_module(module)
 
@@ -138,13 +152,14 @@ def make_logging_metric(module: str, progress_path: Optional[str]) -> Callable:
                     "ts": datetime.utcnow().isoformat(),
                     "module": module,
                     "split": getattr(gold, "split", "train"),
-                    "score": float(res.get("score", 0.0)),
+                    "score": _score_of(res),
                 }
                 with p.open("a") as f:
                     f.write(json.dumps(rec) + "\n")
             except Exception:
                 pass
-        return res
+        # Return a pure float score to be robust across DSPy versions
+        return _score_of(res)
 
     return logging_metric
 
