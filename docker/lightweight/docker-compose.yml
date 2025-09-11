@@ -20,7 +20,14 @@ services:
       - KAFKA_CLIENT_ID=dspy-agent
       - KAFKA_TOPIC_PREFIX
     working_dir: /app
-    command: ["up", "--workspace", "/workspace", "--db", "auto", "--status", "--status-port", "8765"]
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do
+        curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;
+        echo "waiting for ollama/kafka..."; sleep 2;
+      done;
+      dspy-agent stream_topics_create --bootstrap kafka:9092 || true;
+      dspy-agent up --workspace /workspace --db auto --status --status-port 8765
     volumes:
       - /Users/robbiepasquale/dspy_stuff:/workspace:rw
     ports:
@@ -63,6 +70,64 @@ services:
       - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
     ports:
       - "127.0.0.1:9092:9092"
+
+  dspy-worker:
+    image: dspy-lightweight:latest
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic app --bootstrap kafka:9092
+    working_dir: /app
+
+  spark:
+    image: bitnami/spark:3.5
+    depends_on:
+      - kafka
+    volumes:
+      - /Users/robbiepasquale/dspy_stuff:/workspace
+      - ../../scripts:/app/scripts
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      spark-submit \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+        /app/scripts/streaming/spark_logs.py \
+        --bootstrap kafka:9092 \
+        --pattern 'logs.raw.*' \
+        --checkpoint /workspace/.dspy_checkpoints/spark_logs
+
+  dspy-worker-backend:
+    image: dspy-lightweight:latest
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic backend --bootstrap kafka:9092
+    working_dir: /app
+
+  dspy-worker-frontend:
+    image: dspy-lightweight:latest
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic frontend --bootstrap kafka:9092
+    working_dir: /app
+
+  dspy-router:
+    image: dspy-lightweight:latest
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-lc"]
+    command: |
+      python - <<'PY'
+      from dspy_agent.router_worker import RouterWorker
+      RouterWorker('kafka:9092').run()
+      PY
+    working_dir: /app
 
 volumes:
   ollama: {}

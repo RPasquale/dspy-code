@@ -19,7 +19,7 @@ def _read_jsonl(path: Path) -> List[dict]:
     return data
 
 
-def load_examples_for_module(module: str, jsonl_path: Path) -> List[dspy.Example]:
+def load_examples_for_module(module: str, jsonl_path: Path, *, code_summary: Optional[str] = None) -> List[dspy.Example]:
     """Load dataset examples.
 
     Schemas (per-line JSON):
@@ -46,7 +46,7 @@ def load_examples_for_module(module: str, jsonl_path: Path) -> List[dspy.Example
         elif module == "task":
             ex = dspy.Example(
                 task=r.get("task", ""),
-                context=r.get("context", ""),
+                context=(r.get("context", "") + (f"\n\nCode Summary:\n{code_summary}" if code_summary else "")),
                 plan_keywords=r.get("plan_keywords", []),
                 commands_keywords=r.get("commands_keywords", []),
             )
@@ -103,11 +103,20 @@ def metric_for_module(module: str) -> Callable:
         cov1, miss1 = _coverage(plan, getattr(gold, "plan_keywords", []) or [])
         cov2, miss2 = _coverage(cmds, getattr(gold, "commands_keywords", []) or [])
         score = 0.6 * cov1 + 0.4 * cov2
+        # Heuristic penalty for dangerous commands
+        dangerous = [
+            "rm -rf", "git reset --hard", "mkfs", ":> /", "dd if=", "sudo ",
+            "curl ", " | sh", " | bash", "chmod -R 777 /", "chown -R /",
+        ]
+        if any(tok in cmds.lower() for tok in dangerous):
+            score = max(0.0, score - 0.2)
         fb = []
         if miss1:
             fb.append("Plan missing: " + ", ".join(miss1))
         if miss2:
             fb.append("Commands missing: " + ", ".join(miss2))
+        if any(tok in cmds.lower() for tok in dangerous):
+            fb.append("Avoid destructive commands; prefer safe, reviewable steps.")
         if not fb:
             fb.append("Plan looks solid. Ensure commands are safe/non-destructive.")
         return {"score": float(score), "feedback": " \n".join(fb)}
@@ -189,8 +198,9 @@ def run_gepa(
     log_dir: Optional[str] = None,
     track_stats: bool = True,
     progress_path: Optional[str] = None,
+    code_summary: Optional[str] = None,
 ) -> dspy.Module:
-    trainset = load_examples_for_module(module, train_jsonl)
+    trainset = load_examples_for_module(module, train_jsonl, code_summary=code_summary)
     for ex in trainset:
         setattr(ex, "split", "train")
     metric = make_logging_metric(module, progress_path)
@@ -224,9 +234,10 @@ def run_gepa_with_val(
     log_dir: Optional[str] = None,
     track_stats: bool = True,
     progress_path: Optional[str] = None,
+    code_summary: Optional[str] = None,
 ) -> dspy.Module:
-    trainset = load_examples_for_module(module, train_jsonl)
-    valset = load_examples_for_module(module, val_jsonl)
+    trainset = load_examples_for_module(module, train_jsonl, code_summary=code_summary)
+    valset = load_examples_for_module(module, val_jsonl, code_summary=code_summary)
     for ex in trainset:
         setattr(ex, "split", "train")
     for ex in valset:

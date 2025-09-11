@@ -40,9 +40,12 @@ from .patcher import apply_unified_patch, summarize_patch
 from .indexer import build_index, save_index, load_index, semantic_search
 from .train_gepa import run_gepa, run_gepa_with_val, evaluate_on_set
 from .train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
+from .train_codegen import run_gepa_codegen
 from .autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
 from .orchestrator_runtime import evaluate_tool_choice
 from .indexer import tokenize
+from .router_worker import RouterWorker
+from .knowledge import build_code_graph
 from .embeddings_index import (
     build_emb_index,
     save_emb_index,
@@ -63,6 +66,7 @@ from .kafka_log import get_kafka_logger
 from .deploy import DeploymentLogger
 from .status_http import start_status_server
 from .streaming_kafka import WorkerLoop, KafkaParams
+from .knowledge import build_code_graph, summarize_code_graph
 import threading
 import json as _json
 
@@ -118,6 +122,44 @@ def _entry(ctx: typer.Context):
             title="Welcome",
             border_style="accent",
         ))
+
+
+def _get_code_summary(ws: Path) -> str:
+    # Try storage first
+    try:
+        from .db.factory import get_storage as _get_storage
+        st = _get_storage()
+        if st is not None:
+            s = st.get('code:summary')
+            if isinstance(s, str) and s.strip():
+                return s
+    except Exception:
+        pass
+    # Fallback to quick on-the-fly summary (top files only)
+    try:
+        from .knowledge import build_code_graph, summarize_code_graph
+        g = build_code_graph(ws)
+        return summarize_code_graph(g)
+    except Exception:
+        return ""
+
+def _get_code_graph(ws: Path) -> dict:
+    # Try storage first
+    try:
+        from .db.factory import get_storage as _get_storage
+        st = _get_storage()
+        if st is not None:
+            g = st.get('code:graph')
+            if isinstance(g, dict):
+                return g
+    except Exception:
+        pass
+    # Fallback to on-the-fly build
+    try:
+        from .knowledge import build_code_graph
+        return build_code_graph(ws)
+    except Exception:
+        return {}
 
 
 def _maybe_configure_lm(use_lm: bool, ollama: bool, model: Optional[str], base_url: Optional[str], api_key: Optional[str]):
@@ -335,7 +377,8 @@ def codectx(
         raise typer.Exit(0)
     _print_header("Code Context (DSPy)")
     cc = CodeContext()
-    out = cc(snapshot=snap, ask="Summarize key components, APIs, and likely modification points.")
+    code_graph = _get_code_summary(workspace)
+    out = cc(snapshot=snap, ask="Summarize key components, APIs, and likely modification points.", code_graph=code_graph)
     console.print(Panel.fit(out.summary, title="Summary", border_style="cyan"))
     console.print(Panel.fit(out.bullets, title="Bullets", border_style="green"))
 
@@ -449,6 +492,43 @@ def deploy_topics(
 
 
 @app.command()
+def stream_topics_create(
+    cfg_path: Path = typer.Option(STREAM_CFG_PATH, '--config', exists=False, help="Streaming config path"),
+    bootstrap: Optional[str] = typer.Option(None, '--bootstrap', help="Kafka bootstrap servers"),
+):
+    """Create Kafka topics from config using confluent-kafka AdminClient (best-effort)."""
+    try:
+        from confluent_kafka.admin import AdminClient, NewTopic  # type: ignore
+    except Exception:
+        console.print(Panel("confluent-kafka not installed; cannot create topics.", title="kafka", border_style="yellow"))
+        raise typer.Exit(1)
+    # Load config (or default)
+    if cfg_path.exists():
+        cfg = load_stream_cfg(cfg_path)
+    else:
+        cfg = StreamConfig.default()
+    bs = bootstrap or cfg.kafka.bootstrap_servers
+    admin = AdminClient({'bootstrap.servers': bs})
+    topics = []
+    for t in cfg.kafka.topics:
+        topics.append(NewTopic(t.name, num_partitions=t.partitions, replication_factor=t.replication_factor))
+    try:
+        fs = admin.create_topics(topics, request_timeout=10.0)
+        errs = []
+        for name, f in fs.items():
+            try:
+                f.result()
+                console.print(f"[green]Created topic {name}[/green]")
+            except Exception as e:
+                errs.append((name, str(e)))
+        if errs:
+            for name, e in errs:
+                console.print(f"[yellow]{name}: {e}[/yellow]")
+    except Exception as e:
+        console.print(Panel(str(e), title="kafka", border_style="red"))
+
+
+@app.command()
 def last(
     container: str = typer.Option(..., '--container', help="Container name (e.g., backend, frontend, app)"),
     what: str = typer.Option('all', '--what', help="Which field: summary|plan|key_points|ts|all"),
@@ -483,6 +563,60 @@ def last(
     console.print(Panel(str(data.get('ts') or '(no ts)'), title=f"{container}:ts", border_style="magenta"))
 
 
+@app.command("learn")
+def learn(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Repo root to analyze"),
+    embeddings: bool = typer.Option(True, '--embeddings/--no-embeddings', help="Also build embeddings index"),
+    out: Optional[Path] = typer.Option(None, '--out', help="Write code graph JSON to this path"),
+):
+    """Analyze the codebase to build a code graph and optionally embeddings. Persists to storage if configured."""
+    _print_header("Learning codebase")
+    graph = build_code_graph(workspace)
+    summary = summarize_code_graph(graph)
+    if out is None:
+        out = workspace / '.dspy_index' / 'knowledge.json'
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        import json as _j
+        out.write_text(_j.dumps(graph, indent=2))
+        console.print(Panel.fit(f"Wrote code graph to {out}", title="knowledge", border_style="green"))
+        console.print(Panel.fit(summary, title="summary", border_style="accent"))
+    except Exception as e:
+        console.print(Panel(str(e), title="write failed", border_style="red"))
+    # Persist to storage when available
+    try:
+        from .db.factory import get_storage as _get_storage
+        st = _get_storage()
+        if st is not None:
+            st.put('code:graph', graph)  # type: ignore[arg-type]
+            st.put('code:summary', summary)  # type: ignore[arg-type]
+            # Per-file facts for targeted queries
+            try:
+                root = Path(graph.get('root', workspace))
+                for f in graph.get('files', []):
+                    p = Path(f.get('path', ''))
+                    rel = str(p.resolve()).replace(str(root.resolve()), '').lstrip('/')
+                    safe = (rel or p.name).replace('/', '|')
+                    st.put(f'code:file:{safe}:facts', f)  # type: ignore
+            except Exception:
+                pass
+            console.print("[green]Persisted code graph and per-file facts to storage.[/green]\n")
+    except Exception:
+        pass
+    # Build embeddings index
+    if embeddings:
+        try:
+            _print_header("Embeddings index")
+            from .embeddings_index import build_emb_index, save_emb_index
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            items = build_emb_index(workspace, model)
+            idx_dir = save_emb_index(workspace, items, persist=True)
+            console.print(Panel.fit(f"Built embeddings for {len(items)} chunks → {idx_dir}", title="embeddings", border_style="cyan"))
+        except Exception as e:
+            console.print(Panel(f"Embeddings skipped: {e}", title="embeddings", border_style="yellow"))
+
+
 @app.command()
 def spark_script(
     out: Path = typer.Option(Path("scripts/streaming/spark_logs.py"), '--out', help="Path to write PySpark job"),
@@ -495,8 +629,7 @@ import argparse
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--bootstrap', default='localhost:9092')
-    ap.add_argument('--raw-topic', required=True)
-    ap.add_argument('--ctx-topic', required=True)
+    ap.add_argument('--pattern', default='logs.raw.*', help='Kafka topic pattern for raw logs')
     ap.add_argument('--checkpoint', default='.dspy_checkpoints/spark_logs')
     args = ap.parse_args()
 
@@ -505,19 +638,23 @@ def main():
           .readStream
           .format('kafka')
           .option('kafka.bootstrap.servers', args.bootstrap)
-          .option('subscribe', args.raw_topic)
+          .option('subscribePattern', args.pattern)
           .load())
-    # Basic transform: parse value, extract error keywords, keep recent lines
-    val = df.selectExpr("CAST(value AS STRING) AS line", "timestamp")
-    # Example heuristic: keep ERROR/WARN/Traceback windows
-    hits = val.where(F.lower(F.col('line')).rlike('error|warn|traceback|exception'))
-    agg = (hits.groupBy(F.window('timestamp', '30 seconds'))
-               .agg(F.collect_list('line').alias('lines'))
-               .select(F.to_json(F.struct(F.col('lines').alias('ctx'))).alias('value')))
+
+    # Parse Kafka message
+    val = df.selectExpr("CAST(topic AS STRING) AS topic", "CAST(value AS STRING) AS line", "timestamp")
+    # Keep error-like lines
+    hits = val.where(F.lower(F.col('line')).rlike('error|warn|traceback|exception|failed|timeout'))
+    # Aggregate by 30s window and topic; route to logs.ctx.<suffix>
+    agg = (hits
+           .withColumn('topic_out', F.regexp_replace(F.col('topic'), '^logs\\.raw\\.', 'logs.ctx.'))
+           .groupBy(F.window('timestamp', '30 seconds'), F.col('topic_out'))
+           .agg(F.collect_list('line').alias('lines'))
+           .select(F.col('topic_out').alias('topic'), F.to_json(F.struct(F.col('lines').alias('ctx'))).alias('value')))
+
     q = (agg.writeStream
              .format('kafka')
              .option('kafka.bootstrap.servers', args.bootstrap)
-             .option('topic', args.ctx_topic)
              .option('checkpointLocation', args.checkpoint)
              .outputMode('update')
              .start())
@@ -528,7 +665,7 @@ if __name__ == '__main__':
 '''
     out.write_text(code)
     console.print(Panel.fit(f"Wrote PySpark job to {out}", title="spark", border_style="accent"))
-    console.print(Panel.fit("Example: spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 scripts/streaming/spark_logs.py --raw-topic logs.raw.backend --ctx-topic logs.ctx.backend", title="run", border_style="dim"))
+    console.print(Panel.fit("Example: spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 scripts/streaming/spark_logs.py --bootstrap localhost:9092 --pattern 'logs.raw.*'", title="run", border_style="dim"))
 
 
 @app.command()
@@ -767,16 +904,33 @@ services:
       - KAFKA_CLIENT_ID=dspy-agent
       - KAFKA_TOPIC_PREFIX
     working_dir: /app
-    # ENTRYPOINT is dspy-agent; do not repeat binary in command
-    command: ["up", "--workspace", "/workspace", "--db", "{db_backend}", "--status", "--status-port", "8765"]
+    entrypoint: ["/bin/bash", "-lc"]
+    # Wait for services before launching agent
+    command: >-
+      for i in {1..60}; do
+        curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;
+        echo "waiting for ollama/kafka..."; sleep 2;
+      done;
+      dspy-agent stream_topics_create --bootstrap kafka:9092 || true;
+      dspy-agent up --workspace /workspace --db {db_backend} --status --status-port 8765
     volumes:
       - {host_ws.resolve()}:/workspace:rw{logs_map}
     ports:
       - "127.0.0.1:8765:8765"  # reserved for future HTTP status
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8765/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     depends_on:
-      - ollama
-      - kafka
+      ollama:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      spark:
+        condition: service_healthy
 
   ollama:
     image: ollama/ollama:latest
@@ -790,6 +944,12 @@ services:
       - "127.0.0.1:11435:11434"
     volumes:
       - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   zookeeper:
     image: bitnami/zookeeper:3.9
@@ -797,6 +957,12 @@ services:
       - ALLOW_ANONYMOUS_LOGIN=yes
     ports:
       - "127.0.0.1:2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/2181 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   kafka:
     image: bitnami/kafka:3.6
@@ -811,6 +977,144 @@ services:
       - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
     ports:
       - "127.0.0.1:9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/9092 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  spark:
+    image: bitnami/spark:3.5
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - {host_ws.resolve()}:/workspace
+      - ../../scripts:/app/scripts
+    entrypoint: ["/bin/bash", "-lc"]
+    # Run PySpark job to transform raw logs -> context windows on Kafka
+    command: >-
+      spark-submit \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+        /app/scripts/streaming/spark_logs.py \
+        --bootstrap kafka:9092 \
+        --pattern 'logs.raw.*' \
+        --checkpoint /workspace/.dspy_checkpoints/spark_logs
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -iq spark-submit || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  dspy-worker:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic app --bootstrap kafka:9092
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  dspy-worker-backend:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic backend --bootstrap kafka:9092
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  dspy-worker-frontend:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic frontend --bootstrap kafka:9092
+    working_dir: /app
+  dspy-code-watch:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      python - <<'PY'
+from dspy_agent.code_watch import CodeWatcher
+from pathlib import Path
+CodeWatcher(Path('/workspace')).run()
+PY
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  dspy-code-indexer:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      python - <<'PY'
+from dspy_agent.code_indexer_worker import CodeIndexerWorker
+CodeIndexerWorker('kafka:9092').run()
+PY
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  dspy-router:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      python - <<'PY'
+from dspy_agent.router_worker import RouterWorker
+RouterWorker('kafka:9092').run()
+PY
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
 volumes:
   ollama: {{}}
@@ -1096,8 +1400,17 @@ def chat(
         lm = _maybe_configure_lm(True, provider_is_ollama, model_name, base, key)
         if lm is not None:
             try:
-                orch = Orchestrator(); pred = orch(query=task, state=state)
-                tool = (pred.tool or "").strip(); import json as _json; args = _json.loads(pred.args_json or "{}")
+                # Confidence gating: use fast Predict first; escalate to CoT if ambiguous
+                fast = Orchestrator(use_cot=False)
+                pred_fast = fast(query=task, state=state)
+                tool = (pred_fast.tool or "").strip(); import json as _json; args = _json.loads(pred_fast.args_json or "{}")
+                ambiguous = (not tool) or (last_tool == tool and last_args == args) or (tool in {"knowledge","sg"} and not args)
+                if ambiguous:
+                    slow = Orchestrator(use_cot=True)
+                    pred = slow(query=task, state=state)
+                    tool = (pred.tool or tool).strip(); args = _json.loads(pred.args_json or "{}")
+                    if getattr(pred, 'rationale', None):
+                        console.print(Panel.fit(pred.rationale, title="Routing Rationale", border_style="dim"))
             except Exception:
                 tool = None; args = {}
         if not tool:
@@ -1184,10 +1497,12 @@ def run(
 
     builder = ContextBuilder()
     ctx = builder(task=task, logs_preview=key)
+    code_graph = _get_code_summary(ws)
+    fused_context = f"{ctx.context}\n\n{ctx.key_points}\n\nCode Summary:\n{code_graph}" if code_graph else f"{ctx.context}\n\n{ctx.key_points}"
 
     _print_header("Agent Plan")
     agent = TaskAgent()
-    out = agent(task=task, context=f"{ctx.context}\n\n{ctx.key_points}")
+    out = agent(task=task, context=fused_context)
 
     console.print(Panel.fit(task, title="Task", border_style="white"))
     console.print(Panel.fit(ctx.context, title="Context", border_style="cyan"))
@@ -1251,6 +1566,7 @@ def emb_index(
     flash: bool = typer.Option(False, '--flash/--no-flash', help="Enable flash_attention_2 in HF model_kwargs"),
     lines: int = typer.Option(200, '--chunk-lines', help="Lines per chunk for non-Python"),
     smart: bool = typer.Option(True, '--smart/--no-smart', help="Code-aware chunking (Python)"),
+    persist: bool = typer.Option(False, '--persist/--no-persist', help="Also persist embeddings and code chunks to RedDB"),
 ):
     if hf or model.startswith("Qwen/"):
         try:
@@ -1276,8 +1592,219 @@ def emb_index(
             console.print(Panel(str(e), title="Failed to init DSPy Embeddings", border_style="red"))
             raise typer.Exit(1)
     items = build_emb_index(workspace, embedder, lines_per_chunk=lines, smart=smart)
-    out_dir = save_emb_index(workspace, items)
+    out_dir = save_emb_index(workspace, items, persist=persist)
     console.print(f"[green]Embedded {len(items)} chunks. Saved to {out_dir}[/green]")
+
+
+@app.command("embeddings_inspect")
+def embeddings_inspect(
+    start: int = typer.Option(0, '--start', help="Start offset in emb.index stream"),
+    count: int = typer.Option(10, '--count', help="Number of entries to show"),
+):
+    """Page through embeddings from RedDB and display aligned code chunks.
+
+    Requires REDDB_URL to be configured and emb_index persisted with --persist
+    or the compaction job to have run.
+    """
+    try:
+        from .db.factory import get_storage as _get_storage
+        import hashlib as _h
+    except Exception as e:
+        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+    st = _get_storage()
+    if st is None:
+        console.print(Panel("No storage configured (set REDDB_URL).", title="embeddings", border_style="yellow")); raise typer.Exit(1)
+    rows = list(st.read('emb.index', start=start, count=count))  # type: ignore
+    if not rows:
+        console.print("[yellow]No embeddings in stream (persist with emb_index --persist).[/yellow]")
+        raise typer.Exit(0)
+    for off, rec in rows:
+        path = rec.get('path'); s = rec.get('start_line'); e = rec.get('end_line')
+        h = _h.sha256((str(path) + str(s) + str(e)).encode('utf-8')).hexdigest()
+        chunk = st.get(f'code:chunk:{h}')  # type: ignore
+        title = f"off={off} {path}:{s}-{e} vec_len={len(rec.get('vector', []) or [])}"
+        text = (chunk or {}).get('text') if isinstance(chunk, dict) else None
+        console.print(Panel(text or "(no KV chunk; run chunks_compact or emb_index --persist)", title=title, border_style="cyan"))
+
+
+@app.command("chunks_compact")
+def chunks_compact(
+    start: int = typer.Option(0, '--start', help="Start offset in code.chunks stream"),
+    count: int = typer.Option(1000, '--count', help="Number of records to scan"),
+):
+    """Deduplicate code.chunks into KV cache keyed by hash for fast lookup."""
+    try:
+        from .db.factory import get_storage as _get_storage
+    except Exception as e:
+        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+    st = _get_storage()
+    if st is None:
+        console.print(Panel("No storage configured (set REDDB_URL).", title="chunks", border_style="yellow")); raise typer.Exit(1)
+    rows = list(st.read('code.chunks', start=start, count=count))  # type: ignore
+    if not rows:
+        console.print("[yellow]No code.chunks entries found.[/yellow]"); raise typer.Exit(0)
+    written = 0
+    for off, rec in rows:
+        h = rec.get('hash');
+        if not h:
+            continue
+        key = f'code:chunk:{h}'
+        if st.get(key):  # type: ignore
+            continue
+        st.put(key, rec)  # type: ignore
+        written += 1
+    console.print(f"[green]Compacted {written} chunk(s) into KV cache.[/green]")
+
+
+@app.command("ast_cache")
+def ast_cache(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', exists=True, dir_okay=True),
+    limit: int = typer.Option(100000, '--limit', help="Max records to write to streams/KV"),
+):
+    """Build an AST-backed cache of classes/functions (Python) and persist to RedDB.
+
+    Falls back to our Python AST parser (knowledge.py). If ast-grep is available, you can
+    extend this to multi-language patterns later.
+    """
+    try:
+        from .db.factory import get_storage as _get_storage
+    except Exception as e:
+        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+    st = _get_storage()
+    if st is None:
+        console.print(Panel("No storage configured (set REDDB_URL).", title="ast-cache", border_style="yellow")); raise typer.Exit(1)
+    g = build_code_graph(workspace)
+    files = g.get('files', []) or []
+    wrote = 0
+    for rec in files:
+        if wrote >= limit:
+            break
+        path = rec.get('path'); classes = rec.get('classes') or []; functions = rec.get('functions') or []
+        # Streams for backfill
+        for c in classes:
+            st.append('code.ast.class', {'name': c, 'path': path})  # type: ignore
+            # KV cache: append path if not present
+            key = f'code:ast:class:{c}'
+            try:
+                cur = st.get(key) or []  # type: ignore
+                if path not in cur:
+                    cur.append(path)
+                    st.put(key, cur)  # type: ignore
+            except Exception:
+                pass
+            wrote += 1
+            if wrote >= limit: break
+        if wrote >= limit:
+            break
+        for fn in functions:
+            st.append('code.ast.function', {'name': fn, 'path': path})  # type: ignore
+            key = f'code:ast:function:{fn}'
+            try:
+                cur = st.get(key) or []  # type: ignore
+                if path not in cur:
+                    cur.append(path)
+                    st.put(key, cur)  # type: ignore
+            except Exception:
+                pass
+            wrote += 1
+            if wrote >= limit: break
+    # Try ast-grep for JS/TS classes/functions (best-effort)
+    exe = ast_grep_available()
+    if exe:
+        langs = ["js", "jsx", "ts", "tsx"]
+        patterns = {
+            "class": [
+                "class $A { ... }",
+                "export default class $A { ... }",
+                "export class $A { ... }",
+            ],
+            "function": [
+                "function $A($B) { ... }",
+                "export default function $A($B) { ... }",
+                "export function $A($B) { ... }",
+                "const $A = ($B) => { ... }",
+            ],
+            # Methods inside classes (best-effort)
+            "method": [
+                "class $C { $M($ARGS) { ... } }",
+            ],
+        }
+        import json as _j, re as _re
+        for lang in langs:
+            for kind, pats in patterns.items():
+                for pat in pats:
+                    code, out, err = run_ast_grep(root=workspace, pattern=pat, lang=lang, rule_file=None, json=True)
+                for line in (out or "").splitlines():
+                    try:
+                        d = _j.loads(line)
+                    except Exception:
+                        continue
+                    path = d.get('file') or d.get('path') or ''
+                    text = d.get('text') or d.get('match') or ''
+                    name = None
+                    if kind == 'class':
+                        m = _re.search(r'class\s+(\w+)', text)
+                        name = m.group(1) if m else None
+                    elif kind == 'function':
+                        m = _re.search(r'function\s+(\w+)\s*\(', text)
+                        name = m.group(1) if m else None
+                        if not name:
+                            m = _re.search(r'const\s+(\w+)\s*=\s*\(', text)
+                            name = m.group(1) if m else None
+                    elif kind == 'method':
+                        m = _re.search(r'(\w+)\s*\(', text)
+                        name = m.group(1) if m else None
+                    # Streams
+                    try:
+                        st.append(f'code.ast.{lang}.{kind}', {'name': name or '', 'path': path})  # type: ignore
+                    except Exception:
+                        pass
+                    # KV cache
+                    try:
+                        if name:
+                            key = f'code:ast:{lang}:{kind}:{name}'
+                            cur = st.get(key) or []  # type: ignore
+                            if path and path not in cur:
+                                cur.append(path)
+                                st.put(key, cur)  # type: ignore
+                    except Exception:
+                        pass
+    console.print(f"[green]AST cache written ({wrote} records + ast-grep where available).[/green]")
+
+
+@app.command("find_chunk")
+def find_chunk(
+    file: Optional[Path] = typer.Option(None, '--file', exists=True, help="File path"),
+    start: Optional[int] = typer.Option(None, '--start', help="Start line (1-based)"),
+    end: Optional[int] = typer.Option(None, '--end', help="End line (inclusive)"),
+    hash: Optional[str] = typer.Option(None, '--hash', help="Chunk hash (sha256 of path+start+end)"),
+):
+    """Lookup a code chunk either by hash or by file + line range. Uses KV cache when available."""
+    import hashlib as _h
+    if not hash and not (file and start and end):
+        console.print("[yellow]Provide --hash or (--file --start --end).[/yellow]"); raise typer.Exit(2)
+    try:
+        from .db.factory import get_storage as _get_storage
+    except Exception as e:
+        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+    st = _get_storage()
+    if not hash:
+        hash = _h.sha256((str(file) + str(start) + str(end)).encode('utf-8')).hexdigest()
+    rec = None
+    if st is not None:
+        rec = st.get(f'code:chunk:{hash}')  # type: ignore
+    if isinstance(rec, dict) and rec.get('text'):
+        console.print(Panel(rec.get('text'), title=f"{rec.get('path')}:{rec.get('start_line')}-{rec.get('end_line')} | {hash}", border_style="cyan")); raise typer.Exit(0)
+    # Fallback: read from disk if file-range specified
+    if file and start and end:
+        try:
+            text = file.read_text(errors='ignore')
+            lines = text.splitlines()
+            seg = "\n".join(lines[start - 1 : end])
+            console.print(Panel(seg or "(empty)", title=f"{file}:{start}-{end} | {hash}", border_style="cyan")); raise typer.Exit(0)
+        except Exception as e:
+            console.print(Panel(str(e), title="read failed", border_style="red")); raise typer.Exit(1)
+    console.print("[yellow]Chunk not found in KV and no file-range provided.[/yellow]"); raise typer.Exit(1)
 
 
 @app.command()
@@ -1358,6 +1885,7 @@ def gepa_train(
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
     structured: bool = typer.Option(False, '--structured', help="Prefer structured-outputs when available (overrides --force-json)"),
     report_dir: Optional[Path] = typer.Option(None, '--report-dir', help="Directory to write evaluation reports"),
+    workspace: Optional[Path] = typer.Option(None, '--workspace', exists=True, dir_okay=True, help="Workspace to fetch code summary (optional)"),
 ):
     if structured:
         os.environ['DSPY_FORCE_JSON_OBJECT'] = 'false'
@@ -1392,6 +1920,9 @@ def gepa_train(
         log_dir = Path.cwd() / f'.gepa_{module}'
     progress_path = (log_dir / 'progress.jsonl').resolve()
     result: dict = {}
+    code_summary: Optional[str] = None
+    if workspace:
+        code_summary = _get_code_summary(workspace)
     def _worker():
         try:
             if val_jsonl and val_jsonl.exists():
@@ -1406,6 +1937,7 @@ def gepa_train(
                     log_dir=str(log_dir) if log_dir else None,
                     track_stats=track_stats,
                     progress_path=str(progress_path),
+                    code_summary=code_summary,
                 )
             else:
                 result['prog'] = run_gepa(
@@ -1418,6 +1950,7 @@ def gepa_train(
                     log_dir=str(log_dir) if log_dir else None,
                     track_stats=track_stats,
                     progress_path=str(progress_path),
+                    code_summary=code_summary,
                 )
         except Exception as e:
             result['error'] = e
@@ -1620,6 +2153,79 @@ def gepa_orchestrator(
             except Exception as e:
                 console.print(f"[yellow]Could not write report: {e}[/yellow]")
     console.print(Panel.fit("Flags: --train-jsonl --val-jsonl --test-jsonl --dataset-dir --auto --log-dir --save-best --ollama/--no-ollama --model --base-url --api-key", title="usage", border_style="dim"))
+
+
+@app.command()
+def gepa_codegen(
+    train_jsonl: Path = typer.Option(..., '--train-jsonl', exists=True, help="Train JSONL for code edits: {task, context, file_hints?}"),
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', exists=True, dir_okay=True, help="Workspace to test patches in"),
+    test_cmd: Optional[str] = typer.Option(None, '--test-cmd', help="Test command (e.g., 'pytest -q')"),
+    type_cmd: Optional[str] = typer.Option("python -m compileall -q .", '--type-cmd', help="Type/syntax check command"),
+    lint_cmd: Optional[str] = typer.Option(None, '--lint-cmd', help="Lint command (optional)"),
+    auto: Optional[str] = typer.Option('light', '--auto', help="GEPA budget: light|medium|heavy"),
+    log_dir: Optional[Path] = typer.Option(None, '--log-dir', help="Where to write GEPA logs"),
+    ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama for reflection LM"),
+    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model', help="Reflection model"),
+    base_url: Optional[str] = typer.Option(None, '--base-url'),
+    api_key: Optional[str] = typer.Option(None, '--api-key'),
+):
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    if lm is None:
+        console.print("[yellow]No LM configured; cannot run codegen GEPA.[/yellow]")
+        raise typer.Exit(1)
+    _print_header("GEPA Codegen")
+    try:
+        prog = run_gepa_codegen(
+            train_jsonl=train_jsonl,
+            workspace=workspace,
+            test_cmd=test_cmd,
+            type_cmd=type_cmd,
+            lint_cmd=lint_cmd,
+            auto=auto,
+            reflection_lm=lm,
+            log_dir=str(log_dir) if log_dir else None,
+            track_stats=True,
+        )
+        console.print("[green]GEPA codegen complete.[/green]")
+    except Exception as e:
+        console.print(Panel(str(e), title="gepa codegen failed", border_style="red"))
+        raise typer.Exit(1)
+
+
+@app.command("edit")
+def code_edit(
+    task: str = typer.Argument(..., help="Describe the code change you want"),
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', exists=True, dir_okay=True),
+    context: Optional[str] = typer.Option(None, '--context', help="Optional context (errors/logs). If omitted, built from logs"),
+    file_hints: Optional[str] = typer.Option(None, '--files', help="Optional file/module hints"),
+    apply: bool = typer.Option(False, '--apply/--no-apply', help="Apply the generated patch"),
+    ollama: bool = typer.Option(True, '--ollama/--no-ollama'),
+    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model'),
+    base_url: Optional[str] = typer.Option(None, '--base-url'),
+    api_key: Optional[str] = typer.Option(None, '--api-key'),
+):
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    if lm is None:
+        console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]"); raise typer.Exit(1)
+    # Build context if missing
+    ctx_text = context or ""
+    if not ctx_text:
+        bundle, _ = load_logs([workspace / 'logs'])
+        ctx_text = extract_key_events(bundle) if bundle else ""
+    from .skills.code_edit import CodeEdit
+    code_graph = _get_code_summary(workspace)
+    ce = CodeEdit(use_cot=True)
+    out = ce(task=task, context=ctx_text, code_graph=code_graph, file_hints=file_hints or "")
+    _print_header("Proposed Patch")
+    console.print(out.patch or "(no patch)")
+    _print_header("Rationale")
+    console.print(out.rationale or "(no rationale)")
+    if apply and out.patch:
+        ok, msg = apply_unified_patch(out.patch, workspace)
+        if ok:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            console.print(Panel(msg, title="apply failed", border_style="red"))
 
 
 @app.command()
@@ -2093,7 +2699,7 @@ def start(
             lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
             if lm is not None:
                 try:
-                    orch = Orchestrator()
+                    orch = Orchestrator(use_cot=True)
                     pred = orch(query=nl, state=state)
                     tool = (pred.tool or "").strip()
                     import json as _json
@@ -2162,8 +2768,10 @@ def start(
             if lm is None:
                 console.print("[yellow]No LM configured for planning.[/yellow]"); return
             builder = ContextBuilder(); ctx = builder(task=args.get("task", ""), logs_preview=key)
+            code_graph = _get_code_summary(ws)
+            fused_context = f"{ctx.context}\n\n{ctx.key_points}\n\nCode Summary:\n{code_graph}" if code_graph else f"{ctx.context}\n\n{ctx.key_points}"
             _print_header("Agent Plan"); agent = TaskAgent()
-            out = agent(task=args.get("task", ""), context=f"{ctx.context}\n\n{ctx.key_points}")
+            out = agent(task=args.get("task", ""), context=fused_context)
             console.print(Panel.fit(out.plan, title="Proposed Plan", border_style="blue"))
             console.print(Panel.fit(out.commands or "(no commands)", title="Suggested Commands", border_style="yellow"))
         elif t == "grep":
@@ -2202,9 +2810,164 @@ def start(
             console.print(Panel.fit(snap[:8000] + ("\n..." if len(snap)>8000 else ""), title=str(target), border_style="magenta"))
             lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
             if lm:
-                cc = CodeContext(); out = cc(snapshot=snap, ask="Summarize key parts and modification points.")
+                cc = CodeContext(); code_graph = _get_code_summary(ws)
+                out = cc(snapshot=snap, ask="Summarize key parts and modification points.", code_graph=code_graph)
                 console.print(Panel.fit(out.summary, title="Summary", border_style="cyan"))
                 console.print(Panel.fit(out.bullets, title="Bullets", border_style="green"))
+        elif t == "knowledge":
+            # args: file, import, class, function, lang
+            g = _get_code_graph(ws)
+            files = g.get('files') or []
+            f = args.get('file'); imp = args.get('import'); cls = args.get('class'); fn = args.get('function'); lang = (args.get('lang') or '').strip()
+            matches = []
+            # Query KV caches first for class/function if provided
+            try:
+                from .db.factory import get_storage as _get_storage
+                st = _get_storage()
+            except Exception:
+                st = None
+            paths_from_kv = set()
+            if st is not None:
+                keys = []
+                if cls:
+                    keys.append(f'code:ast:class:{cls}')
+                    if lang:
+                        keys.append(f'code:ast:{lang}:class:{cls}')
+                if fn:
+                    keys.append(f'code:ast:function:{fn}')
+                    if lang:
+                        keys.append(f'code:ast:{lang}:function:{fn}')
+                for k in keys:
+                    try:
+                        arr = st.get(k) or []  # type: ignore
+                        for p in arr:
+                            paths_from_kv.add(p)
+                    except Exception:
+                        pass
+            # Merge: KV paths first
+            for rec in files:
+                pth = rec.get('path','')
+                if paths_from_kv and pth not in paths_from_kv:
+                    continue
+                if f and f not in pth:
+                    continue
+                if imp and imp not in (rec.get('imports') or []):
+                    continue
+                if cls and cls not in (rec.get('classes') or []):
+                    continue
+                if fn and fn not in (rec.get('functions') or []):
+                    continue
+                matches.append(rec)
+            if not matches:
+                console.print("[yellow]No knowledge matches. Provide file/import/class/function args.[/yellow]"); return
+            title = f"knowledge matches={len(matches)}"
+            body = "\n".join(f"- {m.get('path')} | classes={len(m.get('classes') or [])} funcs={len(m.get('functions') or [])}" for m in matches[:50])
+            console.print(Panel(body, title=title, border_style="blue"))
+        elif t == "vretr":
+            # Manual vector retrieval
+            q = args.get('query') or args.get('q') or ''
+            if not q:
+                console.print("[yellow]vretr needs --query[/yellow]"); return
+            k = int(args.get('k', 5))
+            hf = bool(args.get('hf', False)); model = args.get('model') or ('all-MiniLM-L6-v2' if hf else 'openai/text-embedding-3-small')
+            if hf:
+                try:
+                    from sentence_transformers import SentenceTransformer  # type: ignore
+                    embedder = SentenceTransformer(model)
+                except Exception as e:
+                    console.print(Panel(str(e), title="HF embeddings missing", border_style="red")); return
+            else:
+                try:
+                    embedder = dspy.Embeddings(model=model)
+                except Exception as e:
+                    console.print(Panel(str(e), title="DSPy embeddings missing", border_style="red")); return
+            try:
+                from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
+                items = load_emb_index(ws)
+                qv = _embed_query(embedder, q)
+                hits = _emb_search(qv, items, top_k=k)
+                if not hits:
+                    console.print("[yellow]No vector matches.")
+                    return
+                for score_i, it in hits:
+                    p = Path(it.path)
+                    try:
+                        text = p.read_text(errors='ignore')
+                        lines = text.splitlines()
+                        s = max(1, it.start_line - 2)
+                        e = min(len(lines), it.end_line + 2)
+                        seg = "\n".join(lines[s - 1 : e])
+                    except Exception:
+                        seg = "(unreadable)"; s = it.start_line; e = it.end_line
+                    title = f"{p} score={score_i:.3f} lines {s}-{e}"
+                    console.print(Panel(seg, title=title, border_style="cyan"))
+            except Exception as e:
+                console.print(Panel(str(e), title="vretr failed", border_style="red"))
+        elif t == "intel":
+            # High-level evidence composition: knowledge + vretr (+ optional sg)
+            q = args.get('query') or args.get('q') or ''
+            if not q:
+                console.print("[yellow]intel needs --query[/yellow]"); return
+            # Knowledge
+            g = _get_code_graph(ws)
+            files = g.get('files') or []
+            import re as _re
+            classes = _re.findall(r'\b[A-Z][a-zA-Z0-9_]+\b', q)
+            funcs = _re.findall(r'\b[a-z_][a-z0-9_]+\b', q)
+            kn_matches = []
+            for rec in files:
+                pth = rec.get('path','')
+                hit = False
+                if any(c in (rec.get('classes') or []) for c in classes):
+                    hit = True
+                if any(fn in (rec.get('functions') or []) for fn in funcs):
+                    hit = True
+                if any(tok in pth for tok in funcs[:3]):
+                    hit = True
+                if hit:
+                    kn_matches.append(rec)
+            # Vector retrieval
+            k = int(args.get('k', 5))
+            hf = bool(args.get('hf', False)); model = args.get('model') or ('all-MiniLM-L6-v2' if hf else 'openai/text-embedding-3-small')
+            if hf:
+                try:
+                    from sentence_transformers import SentenceTransformer  # type: ignore
+                    embedder = SentenceTransformer(model)
+                    def _emb(text): return embedder.encode(text)
+                except Exception as e:
+                    console.print(Panel(str(e), title="HF embeddings missing", border_style="red")); return
+            else:
+                try:
+                    eobj = dspy.Embeddings(model=model)
+                    def _emb(text): return eobj.embed(text)  # type: ignore
+                except Exception as e:
+                    console.print(Panel(str(e), title="DSPy embeddings missing", border_style="red")); return
+            try:
+                from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
+                items = load_emb_index(ws)
+                qv = _emb([q])[0]
+                hits = _emb_search(list(qv), items, top_k=k)
+            except Exception:
+                hits = []
+            # Render evidence
+            _print_header("Intel: Knowledge matches")
+            if kn_matches:
+                body = "\n".join(f"- {m.get('path')} | classes={len(m.get('classes') or [])} funcs={len(m.get('functions') or [])}" for m in kn_matches[:50])
+                console.print(Panel(body, title=f"{len(kn_matches)} files", border_style="blue"))
+            else:
+                console.print("[yellow]No knowledge matches.[/yellow]")
+            _print_header("Intel: Vector retrieval")
+            if hits:
+                for score_i, it in hits:
+                    p = Path(it.path)
+                    try:
+                        text = p.read_text(errors='ignore'); lines = text.splitlines(); s = max(1, it.start_line - 2); e = min(len(lines), it.end_line + 2); seg = "\n".join(lines[s - 1 : e])
+                    except Exception:
+                        seg = "(unreadable)"; s = it.start_line; e = it.end_line
+                    title = f"{p} score={score_i:.3f} lines {s}-{e}"
+                    console.print(Panel(seg, title=title, border_style="cyan"))
+            else:
+                console.print("[yellow]No vector matches.[/yellow]")
         elif t == "index":
             _print_header("Building index"); meta, items = build_index(ws, smart=True); out_dir = save_index(ws, meta, items)
             console.print(f"[green]Indexed {len(items)} chunks. Saved to {out_dir}[/green]")
@@ -2832,3 +3595,38 @@ def sg(
 
 if __name__ == "__main__":
     app()
+  dspy-worker:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic app --bootstrap kafka:9092
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  dspy-router:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      python - <<'PY'
+from dspy_agent.router_worker import RouterWorker
+RouterWorker('kafka:9092').run()
+PY
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s

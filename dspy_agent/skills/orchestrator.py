@@ -5,7 +5,7 @@ import dspy
 
 TOOLS = [
     "context", "plan", "grep", "extract", "tree", "ls",
-    "codectx", "index", "esearch", "emb-index", "emb-search",
+    "codectx", "index", "esearch", "emb-index", "emb-search", "knowledge", "vretr", "intel",
     "open", "watch", "sg", "patch", "diff", "git_status",
     "git_add", "git_commit"
 ]
@@ -22,15 +22,16 @@ class OrchestrateToolSig(dspy.Signature):
     query: str = dspy.InputField(desc="User's natural-language request")
     state: str = dspy.InputField(desc="Short environment summary: workspace, logs, last extract, indexes available")
 
-    tool: str = dspy.OutputField(desc=f"One of: {', '.join(TOOLS)}")
-    args_json: str = dspy.OutputField(desc="A JSON object mapping argument names to values")
+    tool: str = dspy.OutputField(desc=f"One of: {', '.join(TOOLS)} (choose conservatively)")
+    args_json: str = dspy.OutputField(desc="JSON object of arguments; omit unknown fields")
+    rationale: str = dspy.OutputField(desc="Brief reasoning for the tool choice")
 
 
 class Orchestrator(dspy.Module):
-    def __init__(self):
+    def __init__(self, use_cot: bool = True):
         super().__init__()
-        self.predict = dspy.Predict(OrchestrateToolSig)
+        # Use CoT to justify routing when available
+        self.predict = dspy.ChainOfThought(OrchestrateToolSig) if use_cot else dspy.Predict(OrchestrateToolSig)
 
     def forward(self, query: str, state: str):
         return self.predict(query=query, state=state)
-

@@ -31,8 +31,7 @@ Super Simple Setup (Lightweight)
 Optional, recommended
 
 - Enable Kafka (local):
-  - Start local Kafka services (compose profile):
-    - `docker compose -f docker/lightweight/docker-compose.yml --profile kafka up -d`
+  - Kafka + Zookeeper + Spark are included in lightweight by default.
   - Enable publishing: `export KAFKA_BOOTSTRAP_SERVERS=localhost:9092`
   - Install client: `uv pip install confluent-kafka`
   - Create topics: `dspy-code stream_topics` (or `dspy-code deploy_topics --bootstrap localhost:9092`)
@@ -40,6 +39,39 @@ Optional, recommended
   - `export REDDB_URL=http://localhost:8080` (and optionally `REDDB_NAMESPACE`, `REDDB_TOKEN`)
 - Inspect latest agent outputs:
   - `dspy-code last --container app --what all`
+
+Learn the Codebase
+
+- Build a code graph and (optionally) embeddings so the agent deeply understands your repo:
+  - `dspy-code learn --workspace $(pwd) --embeddings`
+  - Writes `./.dspy_index/knowledge.json`, persists to storage (if configured), and prints a concise summary.
+  - Status endpoint `GET /code` returns the stored graph + summary.
+
+Streaming Engine (Kafka + Spark)
+
+- Dataflow (lightweight):
+  - Local tailer publishes `logs.raw.<container>` to Kafka (via LocalBus → Kafka).
+  - Spark Structured Streaming job consumes `logs.raw.app`, aggregates error windows, and publishes `logs.ctx.app`.
+  - You can run a Kafka worker to process `logs.ctx.<container>` and emit results to `agent.results.<container>`:
+    - `dspy-code worker --topic app --bootstrap localhost:9092`
+- Compose services:
+  - `kafka`, `zookeeper`, and `spark` services are included and start with the stack.
+  - Spark runs the generated job `scripts/streaming/spark_logs.py` with a checkpoint under `/workspace/.dspy_checkpoints/spark_logs`.
+- Generate or customize Spark job:
+  - `dspy-code spark-script --out scripts/streaming/spark_logs.py`
+  - The default job filters for error keywords and emits context windows to Kafka.
+
+Topic-Aware Orchestrator Training
+
+- Goal: train the router to select the right tool/args per topic (e.g., backend vs. frontend).
+- Dataset (JSONL), one per line:
+  - `{ "query": "investigate API timeout", "workspace": "/abs/repo", "logs": "/abs/repo/logs/backend.log", "targets": ["timeout", "retry"], "topic": "backend" }`
+  - `{ "query": "UI error on login", "workspace": "/abs/repo", "logs": "/abs/repo/logs/frontend.log", "targets": ["TypeError"], "topic": "frontend" }`
+- Train:
+  - `dspy-code gepa-orchestrator --train-jsonl data/orch_train.jsonl --auto light --ollama --model deepseek-coder:1.3b`
+- Notes:
+  - The training loader injects `topic=<name>` into the state field so the Orchestrator can condition decisions by topic.
+  - Workers subscribe to `logs.ctx.<topic>` and publish to `agent.results.<topic>` so the router can aggregate results and persist per-topic summaries.
 
 Notes & Tips
 
@@ -67,6 +99,10 @@ Usage
 
 - Propose plan and commands for a task using logs as context:
   - `uv run dspy-code run "fix failing tests" --workspace /path/to/repo --logs ./logs --ollama --model deepseek-coder:1.3b`
+
+- Generate a code patch (unified diff) with rationale:
+  - `dspy-code edit "refactor X to Y" --workspace /path/to/repo --files app/service.py --apply`
+  - Builds context from logs if omitted and uses learned code summary.
 
 Code Context
 
@@ -96,6 +132,17 @@ Embeddings (optional)
   - Notes:
     - `--device auto` will try GPU if available; use `--device cpu` to force CPU.
     - `--flash` enables flash_attention_2 when supported (GPU recommended).
+
+Persist Embeddings + Chunks (RedDB)
+
+- Build and persist:
+  - `dspy-code emb_index --workspace $(pwd) --hf --model all-MiniLM-L6-v2 --persist`
+- Inspect:
+  - `dspy-code embeddings_inspect --start 0 --count 10`
+  - Shows embedding metadata and the aligned code chunk text (via KV cache per hash).
+- Compact chunks (deduplicate into KV):
+  - `dspy-code chunks_compact --start 0 --count 1000`
+  - Fills `code:chunk:<hash>` KV entries for fast lookups.
 
 Interactive Session
 
@@ -281,9 +328,9 @@ Training With GEPA
     - {"snapshot": str, "ask": str, "keywords": [str]}
 
 - Run GEPA optimization (uses your LLM for reflection):
-  - `dspy-coder gepa-train --module task --train-jsonl data/task_train.jsonl --auto medium --ollama --model deepseek-coder:1.3b --log-dir .gepa_logs --track-stats`
+  - `dspy-code gepa-train --module task --train-jsonl data/task_train.jsonl --auto medium --ollama --model deepseek-coder:1.3b --log-dir .gepa_logs --track-stats`
   - Save best candidate program:
-    - `dspy-coder gepa-train --module context --train-jsonl data/context_train.jsonl --auto light --save-best prompts/context_best.json`
+    - `dspy-code gepa-train --module context --train-jsonl data/context_train.jsonl --auto light --save-best prompts/context_best.json`
 
 - Orchestrate tool-selection with GEPA (agent decides which command to run):
   - JSONL schema per line: `{ "query": str, "workspace": str, "logs": str|null, "targets": [str] }`
@@ -291,14 +338,26 @@ Training With GEPA
   - The metric executes safe evaluations of chosen actions (grep/extract/context/codectx/index/esearch/plan) and scores success; GEPA evolves the orchestration prompts using this feedback.
 
 - Notes:
-  - GEPA benefits from a strong reflection model; local small models work but may improve slowly.
-  - The metric here scores keyword coverage and returns textual feedback to guide evolution.
+  - GEPA benefits from a strong reflection model; local small models work but may improve more slowly.
+  - The metrics score keyword coverage and gently penalize risky shell commands for task plans.
   - Set `--auto light|medium|heavy` or use `--max-full-evals`/`--max-metric-calls` for budget control.
 - Initialize on a repo (auto-dataset + optional light training):
-  - `dspy-coder init --workspace /path/to/repo --ollama --model deepseek-coder:1.3b --train --budget light`
+  - `dspy-code init --workspace /path/to/repo --ollama --model deepseek-coder:1.3b --train --budget light`
   - Datasets written to `<repo>/.dspy_data`: `orch_train.jsonl`, `context_train.jsonl`, `code_train.jsonl`, `task_train.jsonl`.
   - Then you can run `gepa-orchestrator` or `gepa-train` explicitly for deeper training later.
 
 - Auto-bootstrap:
-  - `dspy-coder init --workspace /path/to/repo --train --budget light`
+  - `dspy-code init --workspace /path/to/repo --train --budget light`
   - Creates datasets and runs quick GEPA passes for orchestrator/context/code/task.
+
+Codegen GEPA (Trainable Coding Agent)
+
+- Goal: learn prompts that generate the best code patches for your repo.
+- Dataset (JSONL), one per line: `{ "task": str, "context": str, "file_hints": str? }`
+- Run training:
+  - `dspy-code gepa-codegen --train-jsonl data/codegen_train.jsonl --workspace $(pwd) --test-cmd "pytest -q" --type-cmd "python -m compileall -q ."`
+- Metric (composite):
+  - Tests (0.6), Types/Syntax (0.25), Lint (0.15 if provided). Runs in a temporary copy of your repo.
+  - Partial credit when some checks pass. Feedback includes test/type/lint outputs (tail) for quick iteration.
+- Outputs:
+  - Optimized program (prompt) for `CodeEdit` module (rationale + unified diff), callable by the agent.

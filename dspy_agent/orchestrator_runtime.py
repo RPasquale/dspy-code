@@ -11,7 +11,7 @@ from .indexer import build_index, save_index, load_index, semantic_search
 from .code_snapshot import build_code_snapshot
 
 
-SAFE_TOOLS = {"context", "plan", "grep", "extract", "codectx", "index", "esearch"}
+SAFE_TOOLS = {"context", "plan", "grep", "extract", "codectx", "index", "esearch", "knowledge", "vretr", "intel"}
 
 
 @dataclass
@@ -180,6 +180,107 @@ def evaluate_tool_choice(
         else:
             fb.append("esearch found no results. Consider grep or building the index first.")
 
+    elif t == "vretr":
+        # Vector retrieval over local embedding index
+        q = argd.get('query') or argd.get('q') or ''
+        k = int(argd.get('k', 5))
+        try:
+            from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
+            import dspy as _dspy
+            # Embeddings model is required in DSPy mode; default to a small open model name or require user to provide
+            model = argd.get('model') or 'openai/text-embedding-3-small'
+            embedder = _dspy.Embeddings(model=model)
+            items = load_emb_index(workspace)
+            qv = _embed_query(embedder, q)
+            hits = _emb_search(qv, items, top_k=k)
+        except Exception:
+            hits = []
+        evidence.append(f"vretr hits={len(hits)}")
+        if hits:
+            score += 1.0
+            # Load snippets and check coverage of targets
+            segs = []
+            for score_i, it in hits:
+                p = Path(it.path)
+                try:
+                    text = p.read_text(errors='ignore')
+                    lines = text.splitlines()
+                    s = max(1, it.start_line - 2)
+                    e = min(len(lines), it.end_line + 2)
+                    segs.append("\n".join(lines[s - 1 : e]))
+                except Exception:
+                    continue
+            joined = "\n".join(segs)
+            c, miss = cov(joined, targets)
+            score += 0.5 * c
+            if miss:
+                fb.append("vretr: results miss: " + ", ".join(miss))
+        else:
+            fb.append("vretr found no results. Consider building embeddings index first.")
+
+    elif t == "intel":
+        # Compose knowledge + vretr given a natural-language query
+        q = argd.get('query') or argd.get('q') or ''
+        k = int(argd.get('k', 5))
+        # Gather knowledge matches
+        kn_files = []
+        try:
+            from .db.factory import get_storage as _get_storage
+            st = _get_storage()
+            if st is not None:
+                graph = st.get('code:graph') if hasattr(st, 'get') else None  # type: ignore
+                if isinstance(graph, dict):
+                    files = graph.get('files', []) or []
+                    # Heuristic: if query includes CamelCase -> class, snake_case -> function, else treat tokens as possible paths
+                    import re as _re
+                    classes = _re.findall(r'\b[A-Z][a-zA-Z0-9_]+\b', q)
+                    funcs = _re.findall(r'\b[a-z_][a-z0-9_]+\b', q)
+                    for rec in files:
+                        pth = rec.get('path','')
+                        hit = False
+                        if any(c in (rec.get('classes') or []) for c in classes):
+                            hit = True
+                        if any(fn in (rec.get('functions') or []) for fn in funcs):
+                            hit = True
+                        if any(tok in pth for tok in funcs[:3]):
+                            hit = True
+                        if hit:
+                            kn_files.append(rec)
+        except Exception:
+            pass
+        # Gather vector retrieval hits
+        vretr_hits = []
+        try:
+            from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
+            import dspy as _dspy
+            model = argd.get('model') or 'openai/text-embedding-3-small'
+            embedder = _dspy.Embeddings(model=model)
+            items = load_emb_index(workspace)
+            qv = _embed_query(embedder, q)
+            vretr_hits = _emb_search(qv, items, top_k=k)
+        except Exception:
+            vretr_hits = []
+        # Score: +1 if any knowledge match, +1 if any vretr hit, coverage over joined text
+        if kn_files:
+            score += 1.0
+        if vretr_hits:
+            score += 1.0
+        text = "\n".join(
+            [rec.get('path','')+" " + " ".join((rec.get('classes') or []) + (rec.get('functions') or [])) for rec in kn_files[:50]]
+        )
+        segs = []
+        for _, it in vretr_hits:
+            try:
+                p = Path(it.path); txt=p.read_text(errors='ignore'); lines=txt.splitlines(); s=max(1,it.start_line-2); e=min(len(lines),it.end_line+2); segs.append("\n".join(lines[s-1:e]))
+            except Exception:
+                continue
+        text += ("\n"+"\n".join(segs))
+        c, miss = cov(text, targets)
+        score += 0.5 * c
+        evidence.append(f"intel kn={len(kn_files)} vretr={len(vretr_hits)} cov={c:.2f}")
+        if miss:
+            fb.append("intel: missing targets: " + ", ".join(miss))
+
     elif t == "plan":
         # Heuristic: plan text should contain multiple steps-like lines
         plan_text = (argd.get("plan_text") or "")  # During training, we don't call LLM; rely on downstream plan execution elsewhere
@@ -187,6 +288,41 @@ def evaluate_tool_choice(
         score += 1.0 if len(steps) >= 2 else 0.2
         evidence.append(f"plan steps_detected={len(steps)}")
 
+    elif t == "knowledge":
+        # Query code knowledge graph stored in KV
+        try:
+            from .db.factory import get_storage as _get_storage
+            st = _get_storage()
+        except Exception:
+            st = None
+        found = []
+        if st is not None:
+            graph = st.get('code:graph') if hasattr(st, 'get') else None  # type: ignore
+            if isinstance(graph, dict):
+                files = graph.get('files', []) or []
+                f = argd.get('file'); imp = argd.get('import'); cls = argd.get('class'); fn = argd.get('function')
+                for rec in files:
+                    if f and f not in rec.get('path',''):
+                        continue
+                    if imp and imp not in (rec.get('imports') or []):
+                        continue
+                    if cls and cls not in (rec.get('classes') or []):
+                        continue
+                    if fn and fn not in (rec.get('functions') or []):
+                        continue
+                    found.append(rec)
+        n = len(found)
+        evidence.append(f"knowledge matches={n}")
+        if n>0:
+            score += 1.0
+            # coverage by targets over concatenated names
+            text = "\n".join([rec.get('path','')+" "+" ".join((rec.get('classes') or [])+(rec.get('functions') or [])) for rec in found[:50]])
+            c, miss = cov(text, targets)
+            score += 0.5 * c
+            if miss:
+                fb.append("knowledge: consider refining query / add imports or symbols: " + ", ".join(miss))
+        else:
+            fb.append("knowledge found no matches. Provide file/import/class/function.")
+
     feedback = " \n".join(fb) if fb else "Looks good."
     return EvalOutcome(score=float(score), feedback=feedback, evidence="; ".join(evidence))
-

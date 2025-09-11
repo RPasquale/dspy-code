@@ -71,6 +71,7 @@ class StreamConfig:
             KafkaTopic(name="agent.errors"),
             KafkaTopic(name="deploy.logs.lightweight"),
             KafkaTopic(name="deploy.events.lightweight"),
+            KafkaTopic(name="code.fs.events"),
         ]
         return StreamConfig(
             kafka=KafkaConfig(topics=topics),

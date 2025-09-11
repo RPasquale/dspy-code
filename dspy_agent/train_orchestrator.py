@@ -22,9 +22,10 @@ def _read_jsonl(path: Path) -> List[dict]:
     return out
 
 
-def _state_text(workspace: Path, logs: Optional[Path]) -> str:
+def _state_text(workspace: Path, logs: Optional[Path], topic: Optional[str]) -> str:
     has_logs = bool(logs and Path(logs).exists())
-    return f"workspace={workspace} logs={logs or (workspace/'logs')} logs_exist={has_logs}"
+    t = topic or ""
+    return f"workspace={workspace} logs={logs or (workspace/'logs')} logs_exist={has_logs} topic={t}"
 
 
 def load_orchestrator_trainset(jsonl_path: Path) -> List[dspy.Example]:
@@ -33,7 +34,8 @@ def load_orchestrator_trainset(jsonl_path: Path) -> List[dspy.Example]:
       "query": str,
       "workspace": str,  # path
       "logs": str | null, # path
-      "targets": [str]    # optional: keywords to hit
+      "targets": [str],   # optional: keywords to hit
+      "topic": str        # optional: target topic (e.g., backend, frontend, app)
     }
     """
     data = _read_jsonl(jsonl_path)
@@ -43,8 +45,8 @@ def load_orchestrator_trainset(jsonl_path: Path) -> List[dspy.Example]:
         ws = Path(r.get("workspace", ".")).resolve()
         logs = r.get("logs")
         lp = Path(logs).resolve() if logs else None
-        st = _state_text(ws, lp)
-        ex = dspy.Example(query=q, state=st, workspace=str(ws), logs=str(lp) if lp else "", targets=r.get("targets", []))
+        st = _state_text(ws, lp, r.get("topic"))
+        ex = dspy.Example(query=q, state=st, workspace=str(ws), logs=str(lp) if lp else "", targets=r.get("targets", []), topic=r.get("topic",""))
         # Mark inputs for DSPy so evaluation knows the input fields.
         ex = ex.with_inputs("query", "state")
         examples.append(ex)
@@ -106,7 +108,7 @@ def run_gepa_orchestrator(train_jsonl: Path, *, auto: Optional[str] = "light", r
         auto = "light"
     metric = make_logging_metric_orchestrator(progress_path)
     gepa = dspy.GEPA(metric=metric, auto=auto, reflection_lm=reflection_lm, log_dir=str(log_dir) if log_dir else None, track_stats=track_stats)
-    student = Orchestrator()
+    student = Orchestrator(use_cot=True)
     optimized = gepa.compile(student, trainset=trainset, valset=trainset)
     return optimized
 
@@ -122,7 +124,7 @@ def run_gepa_orchestrator_with_val(train_jsonl: Path, val_jsonl: Path, *, auto: 
         auto = "light"
     metric = make_logging_metric_orchestrator(progress_path)
     gepa = dspy.GEPA(metric=metric, auto=auto, reflection_lm=reflection_lm, log_dir=str(log_dir) if log_dir else None, track_stats=track_stats)
-    student = Orchestrator()
+    student = Orchestrator(use_cot=True)
     optimized = gepa.compile(student, trainset=trainset, valset=valset)
     return optimized
 

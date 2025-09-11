@@ -9,6 +9,7 @@ from pathlib import Path
 from .db.factory import get_storage
 from .streaming_config import DEFAULT_CONFIG_PATH, load_config, StreamConfig
 from .streaming_runtime import autodiscover_logs
+from .knowledge import summarize_code_graph
 
 
 def _container_names(workspace: Path) -> List[str]:
@@ -73,6 +74,16 @@ class _Handler(BaseHTTPRequestHandler):
                     except Exception:
                         result[c] = {"error": "unavailable"}
             return self._json(200, {"containers": result, "names": names})
+        if self.path == '/code':
+            st = self.storage
+            if st is None:
+                return self._json(200, {"status": "no-storage"})
+            try:
+                graph = st.get("code:graph")
+                summary = st.get("code:summary")
+                return self._json(200, {"graph": graph, "summary": summary})
+            except Exception:
+                return self._json(200, {"status": "unavailable"})
         return self._json(404, {"error": "not found"})
 
 
@@ -84,4 +95,3 @@ def start_status_server(host: str, port: int, workspace: Path) -> threading.Thre
     th = threading.Thread(target=httpd.serve_forever, daemon=True)
     th.start()
     return th
-

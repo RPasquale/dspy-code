@@ -11,6 +11,7 @@ class CodeContextSig(dspy.Signature):
 
     snapshot: str = dspy.InputField()
     ask: str = dspy.InputField()
+    code_graph: str = dspy.InputField(desc="Optional code graph summary", default="")
 
     summary: str = dspy.OutputField(desc="Concise codebase summary")
     bullets: str = dspy.OutputField(desc="Bulleted key parts, files, and hints")
@@ -21,6 +22,5 @@ class CodeContext(dspy.Module):
         super().__init__()
         self.predict = dspy.Predict(CodeContextSig)
 
-    def forward(self, snapshot: str, ask: str = "Summarize this code snapshot."):
-        return self.predict(snapshot=snapshot, ask=ask)
-
+    def forward(self, snapshot: str, ask: str = "Summarize this code snapshot.", code_graph: str = ""):
+        return self.predict(snapshot=snapshot, ask=ask, code_graph=code_graph)

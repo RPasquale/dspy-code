@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .indexer import Chunk, iter_chunks
+from .db.factory import get_storage
+import hashlib
 
 
 @dataclass
@@ -77,7 +79,7 @@ def build_emb_index(
     return items
 
 
-def save_emb_index(root: Path, items: List[EmbIndexItem], out_dir: Optional[Path] = None) -> Path:
+def save_emb_index(root: Path, items: List[EmbIndexItem], out_dir: Optional[Path] = None, persist: bool = False, persist_limit: int = 1000) -> Path:
     out_dir = out_dir or (root / ".dspy_index")
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "emb_index.jsonl").open("w") as f:
@@ -88,6 +90,33 @@ def save_emb_index(root: Path, items: List[EmbIndexItem], out_dir: Optional[Path
                 "end_line": it.end_line,
                 "vector": it.vector,
             }) + "\n")
+    if persist:
+        try:
+            st = get_storage()
+        except Exception:
+            st = None
+        if st is not None:
+            try:
+                meta = {"root": str(root.resolve()), "count": len(items)}
+                st.put('emb:index:meta', meta)  # type: ignore
+                # Append up to persist_limit items to streams for backfill
+                for i, it in enumerate(items[: max(0, persist_limit)]):
+                    rec = {"path": it.path, "start_line": it.start_line, "end_line": it.end_line, "vector": it.vector}
+                    st.append('emb.index', rec)  # type: ignore
+                    # Also persist code chunk text for this item
+                    try:
+                        p = Path(it.path)
+                        text = p.read_text(errors="ignore")
+                        lines = text.splitlines()
+                        seg = "\n".join(lines[it.start_line - 1 : it.end_line])
+                        h = hashlib.sha256((it.path + str(it.start_line) + str(it.end_line)).encode('utf-8')).hexdigest()
+                        st.append('code.chunks', {"hash": h, "path": it.path, "start_line": it.start_line, "end_line": it.end_line, "text": seg})  # type: ignore
+                        # KV cache for quick lookup
+                        st.put(f'code:chunk:{h}', {"path": it.path, "start_line": it.start_line, "end_line": it.end_line, "text": seg})  # type: ignore
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     return out_dir
 
 
