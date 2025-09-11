@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 import sys
 import shlex
 import time
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import typer
 from rich.console import Console
@@ -14,8 +15,6 @@ from rich.theme import Theme
 from rich.panel import Panel
 from rich.text import Text
 from rich.live import Live
-from rich.table import Table
-from rich.align import Align
 from rich.console import Group
 from rich.columns import Columns
 
@@ -45,7 +44,6 @@ from .autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
 from .orchestrator_runtime import evaluate_tool_choice
 from .indexer import tokenize
 from .router_worker import RouterWorker
-from .knowledge import build_code_graph
 from .embeddings_index import (
     build_emb_index,
     save_emb_index,
@@ -68,6 +66,7 @@ from .status_http import start_status_server
 from .streaming_kafka import WorkerLoop, KafkaParams
 from .knowledge import build_code_graph, summarize_code_graph
 import threading
+import json
 import json as _json
 
 
@@ -133,14 +132,15 @@ def _get_code_summary(ws: Path) -> str:
             s = st.get('code:summary')
             if isinstance(s, str) and s.strip():
                 return s
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]Storage not available for code summary: {e}[/dim]")
         pass
     # Fallback to quick on-the-fly summary (top files only)
     try:
-        from .knowledge import build_code_graph, summarize_code_graph
         g = build_code_graph(ws)
         return summarize_code_graph(g)
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]Failed to build code summary: {e}[/dim]")
         return ""
 
 def _get_code_graph(ws: Path) -> dict:
@@ -152,13 +152,14 @@ def _get_code_graph(ws: Path) -> dict:
             g = st.get('code:graph')
             if isinstance(g, dict):
                 return g
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]Storage not available for code graph: {e}[/dim]")
         pass
     # Fallback to on-the-fly build
     try:
-        from .knowledge import build_code_graph
         return build_code_graph(ws)
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]Failed to build code graph: {e}[/dim]")
         return {}
 
 
@@ -212,7 +213,8 @@ def _watch_logs(target: Path, tail_lines: int = 0, interval: float = 2.0):
             for p in list(iter_log_paths([target])):
                 try:
                     sz = p.stat().st_size
-                except Exception:
+                except Exception as e:
+                    console.print(f"[dim]Failed to stat file {p}: {e}[/dim]")
                     continue
                 prev = last_sizes.get(p, 0)
                 if sz != prev:
@@ -224,7 +226,8 @@ def _watch_logs(target: Path, tail_lines: int = 0, interval: float = 2.0):
                             tail = "\n".join(text.splitlines()[-tail_lines:])
                             stamp = datetime.now().strftime("%H:%M:%S")
                             console.print(Panel(tail or "(empty)", title=f"{p} tail({tail_lines}) @ {stamp}", border_style="magenta"))
-                        except Exception:
+                        except Exception as e:
+                            console.print(f"[dim]Failed to read file {p}: {e}[/dim]")
                             pass
             if changed:
                 # Show key events snapshot
@@ -244,7 +247,8 @@ def _logs_mtime_sum(root: Path) -> int:
             if p.is_file():
                 try:
                     total += int(p.stat().st_mtime)
-                except Exception:
+                except Exception as e:
+                    console.print(f"[dim]Failed to stat file {p}: {e}[/dim]")
                     pass
     except Exception:
         pass
@@ -595,8 +599,11 @@ def learn(
                 root = Path(graph.get('root', workspace))
                 for f in graph.get('files', []):
                     p = Path(f.get('path', ''))
-                    rel = str(p.resolve()).replace(str(root.resolve()), '').lstrip('/')
-                    safe = (rel or p.name).replace('/', '|')
+                    try:
+                        rel = os.path.relpath(str(p), start=str(root))
+                    except Exception:
+                        rel = p.name
+                    safe = (rel or p.name).replace(os.sep, '|').replace('/', '|')
                     st.put(f'code:file:{safe}:facts', f)  # type: ignore
             except Exception:
                 pass
@@ -880,245 +887,258 @@ def _docker_available() -> bool:
 
 
 def _compose_yaml(image: str, host_ws: Path, host_logs: Optional[Path], db_backend: str) -> str:
-    logs_map = f"\n      - {host_logs.resolve()}:/workspace/logs:ro" if host_logs else ""
-    return f"""
-services:
-  dspy-agent:
-    image: {image}
-    build:
-      context: ../../
-      dockerfile: docker/lightweight/Dockerfile
-    environment:
-      - LOCAL_MODE=false
-      - USE_OLLAMA=true
-      - DB_BACKEND={db_backend}
-      - REDDB_URL
-      - REDDB_NAMESPACE=dspy
-      - REDDB_TOKEN
-      - MODEL_NAME=deepseek-coder:1.3b
-      - OPENAI_API_KEY=
-      - OPENAI_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=deepseek-coder:1.3b
-      - OLLAMA_API_KEY=
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_CLIENT_ID=dspy-agent
-      - KAFKA_TOPIC_PREFIX
-    working_dir: /app
-    entrypoint: ["/bin/bash", "-lc"]
-    # Wait for services before launching agent
-    command: >-
-      for i in {{1..60}}; do
-        curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;
-        echo "waiting for ollama/kafka..."; sleep 2;
-      done;
-      dspy-agent stream_topics_create --bootstrap kafka:9092 || true;
-      dspy-agent up --workspace /workspace --db {db_backend} --status --status-port 8765
-    volumes:
-      - {host_ws.resolve()}:/workspace:rw{logs_map}
-    ports:
-      - "127.0.0.1:8765:8765"  # reserved for future HTTP status
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8765/health >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 10s
-    depends_on:
-      ollama:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      spark:
-        condition: service_healthy
+    """Render docker-compose content using a YAML serializer.
 
-  ollama:
-    image: ollama/ollama:latest
-    entrypoint: ["/bin/sh", "-lc"]
-    command: |
-      ollama serve &
-      sleep 3;
-      ollama pull deepseek-coder:1.3b || true;
-      wait
-    ports:
-      - "127.0.0.1:11435:11434"
-    volumes:
-      - ollama:/root/.ollama
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 20
-      start_period: 5s
+    Falls back to JSON (valid YAML subset) if PyYAML is unavailable.
+    """
+    ws_mount = f"{host_ws.resolve()}:/workspace:rw"
+    volumes = [ws_mount]
+    if host_logs is not None:
+        volumes.append(f"{host_logs.resolve()}:/workspace/logs:ro")
 
-  zookeeper:
-    image: bitnami/zookeeper:3.9
-    environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
-    ports:
-      - "127.0.0.1:2181:2181"
-    healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/2181 || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 20
-      start_period: 5s
+    # Common helpers
+    def hc_cmdshell(cmd: str) -> list[str]:
+        return ["CMD-SHELL", cmd]
 
-  kafka:
-    image: bitnami/kafka:3.6
-    depends_on:
-      - zookeeper
-    environment:
-      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
-      - ALLOW_PLAINTEXT_LISTENER=yes
-      - KAFKA_LISTENERS=PLAINTEXT://:9092
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
-    ports:
-      - "127.0.0.1:9092:9092"
-    healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/9092 || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
+    agent_command = (
+        "for i in {1..60}; do\n"
+        "  curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;\n"
+        "  echo \"waiting for ollama/kafka...\"; sleep 2;\n"
+        "done;\n"
+        "dspy-agent stream_topics_create --bootstrap kafka:9092 || true;\n"
+        f"dspy-agent up --workspace /workspace --db {db_backend} --status --status-port 8765"
+    )
 
-  spark:
-    image: bitnami/spark:3.5
-    depends_on:
-      kafka:
-        condition: service_healthy
-    volumes:
-      - {host_ws.resolve()}:/workspace
-      - ../../scripts:/app/scripts
-    entrypoint: ["/bin/bash", "-lc"]
-    # Run PySpark job to transform raw logs -> context windows on Kafka
-    command: >-
-      spark-submit \
-        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-        /app/scripts/streaming/spark_logs.py \
-        --bootstrap kafka:9092 \
-        --pattern 'logs.raw.*' \
-        --checkpoint /workspace/.dspy_checkpoints/spark_logs
-    healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -iq spark-submit || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 10s
+    spark_command = (
+        "spark-submit \\\n+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \\\n+        /app/scripts/streaming/spark_logs.py \\\n+        --bootstrap kafka:9092 \\\n+        --pattern 'logs.raw.*' \\\n+        --checkpoint /workspace/.dspy_checkpoints/spark_logs"
+    )
 
-  dspy-worker:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
-      dspy-agent worker --topic app --bootstrap kafka:9092
-    working_dir: /app
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+    worker_wait = (
+        "for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo \"waiting for kafka...\"; sleep 2; done;"
+    )
 
-  dspy-worker-backend:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
-      dspy-agent worker --topic backend --bootstrap kafka:9092
-    working_dir: /app
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+    code_watch_cmd = (
+        "python - <<'PY'\n"
+        "from dspy_agent.code_watch import CodeWatcher\n"
+        "from pathlib import Path\n"
+        "CodeWatcher(Path('/workspace')).run()\n"
+        "PY"
+    )
 
-  dspy-worker-frontend:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
-      dspy-agent worker --topic frontend --bootstrap kafka:9092
-    working_dir: /app
-  dspy-code-watch:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      python - <<'PY'
-from dspy_agent.code_watch import CodeWatcher
-from pathlib import Path
-CodeWatcher(Path('/workspace')).run()
-PY
-    working_dir: /app
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+    code_indexer_cmd = (
+        "python - <<'PY'\n"
+        "from dspy_agent.code_indexer_worker import CodeIndexerWorker\n"
+        "CodeIndexerWorker('kafka:9092').run()\n"
+        "PY"
+    )
 
-  dspy-code-indexer:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      python - <<'PY'
-from dspy_agent.code_indexer_worker import CodeIndexerWorker
-CodeIndexerWorker('kafka:9092').run()
-PY
-    working_dir: /app
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+    router_cmd = (
+        "python - <<'PY'\n"
+        "from dspy_agent.router_worker import RouterWorker\n"
+        "RouterWorker('kafka:9092').run()\n"
+        "PY"
+    )
 
-  dspy-router:
-    image: {image}
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      python - <<'PY'
-from dspy_agent.router_worker import RouterWorker
-RouterWorker('kafka:9092').run()
-PY
-    working_dir: /app
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+    doc: dict = {
+        "services": {
+            "dspy-agent": {
+                "image": image,
+                "build": {
+                    "context": "../../",
+                    "dockerfile": "docker/lightweight/Dockerfile",
+                },
+                "environment": [
+                    "LOCAL_MODE=false",
+                    "USE_OLLAMA=true",
+                    f"DB_BACKEND={db_backend}",
+                    "REDDB_URL",
+                    "REDDB_NAMESPACE=dspy",
+                    "REDDB_TOKEN",
+                    "MODEL_NAME=deepseek-coder:1.3b",
+                    "OPENAI_API_KEY=",
+                    "OPENAI_BASE_URL=http://ollama:11434",
+                    "OLLAMA_MODEL=deepseek-coder:1.3b",
+                    "OLLAMA_API_KEY=",
+                    "KAFKA_BOOTSTRAP_SERVERS=kafka:9092",
+                    "KAFKA_CLIENT_ID=dspy-agent",
+                    "KAFKA_TOPIC_PREFIX",
+                ],
+                "working_dir": "/app",
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": agent_command,
+                "volumes": volumes,
+                "ports": ["127.0.0.1:8765:8765"],
+                "restart": "unless-stopped",
+                "healthcheck": {
+                    "test": hc_cmdshell("curl -sf http://localhost:8765/health >/dev/null 2>&1 || exit 1"),
+                    "interval": "10s",
+                    "timeout": "3s",
+                    "retries": 12,
+                    "start_period": "10s",
+                },
+                "depends_on": {
+                    "ollama": {"condition": "service_healthy"},
+                    "kafka": {"condition": "service_healthy"},
+                    "spark": {"condition": "service_healthy"},
+                },
+            },
+            "ollama": {
+                "image": "ollama/ollama:latest",
+                "entrypoint": ["/bin/sh", "-lc"],
+                "command": (
+                    "ollama serve &\n"
+                    "sleep 3;\n"
+                    "ollama pull deepseek-coder:1.3b || true;\n"
+                    "wait"
+                ),
+                "ports": ["127.0.0.1:11435:11434"],
+                "volumes": ["ollama:/root/.ollama"],
+                "healthcheck": {
+                    "test": hc_cmdshell("curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"),
+                    "interval": "10s",
+                    "timeout": "3s",
+                    "retries": 20,
+                    "start_period": "5s",
+                },
+            },
+            "zookeeper": {
+                "image": "bitnami/zookeeper:3.9",
+                "environment": ["ALLOW_ANONYMOUS_LOGIN=yes"],
+                "ports": ["127.0.0.1:2181:2181"],
+                "healthcheck": {
+                    "test": hc_cmdshell("echo > /dev/tcp/localhost/2181 || exit 1"),
+                    "interval": "10s",
+                    "timeout": "3s",
+                    "retries": 20,
+                    "start_period": "5s",
+                },
+            },
+            "kafka": {
+                "image": "bitnami/kafka:3.6",
+                "depends_on": ["zookeeper"],
+                "environment": [
+                    "KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181",
+                    "ALLOW_PLAINTEXT_LISTENER=yes",
+                    "KAFKA_LISTENERS=PLAINTEXT://:9092",
+                    "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092",
+                    "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT",
+                    "KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT",
+                ],
+                "ports": ["127.0.0.1:9092:9092"],
+                "healthcheck": {
+                    "test": hc_cmdshell("echo > /dev/tcp/localhost/9092 || exit 1"),
+                    "interval": "10s",
+                    "timeout": "3s",
+                    "retries": 20,
+                    "start_period": "10s",
+                },
+            },
+            "spark": {
+                "image": "bitnami/spark:3.5",
+                "depends_on": {"kafka": {"condition": "service_healthy"}},
+                "volumes": [f"{host_ws.resolve()}:/workspace", "../../scripts:/app/scripts"],
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": spark_command,
+                "healthcheck": {
+                    "test": hc_cmdshell("ps aux | grep -v grep | grep -iq spark-submit || exit 1"),
+                    "interval": "15s",
+                    "timeout": "5s",
+                    "retries": 20,
+                    "start_period": "10s",
+                },
+            },
+            "dspy-worker": {
+                "image": image,
+                "depends_on": {"kafka": {"condition": "service_healthy"}},
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": worker_wait + " dspy-agent worker --topic app --bootstrap kafka:9092",
+                "working_dir": "/app",
+                "healthcheck": {
+                    "test": hc_cmdshell("pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"),
+                    "interval": "15s",
+                    "timeout": "5s",
+                    "retries": 10,
+                    "start_period": "10s",
+                },
+            },
+            "dspy-worker-backend": {
+                "image": image,
+                "depends_on": {"kafka": {"condition": "service_healthy"}},
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": worker_wait + " dspy-agent worker --topic backend --bootstrap kafka:9092",
+                "working_dir": "/app",
+                "healthcheck": {
+                    "test": hc_cmdshell("pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"),
+                    "interval": "15s",
+                    "timeout": "5s",
+                    "retries": 10,
+                    "start_period": "10s",
+                },
+            },
+            "dspy-worker-frontend": {
+                "image": image,
+                "depends_on": {"kafka": {"condition": "service_healthy"}},
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": worker_wait + " dspy-agent worker --topic frontend --bootstrap kafka:9092",
+                "working_dir": "/app",
+            },
+            "dspy-code-watch": {
+                "image": image,
+                "depends_on": {"kafka": {"condition": "service_healthy"}},
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": code_watch_cmd,
+                "working_dir": "/app",
+                "healthcheck": {
+                    "test": hc_cmdshell("pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"),
+                    "interval": "15s",
+                    "timeout": "5s",
+                    "retries": 10,
+                    "start_period": "10s",
+                },
+            },
+            "dspy-code-indexer": {
+                "image": image,
+                "depends_on": {"kafka": {"condition": "service_healthy"}},
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": code_indexer_cmd,
+                "working_dir": "/app",
+                "healthcheck": {
+                    "test": hc_cmdshell("pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"),
+                    "interval": "15s",
+                    "timeout": "5s",
+                    "retries": 10,
+                    "start_period": "10s",
+                },
+            },
+            "dspy-router": {
+                "image": image,
+                "depends_on": {"kafka": {"condition": "service_healthy"}},
+                "entrypoint": ["/bin/bash", "-lc"],
+                "command": router_cmd,
+                "working_dir": "/app",
+                "healthcheck": {
+                    "test": hc_cmdshell("pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"),
+                    "interval": "15s",
+                    "timeout": "5s",
+                    "retries": 10,
+                    "start_period": "10s",
+                },
+            },
+        },
+        "volumes": {"ollama": {}},
+    }
 
-volumes:
-  ollama: {{}}
-""".strip()
+    try:
+        import yaml as _yaml  # type: ignore
+    except Exception:
+        _yaml = None  # type: ignore
+
+    if _yaml is not None:
+        return _yaml.safe_dump(doc, sort_keys=False)
+    else:
+        # JSON is a valid subset of YAML; acceptable fallback.
+        import json as _j
+        return _j.dumps(doc, indent=2)
 
 
 def _dockerfile() -> str:
@@ -2506,32 +2526,33 @@ def open_cmd(
     try:
         if editor:
             ed = os.path.basename(editor)
-            quoted = shlex.quote(str(target))
+            editor_args = shlex.split(editor, posix=(os.name != 'nt'))
             if line is not None and ("code" in ed):
-                # VS Code
-                loc = f"{quoted}:{line}:{col or 1}"
-                os.system(f"{editor} -g {loc}")
+                loc = f"{str(target)}:{line}:{col or 1}"
+                proc = subprocess.run([*editor_args, "-g", loc])
             elif line is not None and ("subl" in ed or "sublime" in ed):
-                os.system(f"{editor} {quoted}:{line}:{col or 1}")
+                proc = subprocess.run([*editor_args, f"{str(target)}:{line}:{col or 1}"])
             elif line is not None and ("vim" in ed or "nvim" in ed):
-                os.system(f"{editor} +{line} {quoted}")
+                proc = subprocess.run([*editor_args, f"+{line}", str(target)])
             elif line is not None and ("emacs" in ed):
-                if col is not None:
-                    os.system(f"{editor} +{line}:{col} {quoted}")
-                else:
-                    os.system(f"{editor} +{line} {quoted}")
+                plus = f"+{line}:{col}" if col is not None else f"+{line}"
+                proc = subprocess.run([*editor_args, plus, str(target)])
             elif line is not None and ("idea" in ed):
-                os.system(f"{editor} --line {line} {quoted}")
+                proc = subprocess.run([*editor_args, "--line", str(line), str(target)])
             else:
-                os.system(f"{editor} {quoted}")
+                proc = subprocess.run([*editor_args, str(target)])
         else:
             if os.name == 'nt':
-                os.system(f'start "" {shlex.quote(str(target))}')
+                # Use cmd's built-in 'start' with a title arg
+                proc = subprocess.run(["cmd", "/c", "start", "", f"\"{str(target)}\""])
             elif sys.platform == 'darwin':
-                os.system(f'open {shlex.quote(str(target))}')
+                proc = subprocess.run(["open", str(target)])
             else:
-                os.system(f'xdg-open {shlex.quote(str(target))}')
-        console.print(f"[green]Opened {target}[/green]")
+                proc = subprocess.run(["xdg-open", str(target)])
+        if proc.returncode == 0:
+            console.print(f"[green]Opened {target}[/green]")
+        else:
+            console.print(Panel(f"Failed to open {target} (exit {proc.returncode})", title="open", border_style="err"))
     except Exception as e:
         console.print(f"[red]Failed to open: {e}[/red]")
 
@@ -2541,7 +2562,7 @@ def patch(
     patch_file: Optional[Path] = typer.Option(None, '--file', exists=True, help="Unified diff file"),
 ):
     if not patch_file:
-        console.print("[yellow]Usage: dspy-coder patch --file <PATCHFILE>[/yellow]")
+        console.print("[yellow]Usage: dspy-agent patch --file <PATCHFILE>[/yellow]")
         raise typer.Exit(2)
     text = patch_file.read_text(errors="ignore")
     ok, msg = apply_unified_patch(text, Path.cwd())
@@ -2991,17 +3012,32 @@ def start(
             target = (ws / file_part).resolve(); editor = os.environ.get("EDITOR"); quoted = shlex.quote(str(target))
             if editor:
                 ed = os.path.basename(editor)
-                if line is not None and ("code" in ed): os.system(f"{editor} -g {quoted}:{line}:{col or 1}")
-                elif line is not None and ("subl" in ed or "sublime" in ed): os.system(f"{editor} {quoted}:{line}:{col or 1}")
-                elif line is not None and ("vim" in ed or "nvim" in ed): os.system(f"{editor} +{line} {quoted}")
-                elif line is not None and ("emacs" in ed): os.system(f"{editor} +{line}{(':'+str(col)) if col else ''} {quoted}")
-                elif line is not None and ("idea" in ed): os.system(f"{editor} --line {line} {quoted}")
-                else: os.system(f"{editor} {quoted}")
+                editor_args = shlex.split(editor, posix=(os.name != 'nt'))
+                if line is not None and ("code" in ed):
+                    loc = f"{str(target)}:{line}:{col or 1}"
+                    proc = subprocess.run([*editor_args, "-g", loc])
+                elif line is not None and ("subl" in ed or "sublime" in ed):
+                    proc = subprocess.run([*editor_args, f"{str(target)}:{line}:{col or 1}"])
+                elif line is not None and ("vim" in ed or "nvim" in ed):
+                    proc = subprocess.run([*editor_args, f"+{line}", str(target)])
+                elif line is not None and ("emacs" in ed):
+                    plus = f"+{line}:{col}" if col is not None else f"+{line}"
+                    proc = subprocess.run([*editor_args, plus, str(target)])
+                elif line is not None and ("idea" in ed):
+                    proc = subprocess.run([*editor_args, "--line", str(line), str(target)])
+                else:
+                    proc = subprocess.run([*editor_args, str(target)])
             else:
-                if os.name=='nt': os.system(f'start "" {quoted}')
-                elif sys.platform=='darwin': os.system(f'open {quoted}')
-                else: os.system(f'xdg-open {quoted}')
-            console.print(f"[green]Opened {target}[/green]")
+                if os.name=='nt':
+                    proc = subprocess.run(["cmd", "/c", "start", "", f"\"{str(target)}\""])
+                elif sys.platform=='darwin':
+                    proc = subprocess.run(["open", str(target)])
+                else:
+                    proc = subprocess.run(["xdg-open", str(target)])
+            if proc.returncode == 0:
+                console.print(f"[green]Opened {target}[/green]")
+            else:
+                console.print(Panel(f"Failed to open {target} (exit {proc.returncode})", title="open", border_style="err"))
         elif t == "watch":
             _watch_logs(logs_path, tail_lines=int(args.get("tail",20)), interval=float(args.get("interval",2)))
         elif t == "sg":
@@ -3319,29 +3355,32 @@ def start(
                     quoted = shlex.quote(str(target))
                     if line is not None and ("code" in ed):
                         loc = f"{quoted}:{line}:{col or 1}"
-                        os.system(f"{editor} -g {loc}")
+                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), "-g", loc])
                     elif line is not None and ("subl" in ed or "sublime" in ed):
-                        os.system(f"{editor} {quoted}:{line}:{col or 1}")
+                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"{str(target)}:{line}:{col or 1}"])
                     elif line is not None and ("vim" in ed or "nvim" in ed):
-                        os.system(f"{editor} +{line} {quoted}")
+                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"+{line}", str(target)])
                     elif line is not None and ("emacs" in ed):
                         if col is not None:
-                            os.system(f"{editor} +{line}:{col} {quoted}")
+                            proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"+{line}:{col}", str(target)])
                         else:
-                            os.system(f"{editor} +{line} {quoted}")
+                            proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"+{line}", str(target)])
                     elif line is not None and ("idea" in ed):
-                        os.system(f"{editor} --line {line} {quoted}")
+                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), "--line", str(line), str(target)])
                     else:
-                        os.system(f"{editor} {quoted}")
+                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), str(target)])
                 else:
                     # macOS 'open', Linux 'xdg-open', Windows 'start'
                     if os.name == 'nt':
-                        os.system(f'start "" {shlex.quote(str(target))}')
+                        proc = subprocess.run(["cmd", "/c", "start", "", f"\"{str(target)}\""]) 
                     elif sys.platform == 'darwin':
-                        os.system(f'open {shlex.quote(str(target))}')
+                        proc = subprocess.run(["open", str(target)])
                     else:
-                        os.system(f'xdg-open {shlex.quote(str(target))}')
-                console.print(f"[green]Opened {target}[/green]")
+                        proc = subprocess.run(["xdg-open", str(target)])
+                if proc.returncode == 0:
+                    console.print(f"[green]Opened {target}[/green]")
+                else:
+                    console.print(Panel(f"Failed to open {target} (exit {proc.returncode})", title="open", border_style="err"))
             except Exception as e:
                 console.print(f"[red]Failed to open: {e}[/red]")
         elif cmd == "diff":
