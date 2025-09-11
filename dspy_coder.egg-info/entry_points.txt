@@ -1,4 +1,0 @@
-[console_scripts]
-dspy-agent = dspy_agent.cli:app
-dspy-coder = dspy_agent.cli:app
-dspy_coder = dspy_agent.cli:app
