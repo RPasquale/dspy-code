@@ -436,7 +436,8 @@ def tail_metrics(
                                         va.append(float(rec.get('score', 0.0)))
                                     else:
                                         tr.append(float(rec.get('score', 0.0)))
-                                except Exception:
+                                except Exception as e:
+                                    console.print(f"[dim]Failed to parse progress line: {e}[/dim]")
                                     pass
                             last_pos = f.tell()
                     live.update(_progress_panel(module, budget, tr, va, title="Live Metrics"))
@@ -481,7 +482,8 @@ def deploy_topics(
     if cfg_path.exists():
         try:
             cfg = load_stream_cfg(cfg_path)
-        except Exception:
+        except Exception as e:
+            console.print(f"[dim]Failed to load stream config: {e}[/dim]")
             cfg = None
     cfg = cfg or StreamConfig.default()
     # Filter deploy.* topics
@@ -605,10 +607,12 @@ def learn(
                         rel = p.name
                     safe = (rel or p.name).replace(os.sep, '|').replace('/', '|')
                     st.put(f'code:file:{safe}:facts', f)  # type: ignore
-            except Exception:
+            except Exception as e:
+                console.print(f"[dim]Failed to persist file facts: {e}[/dim]")
                 pass
             console.print("[green]Persisted code graph and per-file facts to storage.[/green]\n")
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]Failed to persist code graph: {e}[/dim]")
         pass
     # Build embeddings index
     if embeddings:
@@ -714,13 +718,15 @@ def k8s_render(
         try:
             try:
                 import yaml as _y  # type: ignore
-            except Exception:
+            except Exception as e:
+                console.print(f"[dim]PyYAML not found, falling back to json: {e}[/dim]")
                 _y = None  # type: ignore
             if _y is not None:
                 p.write_text(_y.safe_dump(dep, sort_keys=False))
             else:
                 raise RuntimeError('yaml not available')
-        except Exception:
+        except Exception as e:
+            console.print(f"[dim]Failed to write YAML, falling back to json: {e}[/dim]")
             # fallback to json
             import json as _j
             p.write_text(_j.dumps(dep, indent=2))
@@ -744,7 +750,8 @@ def worker(
             cfg = load_stream_cfg(config)
             bs = bs or cfg.kafka.bootstrap_servers
             grp = grp or cfg.kafka.group_id
-        except Exception:
+        except Exception as e:
+            console.print(f"[dim]Failed to load stream config: {e}[/dim]")
             pass
     console.print(Panel.fit(
         f"topic={topic}\nbootstrap={bs or 'localhost:9092'}\ngroup={grp or 'dspy-code'}\n",
@@ -812,20 +819,23 @@ def up(
             storage = RedDBStorage(url=s.reddb_url, namespace=s.reddb_namespace or "dspy")
         else:
             storage = _get_storage()
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]Failed to get storage: {e}[/dim]")
         storage = None
     try:
         kafka = get_kafka_logger()
         if kafka is None:
             console.print("[dim]Kafka logging disabled (set KAFKA_BOOTSTRAP_SERVERS to enable).[/dim]")
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]Failed to get kafka logger: {e}[/dim]")
         kafka = None
     threads, bus = start_local_stack(workspace, None, storage=storage, kafka=kafka)
     if train:
         # Discover containers from .dspy_stream.json or autodiscovery
         try:
             cfg = load_stream_cfg(STREAM_CFG_PATH) if STREAM_CFG_PATH.exists() else None
-        except Exception:
+        except Exception as e:
+            console.print(f"[dim]Failed to load stream config: {e}[/dim]")
             cfg = None
         containers = [getattr(ct, 'container') for ct in getattr(cfg, 'containers', [])] if cfg else [d.container for d in autodiscover_logs(workspace)]
         from .streaming_runtime import Trainer
@@ -1130,7 +1140,8 @@ def _compose_yaml(image: str, host_ws: Path, host_logs: Optional[Path], db_backe
 
     try:
         import yaml as _yaml  # type: ignore
-    except Exception:
+    except Exception as e:
+        console.print(f"[dim]PyYAML not found, falling back to json: {e}[/dim]")
         _yaml = None  # type: ignore
 
     if _yaml is not None:
@@ -1431,7 +1442,8 @@ def chat(
                     tool = (pred.tool or tool).strip(); args = _json.loads(pred.args_json or "{}")
                     if getattr(pred, 'rationale', None):
                         console.print(Panel.fit(pred.rationale, title="Routing Rationale", border_style="dim"))
-            except Exception:
+            except Exception as e:
+                console.print(f"[dim]Orchestrator failed: {e}[/dim]")
                 tool = None; args = {}
         if not tool:
             tool = "context" if logs_path.exists() else "codectx"; args = {}
@@ -1471,7 +1483,8 @@ def chat(
             console.print(Panel(str(e), title=f"agent failed ({tool})", border_style="red")); break
         try:
             outcome = evaluate_tool_choice(tool, args, workspace=ws, logs_path=logs_path, targets=targets); piece=f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
-        except Exception:
+        except Exception as e:
+            console.print(f"[dim]Failed to evaluate tool choice: {e}[/dim]")
             piece=f"{tool}: done"
         history_summary = (history_summary + " | " + piece).strip()
         if step >= 2 and ("score=" in piece and float(piece.split("score=")[1].split(";")[0]) >= 1.2):
@@ -1567,7 +1580,8 @@ def esearch(
             start = max(1, it.start_line - context)
             end = min(len(lines), it.end_line + context)
             seg = "\n".join(lines[start - 1 : end])
-        except Exception:
+        except Exception as e:
+            console.print(f"[dim]Failed to read file {p}: {e}[/dim]")
             seg = "(unreadable)"
             start = it.start_line
             end = it.end_line
@@ -1877,7 +1891,8 @@ def emb_search(
             start = max(1, it.start_line - context)
             end = min(len(lines), it.end_line + context)
             seg = "\n".join(lines[start - 1 : end])
-        except Exception:
+        except Exception as e:
+            console.print(f"[dim]Failed to read file {p}: {e}[/dim]")
             seg = "(unreadable)"
             start = it.start_line
             end = it.end_line

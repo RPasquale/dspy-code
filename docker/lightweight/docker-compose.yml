@@ -20,31 +20,28 @@ services:
       - KAFKA_CLIENT_ID=dspy-agent
       - KAFKA_TOPIC_PREFIX
     working_dir: /app
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {1..60}; do
-        curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;
-        echo "waiting for ollama/kafka..."; sleep 2;
-      done;
-      dspy-agent stream_topics_create --bootstrap kafka:9092 || true;
-      dspy-agent up --workspace /workspace --db auto --status --status-port 8765
+    entrypoint: ["/app/entrypoints/run_dspy_agent.sh"]
     volumes:
       - /Users/robbiepasquale/dspy_stuff:/workspace:rw
     ports:
       - "127.0.0.1:8765:8765"  # reserved for future HTTP status
     restart: unless-stopped
     depends_on:
-      - ollama
-      - kafka
+      ollama:
+        condition: service_started
+      kafka:
+        condition: service_healthy
 
   ollama:
     image: ollama/ollama:latest
-    entrypoint: ["/bin/sh", "-lc"]
-    command: |
-      ollama serve &
-      sleep 3;
-      ollama pull deepseek-coder:1.3b || true;
-      wait
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        ollama serve &
+        sleep 3;
+        ollama pull deepseek-coder:1.3b || true;
+        wait
     ports:
       - "127.0.0.1:11435:11434"  # host->container; use 11435 to avoid conflicts
     volumes:
@@ -64,69 +61,83 @@ services:
     environment:
       - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
       - ALLOW_PLAINTEXT_LISTENER=yes
-      - KAFKA_LISTENERS=PLAINTEXT://:9092
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
     ports:
       - "127.0.0.1:9092:9092"
+      - "127.0.0.1:29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   dspy-worker:
     image: dspy-lightweight:latest
     depends_on:
-      - kafka
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
-      dspy-agent worker --topic app --bootstrap kafka:9092
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/app/entrypoints/run_worker.sh", "app"]
     working_dir: /app
 
   spark:
     image: bitnami/spark:3.5
+    user: "0:0"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
+    environment:
+      - HOME=/tmp
+      - USER=spark
+      - SPARK_USER=spark
+      - HADOOP_USER_NAME=spark
+      - JAVA_TOOL_OPTIONS=-Duser.name=spark
+      - HADOOP_OPTS=-Duser.name=spark
     volumes:
       - /Users/robbiepasquale/dspy_stuff:/workspace
       - ../../scripts:/app/scripts
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      spark-submit \
-        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-        /app/scripts/streaming/spark_logs.py \
-        --bootstrap kafka:9092 \
-        --pattern 'logs.raw.*' \
-        --checkpoint /workspace/.dspy_checkpoints/spark_logs
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        spark-submit \
+          --conf spark.hadoop.hadoop.security.authentication=simple \
+          --conf spark.hadoop.fs.defaultFS=file:/// \
+          --conf spark.hadoop.fs.file.impl=org.apache.hadoop.fs.LocalFileSystem \
+          --conf spark.driver.extraJavaOptions=-Duser.name=spark \
+          --conf spark.executor.extraJavaOptions=-Duser.name=spark \
+          --conf spark.jars.ivy=/tmp/.ivy2 \
+          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+          /app/scripts/streaming/spark_logs.py \
+          --bootstrap kafka:9092 \
+          --pattern 'logs.raw.*' \
+          --checkpoint /workspace/.dspy_checkpoints/spark_logs
 
   dspy-worker-backend:
     image: dspy-lightweight:latest
     depends_on:
-      - kafka
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
-      dspy-agent worker --topic backend --bootstrap kafka:9092
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/app/entrypoints/run_worker.sh", "backend"]
     working_dir: /app
 
   dspy-worker-frontend:
     image: dspy-lightweight:latest
     depends_on:
-      - kafka
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >-
-      for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
-      dspy-agent worker --topic frontend --bootstrap kafka:9092
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/app/entrypoints/run_worker.sh", "frontend"]
     working_dir: /app
 
   dspy-router:
     image: dspy-lightweight:latest
     depends_on:
-      - kafka
-    entrypoint: ["/bin/bash", "-lc"]
-    command: |
-      python - <<'PY'
-      from dspy_agent.router_worker import RouterWorker
-      RouterWorker('kafka:9092').run()
-      PY
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/app/entrypoints/run_router.sh"]
     working_dir: /app
 
 volumes:
