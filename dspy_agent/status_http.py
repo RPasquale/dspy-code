@@ -46,7 +46,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         st = self.storage
         if self.path == '/health':
-            return self._json(200, {"ok": True})
+            return self._json(200, {"status": "ok"})
         if self.path == '/deploy':
             if st is None:
                 return self._json(200, {"status": "unknown", "reason": "no storage"})
