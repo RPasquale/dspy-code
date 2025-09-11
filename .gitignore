@@ -86,6 +86,6 @@ docker/lightweight/.env
 *.bak
 *.backup
 
-# UV lockfile is generally committed for reproducibility; comment to ignore
-# uv.lock
+# UV lockfile - not needed in containerized environment
+uv.lock
 
