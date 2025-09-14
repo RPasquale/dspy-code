@@ -7,22 +7,33 @@ services:
     environment:
       - LOCAL_MODE=false
       - USE_OLLAMA=true
+      - AUTO_PATCH=true
+      - AUTO_PATCH_APPROVAL=manual
+      - AUTO_PATCH_MAX_FILES=0
+      - AUTO_PATCH_MAX_LINES=0
+      - WORKSPACE=/workspace
       - DB_BACKEND=auto
       - REDDB_URL
       - REDDB_NAMESPACE=dspy
       - REDDB_TOKEN
-      - MODEL_NAME=deepseek-coder:1.3b
+      - MODEL_NAME=qwen3:1.7b
       - OPENAI_API_KEY=
       - OPENAI_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=deepseek-coder:1.3b
+      - OLLAMA_MODEL=qwen3:1.7b
       - OLLAMA_API_KEY=
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_CLIENT_ID=dspy-agent
       - KAFKA_TOPIC_PREFIX
+      - AUTO_COMMIT=false
+      - AUTO_TEST_CMD=python -m compileall -q .
+      - AUTO_TEST_STRICT=false
+      - AUTO_TEST_TIMEOUT=600
+      - AUTO_PATCH_REQUIRE_KEYWORDS=true
+      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
     working_dir: /app
     entrypoint: ["/app/entrypoints/run_dspy_agent.sh"]
     volumes:
-      - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+      - ../../:/workspace:rw
     ports:
       - "127.0.0.1:8765:8765"  # reserved for future HTTP status
     restart: unless-stopped
@@ -40,7 +51,7 @@ services:
       - |
         ollama serve &
         sleep 3;
-        ollama pull deepseek-coder:1.3b || true;
+        ollama pull qwen3:1.7b || true;
         wait
     ports:
       - "127.0.0.1:11435:11434"  # host->container; use 11435 to avoid conflicts
@@ -82,6 +93,20 @@ services:
         condition: service_healthy
     entrypoint: ["/app/entrypoints/run_worker.sh", "app"]
     working_dir: /app
+    volumes:
+      - ../../:/workspace:rw
+    environment:
+      - AUTO_PATCH=true
+      - AUTO_PATCH_APPROVAL=manual
+      - AUTO_PATCH_MAX_FILES=0
+      - AUTO_PATCH_MAX_LINES=0
+      - WORKSPACE=/workspace
+      - AUTO_COMMIT=false
+      - AUTO_TEST_CMD=python -m compileall -q .
+      - AUTO_TEST_STRICT=false
+      - AUTO_TEST_TIMEOUT=600
+      - AUTO_PATCH_REQUIRE_KEYWORDS=true
+      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
 
   spark:
     image: bitnami/spark:3.5
@@ -97,7 +122,7 @@ services:
       - JAVA_TOOL_OPTIONS=-Duser.name=spark
       - HADOOP_OPTS=-Duser.name=spark
     volumes:
-      - /Users/robbiepasquale/dspy_stuff:/workspace
+      - ../../:/workspace
       - ../../scripts:/app/scripts
     entrypoint:
       - /bin/sh
@@ -123,6 +148,20 @@ services:
         condition: service_healthy
     entrypoint: ["/app/entrypoints/run_worker.sh", "backend"]
     working_dir: /app
+    volumes:
+      - ../../:/workspace:rw
+    environment:
+      - AUTO_PATCH=true
+      - AUTO_PATCH_APPROVAL=manual
+      - AUTO_PATCH_MAX_FILES=0
+      - AUTO_PATCH_MAX_LINES=0
+      - WORKSPACE=/workspace
+      - AUTO_COMMIT=false
+      - AUTO_TEST_CMD=python -m compileall -q .
+      - AUTO_TEST_STRICT=false
+      - AUTO_TEST_TIMEOUT=600
+      - AUTO_PATCH_REQUIRE_KEYWORDS=true
+      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
 
   dspy-worker-frontend:
     image: dspy-lightweight:latest
@@ -131,6 +170,20 @@ services:
         condition: service_healthy
     entrypoint: ["/app/entrypoints/run_worker.sh", "frontend"]
     working_dir: /app
+    volumes:
+      - ../../:/workspace:rw
+    environment:
+      - AUTO_PATCH=true
+      - AUTO_PATCH_APPROVAL=manual
+      - AUTO_PATCH_MAX_FILES=0
+      - AUTO_PATCH_MAX_LINES=0
+      - WORKSPACE=/workspace
+      - AUTO_COMMIT=false
+      - AUTO_TEST_CMD=python -m compileall -q .
+      - AUTO_TEST_STRICT=false
+      - AUTO_TEST_TIMEOUT=600
+      - AUTO_PATCH_REQUIRE_KEYWORDS=true
+      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
 
   dspy-router:
     image: dspy-lightweight:latest

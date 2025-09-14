@@ -174,9 +174,9 @@ def make_logging_metric(module: str, progress_path: Optional[str]) -> Callable:
 
 
 def student_module(module: str) -> dspy.Module:
-    from .skills.context_builder import ContextBuilder
-    from .skills.task_agent import TaskAgent
-    from .skills.code_context import CodeContext
+    from ..skills.context_builder import ContextBuilder
+    from ..skills.task_agent import TaskAgent
+    from ..skills.code_context import CodeContext
 
     if module == "context":
         return ContextBuilder()

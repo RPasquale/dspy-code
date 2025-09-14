@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import random
 
-from .indexer import tokenize
-from .code_search import python_extract_symbol
-from .log_reader import load_logs, extract_key_events
-from .code_snapshot import build_code_snapshot
+from ..embedding.indexer import tokenize
+from ..code_tools.code_search import python_extract_symbol
+from ..streaming.log_reader import load_logs, extract_key_events
+from ..code_tools.code_snapshot import build_code_snapshot
 
 
 def _iter_files(root: Path, include: Sequence[str] | None = None, exclude: Sequence[str] | None = None) -> Iterable[Path]:

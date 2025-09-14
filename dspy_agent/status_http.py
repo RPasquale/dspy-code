@@ -7,9 +7,9 @@ from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 from .db.factory import get_storage
-from .streaming_config import DEFAULT_CONFIG_PATH, load_config, StreamConfig
-from .streaming_runtime import autodiscover_logs
-from .knowledge import summarize_code_graph
+from .streaming.streaming_config import DEFAULT_CONFIG_PATH, load_config, StreamConfig
+from .streaming.streaming_runtime import autodiscover_logs
+from .agents.knowledge import summarize_code_graph
 
 
 def _container_names(workspace: Path) -> List[str]:

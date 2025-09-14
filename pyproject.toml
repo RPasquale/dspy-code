@@ -3,7 +3,7 @@ name = "dspy-code"
 version = "0.1.0"
 description = "Simple local coding agent using DSPy that reads logs and proposes plans/commands."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.13"
 license = { text = "Apache-2.0" }
 authors = [
     { name = "Your Name" }
@@ -15,6 +15,8 @@ dependencies = [
     "pydantic>=2.7.4",
     "sentence-transformers>=2.7.0",
     "transformers>=4.51.0",
+    "confluent-kafka>=2.3.0",
+    "psutil>=5.9.5",
 ]
 
 [project.scripts]
@@ -29,9 +31,17 @@ Repository = "https://github.com/RPasquale/dspy_stuff.git"
 DSPy = "https://github.com/stanfordnlp/dspy.git"
 RedDB = "https://github.com/redbco/redb-open.git"
 
+[project.optional-dependencies]
+rl = [
+    "pufferlib>=0.5.0",
+    "gymnasium>=0.27",
+    "torch>=2.0.0",
+    "verifiers @ git+https://github.com/willccbb/verifiers.git",
+]
+
 [tool.uv]
 dev-dependencies = []
 package = true
 
 [tool.setuptools]
-packages = ["dspy_agent", "dspy_agent.skills", "dspy_agent.db"]
+packages = ["dspy_agent", "dspy_agent.skills", "dspy_agent.db", "dspy_agent.rl", "dspy_agent.streaming", "dspy_agent.embedding", "dspy_agent.code_tools", "dspy_agent.agents", "dspy_agent.training"]

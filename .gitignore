@@ -73,6 +73,9 @@ dist/
 logs/
 *.log
 
+# Development tools and debugging files
+dev_tools/
+
 # Docker / Compose
 docker/lightweight/*.log
 docker/lightweight/.env

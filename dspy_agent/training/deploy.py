@@ -10,7 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .db.factory import get_storage
+from ..db.factory import get_storage
 from .deploy_model import (
     DEPLOY_LOG_STREAM,
     DEPLOY_EVENT_STREAM,

@@ -9,7 +9,7 @@ except Exception:  # pragma: no cover
     Consumer = None  # type: ignore
     Producer = None  # type: ignore
 
-from .db.factory import get_storage
+from ..db.factory import get_storage
 
 
 class RouterWorker:

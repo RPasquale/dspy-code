@@ -38,9 +38,14 @@ def configure_lm(
     lm_kwargs: dict = {}
 
     if provider == "ollama":
-        # Default to Ollama's OpenAI-compatible endpoint
+        # Use native Ollama API (not the OpenAI compatibility layer)
+        # LiteLLM's ollama adapter expects api_base WITHOUT '/v1' and hits '/api/generate'.
         if effective_base_url is None:
-            effective_base_url = "http://localhost:11434/v1"
+            effective_base_url = "http://localhost:11434"
+        else:
+            # If someone set an OpenAI-style base (ending with /v1), strip it for ollama provider
+            if effective_base_url.rstrip('/').endswith('/v1'):
+                effective_base_url = effective_base_url.rstrip('/')[:-3]  # remove trailing '/v1'
         # Ollama doesn't require a real key; pass a placeholder if missing
         if effective_api_key is None:
             effective_api_key = os.getenv("OLLAMA_API_KEY", "ollama")
@@ -64,6 +69,13 @@ def configure_lm(
             lm_kwargs["api_base"] = effective_base_url
 
     # Instantiate the LM using DSPy v3 API (via LiteLLM)
+    lm_kwargs.update({
+        "timeout": 30,            # DSPy/LiteLLM timeout
+        "request_timeout": 30,    # Some LiteLLM adapters use this key
+        "max_retries": 2,
+        "num_retries": 2,
+    })
+    
     lm = dspy.LM(
         model=provider_model,
         **lm_kwargs,

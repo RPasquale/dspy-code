@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .log_reader import load_logs, extract_key_events
-from .code_search import search_text, search_file as file_search, extract_context, python_extract_symbol
-from .indexer import build_index, save_index, load_index, semantic_search
-from .code_snapshot import build_code_snapshot
+from ..streaming.log_reader import load_logs, extract_key_events
+from ..code_tools.code_search import search_text, search_file as file_search, extract_context, python_extract_symbol
+from ..embedding.indexer import build_index, save_index, load_index, semantic_search
+from ..code_tools.code_snapshot import build_code_snapshot
 
 
 SAFE_TOOLS = {"context", "plan", "grep", "extract", "codectx", "index", "esearch", "knowledge", "vretr", "intel"}
@@ -225,7 +225,7 @@ def evaluate_tool_choice(
         # Gather knowledge matches
         kn_files = []
         try:
-            from .db.factory import get_storage as _get_storage
+            from ..db.factory import get_storage as _get_storage
             st = _get_storage()
             if st is not None:
                 graph = st.get('code:graph') if hasattr(st, 'get') else None  # type: ignore
@@ -291,7 +291,7 @@ def evaluate_tool_choice(
     elif t == "knowledge":
         # Query code knowledge graph stored in KV
         try:
-            from .db.factory import get_storage as _get_storage
+            from ..db.factory import get_storage as _get_storage
             st = _get_storage()
         except Exception:
             st = None

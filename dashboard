@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# DSPy Agent Training Dashboard
+# Usage: ./dashboard [--once] [--refresh SECONDS]
+
+echo "🚀 Starting DSPy Agent Training Dashboard..."
+echo ""
+
+# Check if virtual environment is activated
+if [[ "$VIRTUAL_ENV" == "" ]]; then
+    echo "⚠️  Virtual environment not detected. Using uv run..."
+    uv run python3 training_dashboard.py "$@"
+else
+    echo "✅ Virtual environment detected: $VIRTUAL_ENV"
+    python3 training_dashboard.py "$@"
+fi

@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
-from .config import get_settings
+from ..config import get_settings
 
 
 def iter_log_paths(roots: Iterable[Path]) -> Iterable[Path]:
@@ -32,7 +32,7 @@ def read_capped(path: Path, max_bytes: int) -> str:
 
 
 def extract_key_events(text: str, max_lines: int = 120) -> str:
-    # Simple heuristic: collect lines with errors, tracebacks, warnings, and timestamps
+    # Heuristic: collect error-like lines with light de-noising and compression
     patterns = [
         r"\bERROR\b",
         r"\bFATAL\b",
@@ -46,21 +46,55 @@ def extract_key_events(text: str, max_lines: int = 120) -> str:
         r"\bnot found\b",
     ]
     rx = re.compile("|".join(patterns), re.IGNORECASE)
+    # Noise filters: drop extremely spammy warnings
+    noise = re.compile(
+        r"dspy\.adapters\.json_adapter.*structured output format|json_adapter: Failed to use structured|"
+        r"litellm\.Timeout: Connection timed out after 600\.0 seconds|httpcore\.ReadTimeout",
+        re.IGNORECASE,
+    )
     lines = text.splitlines()
     hits: List[str] = []
     for i, line in enumerate(lines):
+        if noise.search(line):
+            continue
         if rx.search(line):
             # Include some context around the hit
             start = max(0, i - 2)
             end = min(len(lines), i + 3)
-            hits.extend(lines[start:end])
+            # Compress Python stack traces
+            block = lines[start:end]
+            out_block: List[str] = []
+            skip_stack = False
+            for j, ln in enumerate(block):
+                if skip_stack:
+                    if ln.strip() == "":
+                        skip_stack = False
+                    continue
+                out_block.append(ln)
+                if ln.strip().startswith("Traceback ("):
+                    out_block.append("... stack trace omitted ...")
+                    skip_stack = True
+            hits.extend(out_block)
             hits.append("")
             if len(hits) >= max_lines:
                 break
     if not hits:
         # fallback to the last lines if nothing matched
         hits = lines[-max_lines:]
-    return "\n".join(hits)
+    # Collapse immediate duplicates
+    comp: List[str] = []
+    repeat = 0
+    for i, ln in enumerate(hits):
+        if i > 0 and ln == hits[i - 1]:
+            repeat += 1
+            continue
+        if repeat > 0 and comp:
+            comp.append(f"... repeated {repeat} times ...")
+            repeat = 0
+        comp.append(ln)
+    if repeat > 0 and comp:
+        comp.append(f"... repeated {repeat} times ...")
+    return "\n".join(comp[:max_lines])
 
 
 def load_logs(paths: Iterable[str | Path]) -> Tuple[str, int]:
@@ -76,4 +110,3 @@ def load_logs(paths: Iterable[str | Path]) -> Tuple[str, int]:
         total += 1
     bundle = "\n\n".join(collected) if collected else ""
     return bundle, total
-

@@ -9,11 +9,11 @@ try:
 except Exception:  # pragma: no cover
     Consumer = None  # type: ignore
 
-from .knowledge import _py_facts  # type: ignore
-from .indexer import iter_chunks
+from ..agents.knowledge import _py_facts  # type: ignore
+from ..embedding.indexer import iter_chunks
 import hashlib
 import dspy
-from .db.factory import get_storage
+from ..db.factory import get_storage
 
 
 class CodeIndexerWorker:

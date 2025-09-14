@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Optional
 
 import dspy
 
-from .skills.orchestrator import Orchestrator
-from .orchestrator_runtime import evaluate_tool_choice
+from ..skills.orchestrator import Orchestrator
+from ..agents.orchestrator_runtime import evaluate_tool_choice
 from datetime import datetime
 
 

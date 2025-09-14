@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
-from .kafka_log import get_kafka_logger
+from ..streaming.kafka_log import get_kafka_logger
 
 
 class CodeWatcher:

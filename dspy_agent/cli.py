@@ -1,32 +1,36 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 import sys
 import shlex
 import time
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 import typer
 from rich.console import Console
 from rich.theme import Theme
 from rich.panel import Panel
 from rich.text import Text
+from rich.markup import escape
 from rich.live import Live
+from rich.table import Table
+from rich.align import Align
 from rich.console import Group
 from rich.columns import Columns
+from .cli_utils import print_banner as _print_banner, banner_text as _banner_text
 
 import dspy
+import logging
 from .config import get_settings
 from .llm import configure_lm
-from .log_reader import extract_key_events, load_logs
+from .streaming.log_reader import extract_key_events, load_logs
 from .skills.context_builder import ContextBuilder
 from .skills.code_context import CodeContext
 from .skills.task_agent import TaskAgent
 from .skills.orchestrator import Orchestrator
-from .code_search import (
+from .code_tools.code_search import (
     search_text,
     search_file as file_search,
     extract_context,
@@ -34,40 +38,424 @@ from .code_search import (
     run_ast_grep,
     ast_grep_available,
 )
-from .code_snapshot import build_code_snapshot
-from .patcher import apply_unified_patch, summarize_patch
-from .indexer import build_index, save_index, load_index, semantic_search
-from .train_gepa import run_gepa, run_gepa_with_val, evaluate_on_set
-from .train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
-from .train_codegen import run_gepa_codegen
-from .autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
-from .orchestrator_runtime import evaluate_tool_choice
-from .indexer import tokenize
-from .router_worker import RouterWorker
-from .embeddings_index import (
+from .code_tools.code_snapshot import build_code_snapshot
+from .code_tools.patcher import apply_unified_patch, summarize_patch
+from .embedding.indexer import build_index, save_index, load_index, semantic_search
+from .training.train_gepa import run_gepa, run_gepa_with_val, evaluate_on_set
+from .training.train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
+from .training.train_codegen import run_gepa_codegen
+from .training.autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
+from .agents.orchestrator_runtime import evaluate_tool_choice
+from .embedding.indexer import tokenize
+from .agents.router_worker import RouterWorker
+from .agents.knowledge import build_code_graph
+from .embedding.embeddings_index import (
     build_emb_index,
     save_emb_index,
     load_emb_index,
     emb_search as emb_search_fn,
     embed_query,
 )
-from .diffutil import unified_diff_file_vs_text
-from .streaming_config import (
+from .code_tools.diffutil import unified_diff_file_vs_text
+from .streaming.streaming_config import (
     StreamConfig,
     load_config as load_stream_cfg,
     save_config as save_stream_cfg,
     DEFAULT_CONFIG_PATH as STREAM_CFG_PATH,
     render_kafka_topic_commands,
 )
-from .streaming_runtime import start_local_stack, autodiscover_logs
-from .kafka_log import get_kafka_logger
-from .deploy import DeploymentLogger
+from .streaming.streaming_runtime import start_local_stack, autodiscover_logs
+from .streaming.kafka_log import get_kafka_logger
+from .training.deploy import DeploymentLogger
 from .status_http import start_status_server
-from .streaming_kafka import WorkerLoop, KafkaParams
-from .knowledge import build_code_graph, summarize_code_graph
+from .streaming.streaming_kafka import WorkerLoop, KafkaParams
+from .agents.knowledge import build_code_graph, summarize_code_graph
 import threading
 import json
 import json as _json
+import typing as _typing
+from collections import Counter
+
+# RL toolkit imports
+from .rl.rlkit import (
+    RLToolEnv,
+    EnvConfig,
+    RewardConfig,
+    aggregate_reward,
+    ToolchainConfig,
+    ToolchainExecutor,
+    detect_toolchain,
+    load_from_module,
+    get_verifiers as _rl_default_verifiers,
+    make_bandit as _rl_make_bandit,
+    TrainerConfig as _RLTrainerConfig,
+    bandit_trainer as _rl_bandit_trainer,
+    bandit_trainer_puffer as _rl_bandit_trainer_puffer,
+    train_puffer_policy as _rl_train_puffer_policy,
+    run_puffer_ppo as _rl_run_puffer_ppo,
+    RLConfig as _RLConfig,
+    load_rl_config as _load_rl_config,
+)
+
+# Nested CLI groups for RL (will be registered after app is created)
+rl_app = typer.Typer(no_args_is_help=True, help="Reinforcement Learning commands")
+rl_config_app = typer.Typer(no_args_is_help=True, help="RL config helpers")
+rl_app.add_typer(rl_config_app, name="config")
+
+
+def _rl_build_make_env(
+    workspace: Path,
+    *,
+    verifiers_module: str | None,
+    weights: dict[str, float] | None,
+    penalty_kinds: _typing.Iterable[str] | None,
+    clamp01_kinds: _typing.Iterable[str] | None,
+    scales: dict[str, tuple[float, float]] | None,
+    test_cmd: str | None,
+    lint_cmd: str | None,
+    build_cmd: str | None,
+    timeout_sec: int | None,
+) -> _typing.Callable[[], RLToolEnv]:
+    vlist = None
+    try:
+        if verifiers_module:
+            vlist = load_from_module(verifiers_module)
+    except Exception:
+        vlist = None
+    if not vlist:
+        vlist = _rl_default_verifiers()
+
+    rc = RewardConfig(
+        weights=weights or {"pass_rate": 1.0, "blast_radius": 1.0},
+        penalty_kinds=list(penalty_kinds or []),
+        clamp01_kinds=list(clamp01_kinds or []),
+        scales=scales or {},
+    )
+    def reward_fn(result, verifiers, wmap):  # type: ignore[no-redef]
+        total, vec, details = aggregate_reward(result, verifiers, rc)
+        return total, vec, details
+
+    tcfg = detect_toolchain(
+        workspace,
+        test_cmd=test_cmd,
+        lint_cmd=lint_cmd,
+        build_cmd=build_cmd,
+        timeout_sec=timeout_sec,
+    )
+    execu = ToolchainExecutor(tcfg)
+
+    # Context provider preferring Kafka (logs.ctx.* topics); falls back to log counters
+    def _ctx_provider() -> list[float]:
+        # Try Kafka first if available
+        bootstrap = os.getenv('KAFKA_BOOTSTRAP') or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
+        if not _kafka_is_available(bootstrap):
+            return _logs_ctx_features(workspace)
+        try:
+            from confluent_kafka import Consumer  # type: ignore
+            silent = logging.getLogger('kafka.silent'); silent.addHandler(logging.NullHandler()); silent.setLevel(logging.CRITICAL)
+            conf = {
+                'bootstrap.servers': bootstrap,
+                'group.id': 'dspy-rl-ctx',
+                'session.timeout.ms': 6000,
+                'auto.offset.reset': 'latest',
+                'enable.partition.eof': True,
+            }
+            c = Consumer(conf, logger=silent)
+            # Subscribe to all logs.ctx.* topics via regex
+            c.subscribe(['^logs\\.ctx\\..*'])
+            # Poll a few records quickly
+            import time as _t
+            t0 = _t.time(); buf: list[str] = []
+            while _t.time() - t0 < 0.25:
+                msg = c.poll(0.05)
+                if msg is None or msg.error():
+                    continue
+                try:
+                    val = msg.value().decode('utf-8', errors='ignore') if isinstance(msg.value(), (bytes, bytearray)) else str(msg.value())
+                except Exception:
+                    continue
+                buf.append(val)
+            try: c.close()
+            except Exception: pass
+            # Aggregate features from JSON payloads {"ctx": [lines...]}
+            err = warn = timeout = trace = 0
+            import json as _j
+            for v in buf[-10:]:
+                try:
+                    obj = _j.loads(v)
+                    lines = obj.get('ctx') or []
+                    if isinstance(lines, list):
+                        s = "\n".join([str(x) for x in lines]).lower()
+                    else:
+                        s = str(obj).lower()
+                except Exception:
+                    s = v.lower()
+                err += s.count(' error ')
+                warn += s.count(' warn')
+                timeout += s.count('timeout')
+                trace += s.count('traceback (most recent call last)')
+            def norm(x: int, cap: int = 10) -> float:
+                return min(float(x), float(cap)) / float(cap)
+            return [norm(err), norm(warn), norm(timeout), norm(trace)]
+        except Exception:
+            return _logs_ctx_features(workspace)
+
+    def make_env() -> RLToolEnv:
+        ecfg = EnvConfig(
+            verifiers=vlist,
+            reward_fn=reward_fn,
+            weights=rc.weights,
+            context_provider=_ctx_provider,
+            action_args=None,
+        )
+        return RLToolEnv(executor=execu, cfg=ecfg, episode_len=1)
+
+    return make_env
+
+def _kafka_is_available(bootstrap: str, timeout: float = 0.2) -> bool:
+    try:
+        tokens = (bootstrap or '').split(',')
+        import socket as _s
+        for tk in tokens:
+            tk = tk.strip()
+            if not tk:
+                continue
+            host = tk; port = 9092
+            if '://' in host:
+                host = host.split('://', 1)[1]
+            if host.startswith('[') and ']' in host:
+                h, rest = host[1:].split(']', 1)
+                host = h
+                if rest.startswith(':'):
+                    try: port = int(rest[1:])
+                    except Exception: port = 9092
+            elif ':' in host:
+                parts = host.rsplit(':', 1)
+                host, port_s = parts[0], parts[1]
+                try: port = int(port_s)
+                except Exception: port = 9092
+            try:
+                with _s.create_connection((host, port), timeout=timeout):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+def _logs_ctx_features(workspace: Path) -> list[float]:
+    try:
+        logs_dir = workspace / 'logs'
+        bundle, _ = load_logs([logs_dir]) if logs_dir.exists() else ("", 0)
+        s = bundle.lower()
+        err = s.count(' error ')
+        warn = s.count(' warn')
+        timeout = s.count('timeout')
+        trace = s.count('traceback (most recent call last)'.lower())
+        def norm(x: int, cap: int = 10) -> float:
+            return min(float(x), float(cap)) / float(cap)
+        return [norm(err), norm(warn), norm(timeout), norm(trace)]
+    except Exception:
+        return []
+
+
+@rl_config_app.command("init")
+def rl_config_init(
+    out: Path = typer.Option(Path(".dspy_rl.json"), '--out', help="Path to write RL config JSON"),
+    verifiers_module: Optional[str] = typer.Option("verifiers", '--verifiers-module', help="Python module that provides verifiers"),
+    puffer: bool = typer.Option(True, '--puffer/--no-puffer', help="Enable PufferLib vectorization by default"),
+):
+    """Write a starter RL config file."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cfg = {
+        "policy": "epsilon-greedy",
+        "epsilon": 0.1,
+        "ucb_c": 2.0,
+        "n_envs": 4,
+        "puffer": bool(puffer),
+        "verifiers_module": verifiers_module,
+        "weights": {"pass_rate": 1.0, "blast_radius": 1.0},
+        "penalty_kinds": ["blast_radius"],
+        "clamp01_kinds": ["pass_rate"],
+        "scales": {"blast_radius": [0.0, 1.0]},
+        "test_cmd": None,
+        "lint_cmd": "ruff check --output-format json .",
+        "build_cmd": "python -m compileall -q .",
+        "timeout_sec": 180,
+    }
+    out.write_text(json.dumps(cfg, indent=2))
+    console.print(Panel.fit(f"Wrote RL config to {out}", title="rl config", border_style="green"))
+
+
+@rl_app.command("train")
+def rl_train(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+    steps: int = typer.Option(200, '--steps', help="Number of training steps"),
+    n_envs: int = typer.Option(2, '--n-envs', help="Parallel environments"),
+    policy: str = typer.Option("epsilon-greedy", '--policy', help="Bandit policy: epsilon-greedy|ucb1|thompson"),
+    epsilon: float = typer.Option(0.1, '--epsilon', help="Epsilon for epsilon-greedy"),
+    ucb_c: float = typer.Option(2.0, '--ucb-c', help="UCB1 exploration constant"),
+    neural: bool = typer.Option(False, '--neural/--no-neural', help="Use neural REINFORCE trainer"),
+    puffer: bool = typer.Option(False, '--puffer/--no-puffer', help="Use PufferLib vectorization (bandits only)"),
+    rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Path to RL config JSON"),
+    verifiers_module: Optional[str] = typer.Option(None, '--verifiers-module', help="Override verifiers module"),
+    test_cmd: Optional[str] = typer.Option(None, '--test-cmd', help="Override test command"),
+    lint_cmd: Optional[str] = typer.Option(None, '--lint-cmd', help="Override lint command"),
+    build_cmd: Optional[str] = typer.Option(None, '--build-cmd', help="Override build command"),
+    timeout_sec: Optional[int] = typer.Option(None, '--timeout-sec', help="Per-tool timeout in seconds"),
+):
+    """Train an RL policy over the local toolchain (tests/lint/build)."""
+    # Load config if provided
+    cfg: Optional[_RLConfig] = None
+    if rl_config:
+        try:
+            cfg = _load_rl_config(rl_config)
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="rl config load failed", border_style="red"))
+            raise typer.Exit(1)
+
+    # Resolve effective parameters (CLI > config defaults)
+    eff_policy = policy or (cfg.policy if cfg else "epsilon-greedy")
+    eff_epsilon = epsilon if epsilon is not None else ((cfg.epsilon if cfg else 0.1))
+    eff_ucb_c = ucb_c if ucb_c is not None else ((cfg.ucb_c if cfg else 2.0))
+    eff_n_envs = n_envs or (cfg.n_envs if cfg else 2)
+    eff_puffer = bool(puffer or (cfg.puffer if cfg else False))
+    eff_verifiers_mod = verifiers_module or ((cfg.verifiers_module if cfg else None))
+
+    eff_weights = (cfg.weights if cfg and cfg.weights else {"pass_rate": 1.0, "blast_radius": 1.0})
+    eff_pen = cfg.penalty_kinds if cfg else []
+    eff_clamp = cfg.clamp01_kinds if cfg else []
+    eff_scales = cfg.scales if cfg else {}
+    eff_test = test_cmd if test_cmd is not None else ((cfg.test_cmd if cfg else None))
+    eff_lint = lint_cmd if lint_cmd is not None else ((cfg.lint_cmd if cfg else None))
+    eff_build = build_cmd if build_cmd is not None else ((cfg.build_cmd if cfg else None))
+    eff_to = timeout_sec if timeout_sec is not None else ((cfg.timeout_sec if cfg else None))
+
+    make_env = _rl_build_make_env(
+        workspace,
+        verifiers_module=eff_verifiers_mod,
+        weights=eff_weights,
+        penalty_kinds=eff_pen,
+        clamp01_kinds=eff_clamp,
+        scales=eff_scales,
+        test_cmd=eff_test,
+        lint_cmd=eff_lint,
+        build_cmd=eff_build,
+        timeout_sec=eff_to,
+    )
+
+    # Build trainer config
+    kwargs: dict[str, _typing.Any] = {}
+    pol = (eff_policy or "epsilon-greedy").lower().strip()
+    if pol in {"epsilon", "epsilon-greedy", "egreedy", "eps"}:
+        kwargs["epsilon"] = float(eff_epsilon)
+    elif pol in {"ucb", "ucb1"}:
+        kwargs["c"] = float(eff_ucb_c)
+
+    try:
+        if neural:
+            stats = _rl_train_puffer_policy(make_env=make_env, steps=int(steps), n_envs=int(eff_n_envs), verbose=True, log_interval=max(1, int(steps)//10 or 1))
+        elif eff_puffer:
+            tcfg = _RLTrainerConfig(steps=int(steps), policy=eff_policy, policy_kwargs=kwargs, n_envs=int(eff_n_envs))
+            stats = _rl_bandit_trainer_puffer(make_env, tcfg)
+        else:
+            tcfg = _RLTrainerConfig(steps=int(steps), policy=eff_policy, policy_kwargs=kwargs, n_envs=1)
+            stats = _rl_bandit_trainer(make_env, tcfg)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="rl train failed", border_style="red"))
+        raise typer.Exit(1)
+
+    # Summarize
+    r = stats.rewards or []
+    avg = (sum(r) / len(r)) if r else 0.0
+    last = r[-10:]
+    tools = Counter([str(it.get("tool", "")) for it in (stats.infos or []) if isinstance(it, dict)])
+    body = (
+        f"steps={len(r)} avg_reward={avg:.3f}\n"
+        f"last10={[round(x,3) for x in last]}\n"
+        f"tools={dict(tools)}"
+    )
+    console.print(Panel.fit(body, title="rl train result", border_style="cyan"))
+
+
+@rl_app.command("ppo")
+def rl_ppo(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+    rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Path to RL config JSON"),
+    n_envs: int = typer.Option(4, '--n-envs', help="Vectorized environments"),
+    total_steps: int = typer.Option(100_000, '--total-steps', help="Total PPO steps"),
+):
+    """Run the PufferRL PPO shell with a vectorized env."""
+    cfg: Optional[_RLConfig] = None
+    if rl_config:
+        try:
+            cfg = _load_rl_config(rl_config)
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="rl config load failed", border_style="red"))
+            raise typer.Exit(1)
+
+    make_env = _rl_build_make_env(
+        workspace,
+        verifiers_module=(cfg.verifiers_module if cfg else None),
+        weights=(cfg.weights if cfg else {"pass_rate": 1.0, "blast_radius": 1.0}),
+        penalty_kinds=(cfg.penalty_kinds if cfg else []),
+        clamp01_kinds=(cfg.clamp01_kinds if cfg else []),
+        scales=(cfg.scales if cfg else {}),
+        test_cmd=(cfg.test_cmd if cfg else None),
+        lint_cmd=(cfg.lint_cmd if cfg else None),
+        build_cmd=(cfg.build_cmd if cfg else None),
+        timeout_sec=(cfg.timeout_sec if cfg else None),
+    )
+
+    try:
+        _rl_run_puffer_ppo(make_env=make_env, n_envs=int(n_envs), total_steps=int(total_steps))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="rl ppo failed", border_style="red"))
+        raise typer.Exit(1)
+
+
+# -----------------------------
+# Online RL during interactive
+# -----------------------------
+
+class _OnlineBandit:
+    def __init__(self, tools: list[str], state_path: Path, policy: str = "epsilon-greedy", epsilon: float = 0.1, ucb_c: float = 2.0):
+        self.tools = list(tools)
+        self.path = state_path
+        self.policy = policy
+        self.kw = {"epsilon": float(epsilon)} if policy.startswith("epsilon") else ({"c": float(ucb_c)} if policy.startswith("ucb") else {})
+        self._bandit = _rl_make_bandit(policy, len(self.tools), **self.kw)
+        self._load()
+    def _load(self):
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text())
+                if data.get("policy") == self.policy and len(data.get("values", [])) == len(self.tools):
+                    if hasattr(self._bandit, "values"): self._bandit.values = list(map(float, data.get("values", [])))
+                    if hasattr(self._bandit, "counts"): self._bandit.counts = list(map(int, data.get("counts", [])))
+        except Exception:
+            pass
+    def _save(self):
+        try:
+            data = {
+                "policy": self.policy,
+                "tools": self.tools,
+                "values": getattr(self._bandit, "values", []),
+                "counts": getattr(self._bandit, "counts", []),
+            }
+            self.path.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+    def select(self) -> str:
+        idx = int(self._bandit.select())
+        return self.tools[idx]
+    def update(self, tool_name: str, reward: float):
+        try:
+            idx = self.tools.index(tool_name)
+        except ValueError:
+            return
+        self._bandit.update(idx, float(reward))
+        self._save()
 
 
 CYBER_THEME = Theme({
@@ -78,9 +466,72 @@ CYBER_THEME = Theme({
     "err": "bright_red",
     "dim": "dim",
 })
-app = typer.Typer(add_completion=False, help="DSPy-based local coding agent")
+app = typer.Typer(add_completion=False, help="DSPy-based local coding agent", no_args_is_help=False)
 console = Console(theme=CYBER_THEME)
 LIGHTWEIGHT_DIR = Path('docker/lightweight')
+
+# Register RL subcommands under main app
+app.add_typer(rl_app, name="rl")
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    workspace: Optional[Path] = typer.Option(None, '--workspace', dir_okay=True, exists=True, help="Initial workspace"),
+    logs: Optional[Path] = typer.Option(None, '--logs', dir_okay=True, file_okay=True, exists=False, help="Initial logs path"),
+    ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama by default"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Default model"),
+    base_url: Optional[str] = typer.Option(None, '--base-url', help="Override base URL"),
+    api_key: Optional[str] = typer.Option(None, '--api-key', help="API key"),
+    force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs"),
+    structured: bool = typer.Option(False, '--structured', help="Prefer structured outputs"),
+    approval: Optional[str] = typer.Option(None, '--approval', help='Tool approval mode: auto|manual'),
+):
+    """DSPy Agent - Trainable Coding Agent
+    
+    Start an interactive session to work with your codebase.
+    All functionality is available from within the session.
+    """
+    if ctx.invoked_subcommand is None:
+        # No subcommand provided, start interactive session
+        console.print("[green]Starting interactive session...[/green]")
+        _start_interactive_session(
+            workspace=workspace,
+            logs=logs,
+            ollama=ollama,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            force_json=force_json,
+            structured=structured,
+            approval=approval
+        )
+
+
+def _start_interactive_session(
+    workspace: Optional[Path] = None,
+    logs: Optional[Path] = None,
+    ollama: bool = True,
+    model: Optional[str] = "qwen3:1.7b",
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    force_json: bool = False,
+    structured: bool = False,
+    approval: Optional[str] = None,
+):
+    """Start the interactive session - this is the main entry point."""
+    # Call the start command function
+    start_command(
+        workspace=workspace,
+        logs=logs,
+        ollama=ollama,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        force_json=force_json,
+        structured=structured,
+        approval=approval
+    )
 
 
 def _print_header(title: str):
@@ -93,34 +544,14 @@ def _banner_text() -> str:
         "██████╗ ███████╗██████╗ ██╗   ██╗   ██████╗ ██████╗ ██████╗  ███████╗\n"
         "██╔══██╗██╔════╝██╔══██╗╚██╗ ██╔╝  ██╔════╝██╔══██╗██╔══██╗ ██╔════╝\n"
         "██║  ██║███████╗██████╔╝ ╚████╔╝   ██║     ██║  ██║██║  ██║ █████╗   \n"
-        "██║  ██║╚════██║██╔═══╝   ╚██╔╝     ██║     ██║  ██║██║  ██║ ██╔══╝   \n"
+        "██║  ██║╚════██║██╔═══╝   ╚██╔╝     ██║    ██║  ██║██║  ██║ ██╔══╝   \n"
         "██████╔╝███████║██║        ██║      ╚██████╗██████╔╝██████╔╝ ███████╗\n"
         "╚═════╝ ╚══════╝╚═╝        ╚═╝       ╚═════╝╚═════╝ ╚═════╝  ╚══════╝\n"
         "\n                 DSPY-CODE — Trainable Coding Agent\n"
     )
 
 
-def _print_banner():
-    if os.environ.get("DSPY_NO_BANNER"):
-        return
-    console.print(Panel.fit(_banner_text(), border_style="magenta", title="[banner]DSPY-CODE[/banner]", subtitle="[accent]Booting neural synths...[/accent]"))
-
-
-@app.callback(invoke_without_command=True)
-def _entry(ctx: typer.Context):
-    _print_banner()
-    if ctx.invoked_subcommand is None:
-        console.print(Panel.fit(
-            "Quickstart:\n"
-            "  dspy-code              Launch interactive agent (recommended)\n"
-            "  dspy-agent live        Start live training with sensible defaults\n"
-            "  dspy-agent dataset     Build dataset + splits from ./ and ./logs\n\n"
-            "Tips:\n"
-            "  - Interactive 'start' shows all commands and usage.\n"
-            "  - Most commands pick smart defaults (workspace=., logs=./logs).\n",
-            title="Welcome",
-            border_style="accent",
-        ))
+# Removed conflicting _entry callback - main() handles the default behavior
 
 
 def _get_code_summary(ws: Path) -> str:
@@ -132,15 +563,14 @@ def _get_code_summary(ws: Path) -> str:
             s = st.get('code:summary')
             if isinstance(s, str) and s.strip():
                 return s
-    except Exception as e:
-        console.print(f"[dim]Storage not available for code summary: {e}[/dim]")
+    except Exception:
         pass
     # Fallback to quick on-the-fly summary (top files only)
     try:
+        from .agents.knowledge import build_code_graph, summarize_code_graph
         g = build_code_graph(ws)
         return summarize_code_graph(g)
-    except Exception as e:
-        console.print(f"[dim]Failed to build code summary: {e}[/dim]")
+    except Exception:
         return ""
 
 def _get_code_graph(ws: Path) -> dict:
@@ -152,14 +582,13 @@ def _get_code_graph(ws: Path) -> dict:
             g = st.get('code:graph')
             if isinstance(g, dict):
                 return g
-    except Exception as e:
-        console.print(f"[dim]Storage not available for code graph: {e}[/dim]")
+    except Exception:
         pass
     # Fallback to on-the-fly build
     try:
+        from .agents.knowledge import build_code_graph
         return build_code_graph(ws)
-    except Exception as e:
-        console.print(f"[dim]Failed to build code graph: {e}[/dim]")
+    except Exception:
         return {}
 
 
@@ -201,7 +630,7 @@ def _render_tree(root: Path, max_depth: int = 2, show_hidden: bool = False) -> s
 
 
 def _watch_logs(target: Path, tail_lines: int = 0, interval: float = 2.0):
-    from .log_reader import iter_log_paths, read_capped  # local import to avoid circular
+    from .streaming.log_reader import iter_log_paths, read_capped  # local import to avoid circular
     last_sizes: dict[Path, int] = {}
     console.print(Panel.fit(
         f"Watching {target} (interval {interval}s). Ctrl-C to stop.",
@@ -213,8 +642,7 @@ def _watch_logs(target: Path, tail_lines: int = 0, interval: float = 2.0):
             for p in list(iter_log_paths([target])):
                 try:
                     sz = p.stat().st_size
-                except Exception as e:
-                    console.print(f"[dim]Failed to stat file {p}: {e}[/dim]")
+                except Exception:
                     continue
                 prev = last_sizes.get(p, 0)
                 if sz != prev:
@@ -226,8 +654,7 @@ def _watch_logs(target: Path, tail_lines: int = 0, interval: float = 2.0):
                             tail = "\n".join(text.splitlines()[-tail_lines:])
                             stamp = datetime.now().strftime("%H:%M:%S")
                             console.print(Panel(tail or "(empty)", title=f"{p} tail({tail_lines}) @ {stamp}", border_style="magenta"))
-                        except Exception as e:
-                            console.print(f"[dim]Failed to read file {p}: {e}[/dim]")
+                        except Exception:
                             pass
             if changed:
                 # Show key events snapshot
@@ -247,8 +674,7 @@ def _logs_mtime_sum(root: Path) -> int:
             if p.is_file():
                 try:
                     total += int(p.stat().st_mtime)
-                except Exception as e:
-                    console.print(f"[dim]Failed to stat file {p}: {e}[/dim]")
+                except Exception:
                     pass
     except Exception:
         pass
@@ -305,7 +731,7 @@ def context(
     ),
     use_lm: bool = typer.Option(True, '--use-lm/--no-lm', help="Use LLM to enhance context"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama (OpenAI-compatible) backend"),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model', help="Model name (e.g., llama3)"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Model name (e.g., llama3)"),
     base_url: Optional[str] = typer.Option(None, '--base-url', help="Override base URL for OpenAI-compatible server"),
     api_key: Optional[str] = typer.Option(None, '--api-key', help="API key; for Ollama any string is fine"),
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
@@ -326,7 +752,7 @@ def context(
 
     _print_header("Log Key Events")
     key = extract_key_events(bundle)
-    console.print(Panel.fit(key, title="Extracted Events", border_style="magenta"))
+    console.print(Panel.fit(escape(key), title="Extracted Events", border_style="magenta"))
 
     if not use_lm or settings.local_mode:
         console.print("[dim]LOCAL_MODE or --no-lm: showing heuristics only.[/dim]")
@@ -340,8 +766,8 @@ def context(
     _print_header("Enhanced Context (DSPy)")
     builder = ContextBuilder()
     pred = builder(task="Summarize logs for debugging", logs_preview=key)
-    console.print(Panel.fit(pred.context, title="Context", border_style="cyan"))
-    console.print(Panel.fit(pred.key_points, title="Key Points", border_style="green"))
+    console.print(Panel.fit(escape(pred.context), title="Context", border_style="cyan"))
+    console.print(Panel.fit(escape(pred.key_points), title="Key Points", border_style="green"))
 
 
 @app.command()
@@ -362,7 +788,7 @@ def codectx(
     workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root for relative paths"),
     use_lm: bool = typer.Option(True, '--use-lm/--no-lm', help="Use LLM to summarize"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama for LLM"),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model', help="Model name for LLM"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Model name for LLM"),
     base_url: Optional[str] = typer.Option(None, '--base-url', help="Override base URL"),
     api_key: Optional[str] = typer.Option(None, '--api-key', help="API key"),
 ):
@@ -373,7 +799,7 @@ def codectx(
     target = path if path.is_absolute() else (workspace / path)
     snap = build_code_snapshot(target)
     _print_header("Code Snapshot")
-    console.print(Panel.fit(snap[:8000] + ("\n..." if len(snap) > 8000 else ""), title=str(target), border_style="magenta"))
+    console.print(Panel.fit(escape(snap[:8000] + ("\n..." if len(snap) > 8000 else "")), title=str(target), border_style="magenta"))
     if not use_lm:
         raise typer.Exit(0)
     lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
@@ -383,8 +809,8 @@ def codectx(
     cc = CodeContext()
     code_graph = _get_code_summary(workspace)
     out = cc(snapshot=snap, ask="Summarize key components, APIs, and likely modification points.", code_graph=code_graph)
-    console.print(Panel.fit(out.summary, title="Summary", border_style="cyan"))
-    console.print(Panel.fit(out.bullets, title="Bullets", border_style="green"))
+    console.print(Panel.fit(escape(out.summary), title="Summary", border_style="cyan"))
+    console.print(Panel.fit(escape(out.bullets), title="Bullets", border_style="green"))
 
 
 @app.command()
@@ -436,8 +862,7 @@ def tail_metrics(
                                         va.append(float(rec.get('score', 0.0)))
                                     else:
                                         tr.append(float(rec.get('score', 0.0)))
-                                except Exception as e:
-                                    console.print(f"[dim]Failed to parse progress line: {e}[/dim]")
+                                except Exception:
                                     pass
                             last_pos = f.tell()
                     live.update(_progress_panel(module, budget, tr, va, title="Live Metrics"))
@@ -482,8 +907,7 @@ def deploy_topics(
     if cfg_path.exists():
         try:
             cfg = load_stream_cfg(cfg_path)
-        except Exception as e:
-            console.print(f"[dim]Failed to load stream config: {e}[/dim]")
+        except Exception:
             cfg = None
     cfg = cfg or StreamConfig.default()
     # Filter deploy.* topics
@@ -531,7 +955,7 @@ def stream_topics_create(
             for name, e in errs:
                 console.print(f"[yellow]{name}: {e}[/yellow]")
     except Exception as e:
-        console.print(Panel(str(e), title="kafka", border_style="red"))
+        console.print(Panel(escape(str(e)), title="kafka", border_style="red"))
 
 
 @app.command()
@@ -543,7 +967,7 @@ def last(
     try:
         from .db.factory import get_storage as _get_storage
     except Exception as e:
-        console.print(Panel(str(e), title="storage unavailable", border_style="red")); raise typer.Exit(1)
+        console.print(Panel(escape(str(e)), title="storage unavailable", border_style="red")); raise typer.Exit(1)
     st = _get_storage()
     if st is None:
         console.print(Panel("No storage configured. Set REDDB_URL or use --db reddb in 'up'.", title="storage", border_style="yellow"))
@@ -557,7 +981,7 @@ def last(
             'ts': st.get(pref + 'ts'),
         }
     except Exception as e:
-        console.print(Panel(str(e), title="read failed", border_style="red")); raise typer.Exit(1)
+        console.print(Panel(escape(str(e)), title="read failed", border_style="red")); raise typer.Exit(1)
     if what != 'all':
         val = data.get(what)
         if val is None:
@@ -588,7 +1012,7 @@ def learn(
         console.print(Panel.fit(f"Wrote code graph to {out}", title="knowledge", border_style="green"))
         console.print(Panel.fit(summary, title="summary", border_style="accent"))
     except Exception as e:
-        console.print(Panel(str(e), title="write failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="write failed", border_style="red"))
     # Persist to storage when available
     try:
         from .db.factory import get_storage as _get_storage
@@ -601,24 +1025,19 @@ def learn(
                 root = Path(graph.get('root', workspace))
                 for f in graph.get('files', []):
                     p = Path(f.get('path', ''))
-                    try:
-                        rel = os.path.relpath(str(p), start=str(root))
-                    except Exception:
-                        rel = p.name
-                    safe = (rel or p.name).replace(os.sep, '|').replace('/', '|')
+                    rel = str(p.resolve()).replace(str(root.resolve()), '').lstrip('/')
+                    safe = (rel or p.name).replace('/', '|')
                     st.put(f'code:file:{safe}:facts', f)  # type: ignore
-            except Exception as e:
-                console.print(f"[dim]Failed to persist file facts: {e}[/dim]")
+            except Exception:
                 pass
             console.print("[green]Persisted code graph and per-file facts to storage.[/green]\n")
-    except Exception as e:
-        console.print(f"[dim]Failed to persist code graph: {e}[/dim]")
+    except Exception:
         pass
     # Build embeddings index
     if embeddings:
         try:
             _print_header("Embeddings index")
-            from .embeddings_index import build_emb_index, save_emb_index
+            from .embedding.embeddings_index import build_emb_index, save_emb_index
             from sentence_transformers import SentenceTransformer  # type: ignore
             model = SentenceTransformer('all-MiniLM-L6-v2')
             items = build_emb_index(workspace, model)
@@ -718,15 +1137,13 @@ def k8s_render(
         try:
             try:
                 import yaml as _y  # type: ignore
-            except Exception as e:
-                console.print(f"[dim]PyYAML not found, falling back to json: {e}[/dim]")
+            except Exception:
                 _y = None  # type: ignore
             if _y is not None:
                 p.write_text(_y.safe_dump(dep, sort_keys=False))
             else:
                 raise RuntimeError('yaml not available')
-        except Exception as e:
-            console.print(f"[dim]Failed to write YAML, falling back to json: {e}[/dim]")
+        except Exception:
             # fallback to json
             import json as _j
             p.write_text(_j.dumps(dep, indent=2))
@@ -750,8 +1167,7 @@ def worker(
             cfg = load_stream_cfg(config)
             bs = bs or cfg.kafka.bootstrap_servers
             grp = grp or cfg.kafka.group_id
-        except Exception as e:
-            console.print(f"[dim]Failed to load stream config: {e}[/dim]")
+        except Exception:
             pass
     console.print(Panel.fit(
         f"topic={topic}\nbootstrap={bs or 'localhost:9092'}\ngroup={grp or 'dspy-code'}\n",
@@ -768,7 +1184,7 @@ def worker(
         loop = WorkerLoop(params)
         loop.run()
     except RuntimeError as e:
-        console.print(Panel(str(e), title="worker", border_style="red"))
+        console.print(Panel(escape(str(e)), title="worker", border_style="red"))
         raise typer.Exit(1)
 
 
@@ -801,7 +1217,7 @@ def up(
     status_port: int = typer.Option(8765, '--status-port', help="Status server port (0 to disable)"),
 ):
     """Start local tailers + aggregators + workers (no Kafka needed). Single command dev stack."""
-    _print_banner()
+    _print_banner(console)
     # Optionally wire storage + kafka for persistence
     storage = None
     kafka = None
@@ -819,26 +1235,23 @@ def up(
             storage = RedDBStorage(url=s.reddb_url, namespace=s.reddb_namespace or "dspy")
         else:
             storage = _get_storage()
-    except Exception as e:
-        console.print(f"[dim]Failed to get storage: {e}[/dim]")
+    except Exception:
         storage = None
     try:
         kafka = get_kafka_logger()
         if kafka is None:
             console.print("[dim]Kafka logging disabled (set KAFKA_BOOTSTRAP_SERVERS to enable).[/dim]")
-    except Exception as e:
-        console.print(f"[dim]Failed to get kafka logger: {e}[/dim]")
+    except Exception:
         kafka = None
     threads, bus = start_local_stack(workspace, None, storage=storage, kafka=kafka)
     if train:
         # Discover containers from .dspy_stream.json or autodiscovery
         try:
             cfg = load_stream_cfg(STREAM_CFG_PATH) if STREAM_CFG_PATH.exists() else None
-        except Exception as e:
-            console.print(f"[dim]Failed to load stream config: {e}[/dim]")
+        except Exception:
             cfg = None
         containers = [getattr(ct, 'container') for ct in getattr(cfg, 'containers', [])] if cfg else [d.container for d in autodiscover_logs(workspace)]
-        from .streaming_runtime import Trainer
+        from .streaming.streaming_runtime import Trainer
         trainer = Trainer(workspace, bus, containers, min_batch=3, interval_sec=60.0)
         trainer.start(); threads.append(trainer)
     if not threads:
@@ -897,259 +1310,239 @@ def _docker_available() -> bool:
 
 
 def _compose_yaml(image: str, host_ws: Path, host_logs: Optional[Path], db_backend: str) -> str:
-    """Render docker-compose content using a YAML serializer.
+    logs_map = f"\n      - {host_logs.resolve()}:/workspace/logs:ro" if host_logs else ""
+    return f"""
+services:
+  dspy-agent:
+    image: {image}
+    build:
+      context: ../../
+      dockerfile: docker/lightweight/Dockerfile
+    environment:
+      - LOCAL_MODE=false
+      - USE_OLLAMA=true
+      - DB_BACKEND={db_backend}
+      - REDDB_URL
+      - REDDB_NAMESPACE=dspy
+      - REDDB_TOKEN
+      - MODEL_NAME=qwen3:1.7b
+      - OPENAI_API_KEY=
+      - OPENAI_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3:1.7b
+      - OLLAMA_API_KEY=
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_CLIENT_ID=dspy-agent
+      - KAFKA_TOPIC_PREFIX
+    working_dir: /app
+    entrypoint: ["/bin/bash", "-lc"]
+    # Wait for services before launching agent
+    command: >-
+      for i in {{1..60}}; do
+        curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;
+        echo "waiting for ollama/kafka..."; sleep 2;
+      done;
+      dspy-agent stream_topics_create --bootstrap kafka:9092 || true;
+      dspy-agent up --workspace /workspace --db {db_backend} --status --status-port 8765
+    volumes:
+      - {host_ws.resolve()}:/workspace:rw{logs_map}
+    ports:
+      - "127.0.0.1:8765:8765"  # reserved for future HTTP status
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8765/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      ollama:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      spark:
+        condition: service_healthy
 
-    Falls back to JSON (valid YAML subset) if PyYAML is unavailable.
-    """
-    ws_mount = f"{host_ws.resolve()}:/workspace:rw"
-    volumes = [ws_mount]
-    if host_logs is not None:
-        volumes.append(f"{host_logs.resolve()}:/workspace/logs:ro")
+  ollama:
+    image: ollama/ollama:latest
+    entrypoint: ["/bin/sh", "-lc"]
+    command: |
+      ollama serve &
+      sleep 3;
+      ollama pull qwen3:1.7b || true;
+      wait
+    ports:
+      - "127.0.0.1:11435:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
-    # Common helpers
-    def hc_cmdshell(cmd: str) -> list[str]:
-        return ["CMD-SHELL", cmd]
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    ports:
+      - "127.0.0.1:2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/2181 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
-    agent_command = (
-        "for i in {1..60}; do\n"
-        "  curl -sf http://ollama:11434/api/tags >/dev/null 2>&1 && echo > /dev/tcp/kafka/9092 && break;\n"
-        "  echo \"waiting for ollama/kafka...\"; sleep 2;\n"
-        "done;\n"
-        "dspy-agent stream_topics_create --bootstrap kafka:9092 || true;\n"
-        f"dspy-agent up --workspace /workspace --db {db_backend} --status --status-port 8765"
-    )
+  kafka:
+    image: bitnami/kafka:3.6
+    depends_on:
+      - zookeeper
+    environment:
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+    ports:
+      - "127.0.0.1:9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/9092 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
 
-    spark_command = (
-        "spark-submit \\\n+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \\\n+        /app/scripts/streaming/spark_logs.py \\\n+        --bootstrap kafka:9092 \\\n+        --pattern 'logs.raw.*' \\\n+        --checkpoint /workspace/.dspy_checkpoints/spark_logs"
-    )
+  spark:
+    image: bitnami/spark:3.5
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - {host_ws.resolve()}:/workspace
+      - ../../scripts:/app/scripts
+    entrypoint: ["/bin/bash", "-lc"]
+    # Run PySpark job to transform raw logs -> context windows on Kafka
+    command: >-
+      spark-submit \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+        /app/scripts/streaming/spark_logs.py \
+        --bootstrap kafka:9092 \
+        --pattern 'logs.raw.*' \
+        --checkpoint /workspace/.dspy_checkpoints/spark_logs
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -iq spark-submit || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
 
-    worker_wait = (
-        "for i in {1..60}; do echo > /dev/tcp/kafka/9092 && break; echo \"waiting for kafka...\"; sleep 2; done;"
-    )
+  dspy-worker:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic app --bootstrap kafka:9092
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-    code_watch_cmd = (
-        "python - <<'PY'\n"
-        "from dspy_agent.code_watch import CodeWatcher\n"
-        "from pathlib import Path\n"
-        "CodeWatcher(Path('/workspace')).run()\n"
-        "PY"
-    )
+  dspy-worker-backend:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic backend --bootstrap kafka:9092
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-    code_indexer_cmd = (
-        "python - <<'PY'\n"
-        "from dspy_agent.code_indexer_worker import CodeIndexerWorker\n"
-        "CodeIndexerWorker('kafka:9092').run()\n"
-        "PY"
-    )
+  dspy-worker-frontend:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      for i in {{1..60}}; do echo > /dev/tcp/kafka/9092 && break; echo "waiting for kafka..."; sleep 2; done;
+      dspy-agent worker --topic frontend --bootstrap kafka:9092
+    working_dir: /app
+  dspy-code-watch:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      python - <<'PY'
+from dspy_agent.code_tools.code_watch import CodeWatcher
+from pathlib import Path
+CodeWatcher(Path('/workspace')).run()
+PY
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-    router_cmd = (
-        "python - <<'PY'\n"
-        "from dspy_agent.router_worker import RouterWorker\n"
-        "RouterWorker('kafka:9092').run()\n"
-        "PY"
-    )
+  dspy-code-indexer:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      python - <<'PY'
+from dspy_agent.code_tools.code_indexer_worker import CodeIndexerWorker
+CodeIndexerWorker('kafka:9092').run()
+PY
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-    doc: dict = {
-        "services": {
-            "dspy-agent": {
-                "image": image,
-                "build": {
-                    "context": "../../",
-                    "dockerfile": "docker/lightweight/Dockerfile",
-                },
-                "environment": [
-                    "LOCAL_MODE=false",
-                    "USE_OLLAMA=true",
-                    f"DB_BACKEND={db_backend}",
-                    "REDDB_URL",
-                    "REDDB_NAMESPACE=dspy",
-                    "REDDB_TOKEN",
-                    "MODEL_NAME=deepseek-coder:1.3b",
-                    "OPENAI_API_KEY=",
-                    "OPENAI_BASE_URL=http://ollama:11434",
-                    "OLLAMA_MODEL=deepseek-coder:1.3b",
-                    "OLLAMA_API_KEY=",
-                    "KAFKA_BOOTSTRAP_SERVERS=kafka:9092",
-                    "KAFKA_CLIENT_ID=dspy-agent",
-                    "KAFKA_TOPIC_PREFIX",
-                ],
-                "working_dir": "/app",
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": agent_command,
-                "volumes": volumes,
-                "ports": ["127.0.0.1:8765:8765"],
-                "restart": "unless-stopped",
-                "healthcheck": {
-                    "test": hc_cmdshell("curl -sf http://localhost:8765/health >/dev/null 2>&1 || exit 1"),
-                    "interval": "10s",
-                    "timeout": "3s",
-                    "retries": 12,
-                    "start_period": "10s",
-                },
-                "depends_on": {
-                    "ollama": {"condition": "service_healthy"},
-                    "kafka": {"condition": "service_healthy"},
-                    "spark": {"condition": "service_healthy"},
-                },
-            },
-            "ollama": {
-                "image": "ollama/ollama:latest",
-                "entrypoint": ["/bin/sh", "-lc"],
-                "command": (
-                    "ollama serve &\n"
-                    "sleep 3;\n"
-                    "ollama pull deepseek-coder:1.3b || true;\n"
-                    "wait"
-                ),
-                "ports": ["127.0.0.1:11435:11434"],
-                "volumes": ["ollama:/root/.ollama"],
-                "healthcheck": {
-                    "test": hc_cmdshell("curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"),
-                    "interval": "10s",
-                    "timeout": "3s",
-                    "retries": 20,
-                    "start_period": "5s",
-                },
-            },
-            "zookeeper": {
-                "image": "bitnami/zookeeper:3.9",
-                "environment": ["ALLOW_ANONYMOUS_LOGIN=yes"],
-                "ports": ["127.0.0.1:2181:2181"],
-                "healthcheck": {
-                    "test": hc_cmdshell("echo > /dev/tcp/localhost/2181 || exit 1"),
-                    "interval": "10s",
-                    "timeout": "3s",
-                    "retries": 20,
-                    "start_period": "5s",
-                },
-            },
-            "kafka": {
-                "image": "bitnami/kafka:3.6",
-                "depends_on": ["zookeeper"],
-                "environment": [
-                    "KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181",
-                    "ALLOW_PLAINTEXT_LISTENER=yes",
-                    "KAFKA_LISTENERS=PLAINTEXT://:9092",
-                    "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092",
-                    "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT",
-                    "KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT",
-                ],
-                "ports": ["127.0.0.1:9092:9092"],
-                "healthcheck": {
-                    "test": hc_cmdshell("echo > /dev/tcp/localhost/9092 || exit 1"),
-                    "interval": "10s",
-                    "timeout": "3s",
-                    "retries": 20,
-                    "start_period": "10s",
-                },
-            },
-            "spark": {
-                "image": "bitnami/spark:3.5",
-                "depends_on": {"kafka": {"condition": "service_healthy"}},
-                "volumes": [f"{host_ws.resolve()}:/workspace", "../../scripts:/app/scripts"],
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": spark_command,
-                "healthcheck": {
-                    "test": hc_cmdshell("ps aux | grep -v grep | grep -iq spark-submit || exit 1"),
-                    "interval": "15s",
-                    "timeout": "5s",
-                    "retries": 20,
-                    "start_period": "10s",
-                },
-            },
-            "dspy-worker": {
-                "image": image,
-                "depends_on": {"kafka": {"condition": "service_healthy"}},
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": worker_wait + " dspy-agent worker --topic app --bootstrap kafka:9092",
-                "working_dir": "/app",
-                "healthcheck": {
-                    "test": hc_cmdshell("pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"),
-                    "interval": "15s",
-                    "timeout": "5s",
-                    "retries": 10,
-                    "start_period": "10s",
-                },
-            },
-            "dspy-worker-backend": {
-                "image": image,
-                "depends_on": {"kafka": {"condition": "service_healthy"}},
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": worker_wait + " dspy-agent worker --topic backend --bootstrap kafka:9092",
-                "working_dir": "/app",
-                "healthcheck": {
-                    "test": hc_cmdshell("pgrep -f 'dspy-agent worker' >/dev/null 2>&1 || exit 1"),
-                    "interval": "15s",
-                    "timeout": "5s",
-                    "retries": 10,
-                    "start_period": "10s",
-                },
-            },
-            "dspy-worker-frontend": {
-                "image": image,
-                "depends_on": {"kafka": {"condition": "service_healthy"}},
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": worker_wait + " dspy-agent worker --topic frontend --bootstrap kafka:9092",
-                "working_dir": "/app",
-            },
-            "dspy-code-watch": {
-                "image": image,
-                "depends_on": {"kafka": {"condition": "service_healthy"}},
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": code_watch_cmd,
-                "working_dir": "/app",
-                "healthcheck": {
-                    "test": hc_cmdshell("pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"),
-                    "interval": "15s",
-                    "timeout": "5s",
-                    "retries": 10,
-                    "start_period": "10s",
-                },
-            },
-            "dspy-code-indexer": {
-                "image": image,
-                "depends_on": {"kafka": {"condition": "service_healthy"}},
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": code_indexer_cmd,
-                "working_dir": "/app",
-                "healthcheck": {
-                    "test": hc_cmdshell("pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"),
-                    "interval": "15s",
-                    "timeout": "5s",
-                    "retries": 10,
-                    "start_period": "10s",
-                },
-            },
-            "dspy-router": {
-                "image": image,
-                "depends_on": {"kafka": {"condition": "service_healthy"}},
-                "entrypoint": ["/bin/bash", "-lc"],
-                "command": router_cmd,
-                "working_dir": "/app",
-                "healthcheck": {
-                    "test": hc_cmdshell("pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"),
-                    "interval": "15s",
-                    "timeout": "5s",
-                    "retries": 10,
-                    "start_period": "10s",
-                },
-            },
-        },
-        "volumes": {"ollama": {}},
-    }
+  dspy-router:
+    image: {image}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >-
+      python - <<'PY'
+from dspy_agent.agents.router_worker import RouterWorker
+RouterWorker('kafka:9092').run()
+PY
+    working_dir: /app
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-    try:
-        import yaml as _yaml  # type: ignore
-    except Exception as e:
-        console.print(f"[dim]PyYAML not found, falling back to json: {e}[/dim]")
-        _yaml = None  # type: ignore
-
-    if _yaml is not None:
-        return _yaml.safe_dump(doc, sort_keys=False)
-    else:
-        # JSON is a valid subset of YAML; acceptable fallback.
-        import json as _j
-        return _j.dumps(doc, indent=2)
+volumes:
+  ollama: {{}}
+""".strip()
 
 
 def _dockerfile() -> str:
@@ -1214,7 +1607,7 @@ def lightweight_init(
         df.write_text(_dockerfile())
         dc.write_text(_compose_yaml(image='dspy-lightweight:latest', host_ws=ws, host_logs=lg, db_backend=db))
     except Exception as e:
-        console.print(Panel(str(e), title="write failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="write failed", border_style="red"))
         raise typer.Exit(1)
 
     if warns:
@@ -1268,7 +1661,7 @@ def lightweight_up(
         logger.event("up", "info", "Lightweight stack is up")
     except Exception as e:
         logger.status("error")
-        console.print(Panel(str(e), title="docker compose failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="docker compose failed", border_style="red"))
     finally:
         logger.close()
     raise typer.Exit(0)
@@ -1300,7 +1693,7 @@ def lightweight_down(
         logger.event("down", "info", "Lightweight stack stopped")
     except Exception as e:
         logger.status("error")
-        console.print(Panel(str(e), title="docker compose failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="docker compose failed", border_style="red"))
     finally:
         logger.close()
     raise typer.Exit(0)
@@ -1329,7 +1722,7 @@ def lightweight_status(
             logger.status("error")
     except Exception as e:
         logger.status("error")
-        console.print(Panel(str(e), title="docker compose failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="docker compose failed", border_style="red"))
     finally:
         logger.close()
     raise typer.Exit(0)
@@ -1372,7 +1765,7 @@ def lightweight_build(
         console.print("[green]Lightweight build complete.[/green]")
     except Exception as e:
         logger.status("error")
-        console.print(Panel(str(e), title="lightweight build failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="lightweight build failed", border_style="red"))
     finally:
         logger.close()
     raise typer.Exit(0)
@@ -1385,7 +1778,7 @@ def chat(
     logs: Optional[Path] = typer.Option(None, '--logs', file_okay=True, dir_okay=True, exists=True),
     steps: int = typer.Option(4, '--steps', help="Max auto steps"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama'),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model'),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model'),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
@@ -1441,13 +1834,12 @@ def chat(
                     pred = slow(query=task, state=state)
                     tool = (pred.tool or tool).strip(); args = _json.loads(pred.args_json or "{}")
                     if getattr(pred, 'rationale', None):
-                        console.print(Panel.fit(pred.rationale, title="Routing Rationale", border_style="dim"))
-            except Exception as e:
-                console.print(f"[dim]Orchestrator failed: {e}[/dim]")
+                        console.print(Panel.fit(escape(pred.rationale), title="Routing Rationale", border_style="dim"))
+            except Exception:
                 tool = None; args = {}
         if not tool:
             tool = "context" if logs_path.exists() else "codectx"; args = {}
-        console.print(Panel.fit(f"{tool} {args}", title=f"Step {step}: action", border_style="yellow"))
+        console.print(Panel.fit(escape(f"{tool} {args}"), title=f"Step {step}: action", border_style="yellow"))
         if last_tool == tool and last_args == args:
             console.print("[dim]No new action; stopping.[/dim]")
             break
@@ -1461,9 +1853,9 @@ def chat(
                     continue
             # dispatch_tool is nested in start; inline minimal relevant calls
             if tool == "context":
-                bundle, _ = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""; _print_header("Log Key Events"); console.print(Panel.fit(key, title="Extracted Events", border_style="magenta"))
+                bundle, _ = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""; _print_header("Log Key Events"); console.print(Panel.fit(escape(key), title="Extracted Events", border_style="magenta"))
             elif tool == "codectx":
-                snap = build_code_snapshot(ws); _print_header("Code Snapshot"); console.print(Panel.fit(snap[:8000] + ("\n..." if len(snap)>8000 else ""), title=str(ws), border_style="magenta"))
+                snap = build_code_snapshot(ws); _print_header("Code Snapshot"); console.print(Panel.fit(escape(snap[:8000] + ("\n..." if len(snap)>8000 else "")), title=str(ws), border_style="magenta"))
             elif tool == "grep":
                 hits = search_text(ws, args.get("pattern", task), regex=True); [console.print(f"{h.path}:{h.line_no}: {h.line}") for h in hits[:200]]
             elif tool == "esearch":
@@ -1471,20 +1863,19 @@ def chat(
                 except FileNotFoundError: meta, items = build_index(ws, smart=True); save_index(ws, meta, items)
                 hits = semantic_search(task, meta, items, top_k=5)
                 for score,it in hits:
-                    p = Path(it.path); text = p.read_text(errors="ignore"); lines = text.splitlines(); s=max(1,it.start_line-3); e=min(len(lines), it.end_line+3); seg = "\n".join(lines[s-1:e]); console.print(Panel(seg, title=f"{p} score={score:.3f} lines {s}-{e}", border_style="blue"))
+                    p = Path(it.path); text = p.read_text(errors="ignore"); lines = text.splitlines(); s=max(1,it.start_line-3); e=min(len(lines), it.end_line+3); seg = "\n".join(lines[s-1:e]); console.print(Panel(escape(seg), title=f"{p} score={score:.3f} lines {s}-{e}", border_style="blue"))
             elif tool == "extract":
                 fp = (ws / args.get("file",".")).resolve(); sym=args.get("symbol"); rx=args.get("regex");
                 if sym and fp.suffix==".py": res = python_extract_symbol(fp, sym); 
-                elif rx: hits=file_search(fp, rx, regex=True); text=fp.read_text(errors="ignore"); s,e,seg=extract_context(text, hits[0].line_no, before=3, after=3); console.print(Panel(seg, title=f"{fp} lines {s}-{e}", border_style="green"))
+                elif rx: hits=file_search(fp, rx, regex=True); text=fp.read_text(errors="ignore"); s,e,seg=extract_context(text, hits[0].line_no, before=3, after=3); console.print(Panel(escape(seg), title=f"{fp} lines {s}-{e}", border_style="green"))
             else:
                 # default to context snapshot
-                bundle, _ = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""; console.print(Panel.fit(key or "(no logs)", title="Key Events", border_style="magenta"))
+                bundle, _ = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""; console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
         except Exception as e:
-            console.print(Panel(str(e), title=f"agent failed ({tool})", border_style="red")); break
+            console.print(Panel(escape(str(e)), title=f"agent failed ({tool})", border_style="red")); break
         try:
             outcome = evaluate_tool_choice(tool, args, workspace=ws, logs_path=logs_path, targets=targets); piece=f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
-        except Exception as e:
-            console.print(f"[dim]Failed to evaluate tool choice: {e}[/dim]")
+        except Exception:
             piece=f"{tool}: done"
         history_summary = (history_summary + " | " + piece).strip()
         if step >= 2 and ("score=" in piece and float(piece.split("score=")[1].split(";")[0]) >= 1.2):
@@ -1517,14 +1908,14 @@ def run(
 
     if not use_lm or settings.local_mode:
         _print_header("Heuristic Context")
-        console.print(Panel.fit(key or "(no logs)", title="Key Events", border_style="magenta"))
+        console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
         console.print("[yellow]LOCAL_MODE or --no-lm: cannot generate a plan.[/yellow]")
         raise typer.Exit(0)
 
     lm = _maybe_configure_lm(use_lm, ollama, model, base_url, api_key)
     if lm is None:
         _print_header("Heuristic Context")
-        console.print(Panel.fit(key or "(no logs)", title="Key Events", border_style="magenta"))
+        console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
         console.print("[yellow]No LM configured; cannot generate a plan.[/yellow]")
         raise typer.Exit(1)
 
@@ -1537,11 +1928,11 @@ def run(
     agent = TaskAgent()
     out = agent(task=task, context=fused_context)
 
-    console.print(Panel.fit(task, title="Task", border_style="white"))
-    console.print(Panel.fit(ctx.context, title="Context", border_style="cyan"))
-    console.print(Panel.fit(ctx.key_points, title="Key Points", border_style="green"))
-    console.print(Panel.fit(out.plan, title="Proposed Plan", border_style="blue"))
-    console.print(Panel.fit(out.commands or "(no commands)", title="Suggested Commands", border_style="yellow"))
+    console.print(Panel.fit(escape(task), title="Task", border_style="white"))
+    console.print(Panel.fit(escape(ctx.context), title="Context", border_style="cyan"))
+    console.print(Panel.fit(escape(ctx.key_points), title="Key Points", border_style="green"))
+    console.print(Panel.fit(escape(out.plan), title="Proposed Plan", border_style="blue"))
+    console.print(Panel.fit(escape(out.commands or "(no commands)"), title="Suggested Commands", border_style="yellow"))
 
 
 @app.command()
@@ -1580,13 +1971,12 @@ def esearch(
             start = max(1, it.start_line - context)
             end = min(len(lines), it.end_line + context)
             seg = "\n".join(lines[start - 1 : end])
-        except Exception as e:
-            console.print(f"[dim]Failed to read file {p}: {e}[/dim]")
+        except Exception:
             seg = "(unreadable)"
             start = it.start_line
             end = it.end_line
         title = f"{p}  score={score:.3f}  lines {start}-{end}"
-        console.print(Panel(seg, title=title, border_style="blue"))
+        console.print(Panel(escape(seg), title=title, border_style="blue"))
 
 
 @app.command()
@@ -1617,13 +2007,13 @@ def emb_index(
         try:
             embedder = SentenceTransformer(model, model_kwargs=model_kwargs or None, tokenizer_kwargs=tok_kwargs or None)
         except Exception as e:
-            console.print(Panel(str(e), title="Failed to load HF model", border_style="red"))
+            console.print(Panel(escape(str(e)), title="Failed to load HF model", border_style="red"))
             raise typer.Exit(1)
     else:
         try:
             embedder = dspy.Embeddings(model=model, api_base=base_url, api_key=api_key)
         except Exception as e:
-            console.print(Panel(str(e), title="Failed to init DSPy Embeddings", border_style="red"))
+            console.print(Panel(escape(str(e)), title="Failed to init DSPy Embeddings", border_style="red"))
             raise typer.Exit(1)
     items = build_emb_index(workspace, embedder, lines_per_chunk=lines, smart=smart)
     out_dir = save_emb_index(workspace, items, persist=persist)
@@ -1644,7 +2034,7 @@ def embeddings_inspect(
         from .db.factory import get_storage as _get_storage
         import hashlib as _h
     except Exception as e:
-        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+        console.print(Panel(escape(str(e)), title="storage", border_style="red")); raise typer.Exit(1)
     st = _get_storage()
     if st is None:
         console.print(Panel("No storage configured (set REDDB_URL).", title="embeddings", border_style="yellow")); raise typer.Exit(1)
@@ -1670,7 +2060,7 @@ def chunks_compact(
     try:
         from .db.factory import get_storage as _get_storage
     except Exception as e:
-        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+        console.print(Panel(escape(str(e)), title="storage", border_style="red")); raise typer.Exit(1)
     st = _get_storage()
     if st is None:
         console.print(Panel("No storage configured (set REDDB_URL).", title="chunks", border_style="yellow")); raise typer.Exit(1)
@@ -1703,7 +2093,7 @@ def ast_cache(
     try:
         from .db.factory import get_storage as _get_storage
     except Exception as e:
-        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+        console.print(Panel(escape(str(e)), title="storage", border_style="red")); raise typer.Exit(1)
     st = _get_storage()
     if st is None:
         console.print(Panel("No storage configured (set REDDB_URL).", title="ast-cache", border_style="yellow")); raise typer.Exit(1)
@@ -1820,7 +2210,7 @@ def find_chunk(
     try:
         from .db.factory import get_storage as _get_storage
     except Exception as e:
-        console.print(Panel(str(e), title="storage", border_style="red")); raise typer.Exit(1)
+        console.print(Panel(escape(str(e)), title="storage", border_style="red")); raise typer.Exit(1)
     st = _get_storage()
     if not hash:
         hash = _h.sha256((str(file) + str(start) + str(end)).encode('utf-8')).hexdigest()
@@ -1837,7 +2227,7 @@ def find_chunk(
             seg = "\n".join(lines[start - 1 : end])
             console.print(Panel(seg or "(empty)", title=f"{file}:{start}-{end} | {hash}", border_style="cyan")); raise typer.Exit(0)
         except Exception as e:
-            console.print(Panel(str(e), title="read failed", border_style="red")); raise typer.Exit(1)
+            console.print(Panel(escape(str(e)), title="read failed", border_style="red")); raise typer.Exit(1)
     console.print("[yellow]Chunk not found in KV and no file-range provided.[/yellow]"); raise typer.Exit(1)
 
 
@@ -1869,13 +2259,13 @@ def emb_search(
         try:
             embedder = SentenceTransformer(model, model_kwargs=model_kwargs or None, tokenizer_kwargs=tok_kwargs or None)
         except Exception as e:
-            console.print(Panel(str(e), title="Failed to load HF model", border_style="red"))
+            console.print(Panel(escape(str(e)), title="Failed to load HF model", border_style="red"))
             raise typer.Exit(1)
     else:
         try:
             embedder = dspy.Embeddings(model=model, api_base=base_url, api_key=api_key)
         except Exception as e:
-            console.print(Panel(str(e), title="Failed to init DSPy Embeddings", border_style="red"))
+            console.print(Panel(escape(str(e)), title="Failed to init DSPy Embeddings", border_style="red"))
             raise typer.Exit(1)
     items = load_emb_index(workspace)
     qv = embed_query(embedder, query)
@@ -1891,13 +2281,12 @@ def emb_search(
             start = max(1, it.start_line - context)
             end = min(len(lines), it.end_line + context)
             seg = "\n".join(lines[start - 1 : end])
-        except Exception as e:
-            console.print(f"[dim]Failed to read file {p}: {e}[/dim]")
+        except Exception:
             seg = "(unreadable)"
             start = it.start_line
             end = it.end_line
         title = f"{p}  score={score:.3f}  lines {start}-{end}"
-        console.print(Panel(seg, title=title, border_style="cyan"))
+        console.print(Panel(escape(seg), title=title, border_style="cyan"))
 
 
 @app.command()
@@ -1913,7 +2302,7 @@ def gepa_train(
     log_dir: Optional[Path] = typer.Option(None, '--log-dir', help="Directory to store GEPA logs"),
     track_stats: bool = typer.Option(True, '--track-stats/--no-track-stats'),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama for reflection LM"),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model', help="Reflection model name"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Reflection model name"),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
     save_best: Optional[Path] = typer.Option(None, '--save-best', help="Write best candidate program mapping to this JSON file"),
@@ -2080,7 +2469,7 @@ def gepa_orchestrator(
     log_dir: Optional[Path] = typer.Option(None, '--log-dir'),
     track_stats: bool = typer.Option(True, '--track-stats/--no-track-stats'),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama'),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model'),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model'),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
     save_best: Optional[Path] = typer.Option(None, '--save-best', help="Write best candidate orchestration mapping to file"),
@@ -2200,7 +2589,7 @@ def gepa_codegen(
     auto: Optional[str] = typer.Option('light', '--auto', help="GEPA budget: light|medium|heavy"),
     log_dir: Optional[Path] = typer.Option(None, '--log-dir', help="Where to write GEPA logs"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama for reflection LM"),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model', help="Reflection model"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Reflection model"),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
 ):
@@ -2223,7 +2612,7 @@ def gepa_codegen(
         )
         console.print("[green]GEPA codegen complete.[/green]")
     except Exception as e:
-        console.print(Panel(str(e), title="gepa codegen failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="gepa codegen failed", border_style="red"))
         raise typer.Exit(1)
 
 
@@ -2235,7 +2624,7 @@ def code_edit(
     file_hints: Optional[str] = typer.Option(None, '--files', help="Optional file/module hints"),
     apply: bool = typer.Option(False, '--apply/--no-apply', help="Apply the generated patch"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama'),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model'),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model'),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
 ):
@@ -2271,7 +2660,7 @@ def init(
     train: bool = typer.Option(False, '--train/--no-train', help="Run a light GEPA training pass after bootstrapping"),
     budget: str = typer.Option('light', '--budget', help="GEPA budget: light|medium|heavy"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama for reflection LM"),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model', help="Reflection model name"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Reflection model name"),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
@@ -2300,22 +2689,22 @@ def init(
         _ = run_gepa_orchestrator(train_jsonl=paths['orchestrator'], auto=budget, reflection_lm=lm, log_dir=str(ws / '.gepa_orch'), track_stats=True)
         console.print("[green]Orchestrator training complete.[/green]")
     except Exception as e:
-        console.print(Panel(str(e), title="orchestrator training failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="orchestrator training failed", border_style="red"))
     try:
         _ = run_gepa(module='context', train_jsonl=paths['context'], auto=budget, reflection_lm=lm, log_dir=str(ws / '.gepa_ctx'), track_stats=True)
         console.print("[green]Context module training complete.[/green]")
     except Exception as e:
-        console.print(Panel(str(e), title="context training failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="context training failed", border_style="red"))
     try:
         _ = run_gepa(module='code', train_jsonl=paths['code'], auto=budget, reflection_lm=lm, log_dir=str(ws / '.gepa_code'), track_stats=True)
         console.print("[green]Code module training complete.[/green]")
     except Exception as e:
-        console.print(Panel(str(e), title="code training failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="code training failed", border_style="red"))
     try:
         _ = run_gepa(module='task', train_jsonl=paths['task'], auto=budget, reflection_lm=lm, log_dir=str(ws / '.gepa_task'), track_stats=True)
         console.print("[green]Task module training complete.[/green]")
     except Exception as e:
-        console.print(Panel(str(e), title="task training failed", border_style="red"))
+        console.print(Panel(escape(str(e)), title="task training failed", border_style="red"))
     console.print(Panel.fit("Flags: --workspace --logs --out-dir --train/--no-train --budget --ollama/--no-ollama --model --base-url --api-key", title="usage", border_style="dim"))
 
 
@@ -2332,7 +2721,7 @@ def live_train(
     dedup: bool = typer.Option(True, '--dedup/--no-dedup', help="De-duplicate rows"),
     stratify_by: Optional[str] = typer.Option('task_type', '--stratify-by'),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama'),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model'),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model'),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
 ):
@@ -2484,7 +2873,7 @@ def live_train(
                                     for rec in series:
                                         w.writerow([rec.get('ts',''), rec.get('module',''), rec.get('split',''), rec.get('score',0.0)])
                         except Exception as e:
-                            console.print(Panel(str(e), title=f"{m} export failed", border_style="yellow"))
+                            console.print(Panel(escape(str(e)), title=f"{m} export failed", border_style="yellow"))
                         if m not in results:
                             console.print(Panel("No trained program returned.", title=f"{m} eval skipped", border_style="yellow"))
                             continue
@@ -2494,7 +2883,7 @@ def live_train(
                             stats = evaluate_on_set(m, results[m], split_dir / f'{m}_test.jsonl')  # type: ignore[arg-type]
                         write_report(m, stats)
                     except Exception as e:
-                        console.print(Panel(str(e), title=f"{m} eval failed", border_style="red"))
+                        console.print(Panel(escape(str(e)), title=f"{m} eval failed", border_style="red"))
             time.sleep(interval)
     except KeyboardInterrupt:
         console.print("[dim]Stopped live training.[/dim]")
@@ -2518,7 +2907,7 @@ def live():
         dedup=True,
         stratify_by='task_type',
         ollama=True,
-        model="deepseek-coder:1.3b",
+        model="qwen3:1.7b",
         base_url=None,
         api_key=None,
     )
@@ -2541,33 +2930,32 @@ def open_cmd(
     try:
         if editor:
             ed = os.path.basename(editor)
-            editor_args = shlex.split(editor, posix=(os.name != 'nt'))
+            quoted = shlex.quote(str(target))
             if line is not None and ("code" in ed):
-                loc = f"{str(target)}:{line}:{col or 1}"
-                proc = subprocess.run([*editor_args, "-g", loc])
+                # VS Code
+                loc = f"{quoted}:{line}:{col or 1}"
+                os.system(f"{editor} -g {loc}")
             elif line is not None and ("subl" in ed or "sublime" in ed):
-                proc = subprocess.run([*editor_args, f"{str(target)}:{line}:{col or 1}"])
+                os.system(f"{editor} {quoted}:{line}:{col or 1}")
             elif line is not None and ("vim" in ed or "nvim" in ed):
-                proc = subprocess.run([*editor_args, f"+{line}", str(target)])
+                os.system(f"{editor} +{line} {quoted}")
             elif line is not None and ("emacs" in ed):
-                plus = f"+{line}:{col}" if col is not None else f"+{line}"
-                proc = subprocess.run([*editor_args, plus, str(target)])
+                if col is not None:
+                    os.system(f"{editor} +{line}:{col} {quoted}")
+                else:
+                    os.system(f"{editor} +{line} {quoted}")
             elif line is not None and ("idea" in ed):
-                proc = subprocess.run([*editor_args, "--line", str(line), str(target)])
+                os.system(f"{editor} --line {line} {quoted}")
             else:
-                proc = subprocess.run([*editor_args, str(target)])
+                os.system(f"{editor} {quoted}")
         else:
             if os.name == 'nt':
-                # Use cmd's built-in 'start' with a title arg
-                proc = subprocess.run(["cmd", "/c", "start", "", f"\"{str(target)}\""])
+                os.system(f'start "" {shlex.quote(str(target))}')
             elif sys.platform == 'darwin':
-                proc = subprocess.run(["open", str(target)])
+                os.system(f'open {shlex.quote(str(target))}')
             else:
-                proc = subprocess.run(["xdg-open", str(target)])
-        if proc.returncode == 0:
-            console.print(f"[green]Opened {target}[/green]")
-        else:
-            console.print(Panel(f"Failed to open {target} (exit {proc.returncode})", title="open", border_style="err"))
+                os.system(f'xdg-open {shlex.quote(str(target))}')
+        console.print(f"[green]Opened {target}[/green]")
     except Exception as e:
         console.print(f"[red]Failed to open: {e}[/red]")
 
@@ -2577,7 +2965,7 @@ def patch(
     patch_file: Optional[Path] = typer.Option(None, '--file', exists=True, help="Unified diff file"),
 ):
     if not patch_file:
-        console.print("[yellow]Usage: dspy-agent patch --file <PATCHFILE>[/yellow]")
+        console.print("[yellow]Usage: dspy-coder patch --file <PATCHFILE>[/yellow]")
         raise typer.Exit(2)
     text = patch_file.read_text(errors="ignore")
     ok, msg = apply_unified_patch(text, Path.cwd())
@@ -2595,11 +2983,11 @@ def patch(
 def code_entry():
     """Entry point for 'dspy-code' shortcut: launches interactive agent with defaults."""
     try:
-        _print_banner()
+        _print_banner(console)
         # Use cwd as workspace and ./logs if exists
         ws = Path.cwd()
         logs = ws / 'logs'
-        start(workspace=ws, logs=logs if logs.exists() else None, ollama=True, model="deepseek-coder:1.3b", base_url=None, api_key=None, force_json=False, structured=False, approval=None)  # type: ignore[arg-type]
+        start(workspace=ws, logs=logs if logs.exists() else None, ollama=True, model="qwen3:1.7b", base_url=None, api_key=None, force_json=False, structured=False, approval=None)  # type: ignore[arg-type]
     except SystemExit:
         pass
 
@@ -2619,7 +3007,7 @@ def diff(
         except Exception:
             console.print("[yellow]No input provided for --new or STDIN.[/yellow]")
             raise typer.Exit(2)
-    from .diffutil import unified_diff_from_texts
+    from .code_tools.diffutil import unified_diff_from_texts
     old_text = file.read_text(errors="ignore") if file.exists() else ""
     patch_text = unified_diff_from_texts(old_text, new_text, a_path=str(file), b_path=str(file), n=unified)
     if out:
@@ -2629,12 +3017,12 @@ def diff(
         console.print(patch_text or "(no differences)")
 
 
-@app.command()
-def start(
+@app.command(name="start")
+def start_command(
     workspace: Optional[Path] = typer.Option(None, '--workspace', dir_okay=True, exists=True, help="Initial workspace"),
     logs: Optional[Path] = typer.Option(None, '--logs', dir_okay=True, file_okay=True, exists=False, help="Initial logs path (defaults to <ws>/logs)"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama by default in session"),
-    model: Optional[str] = typer.Option("deepseek-coder:1.3b", '--model', help="Default model for session"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Default model for session"),
     base_url: Optional[str] = typer.Option(None, '--base-url', help="Override base URL"),
     api_key: Optional[str] = typer.Option(None, '--api-key', help="API key (unused for Ollama)"),
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
@@ -2648,11 +3036,19 @@ def start(
     provider_is_ollama = ollama
     last_extract: Optional[str] = None
 
-    # Apply runtime toggle for adapter behavior
+    # Apply runtime toggle for adapter behavior; default to simple JSON to avoid noisy warnings
     if structured:
         os.environ['DSPY_FORCE_JSON_OBJECT'] = 'false'
-    elif force_json:
+    elif force_json or os.environ.get('DSPY_FORCE_JSON_OBJECT') is None:
         os.environ['DSPY_FORCE_JSON_OBJECT'] = 'true'
+    # Tame noisy adapter warnings
+    try:
+        logging.getLogger('dspy.adapters.json_adapter').setLevel(logging.ERROR)
+    except Exception:
+        pass
+    # Set LiteLLM timeout defaults if not set
+    os.environ.setdefault('LITELLM_TIMEOUT', '30')
+    os.environ.setdefault('LITELLM_MAX_RETRIES', '2')
 
     # Resolve approval mode
     settings = get_settings()
@@ -2728,23 +3124,70 @@ def start(
         last_tool = None
         last_args = None
         targets = _extract_targets_from_query(nl)
+        # Online RL over safe tools
+        rl_enabled = True  # enable by default; can later wire to settings
+        rl_tools = ["context", "codectx", "grep", "esearch", "plan", "tree", "ls", "index", "emb-index", "intel", "vretr"]
+        rl_state_path = ws / '.dspy_rl_state.json'
+        bandit = _OnlineBandit(rl_tools, rl_state_path)
+        # Per-tool cooldowns (seconds) to avoid heavy repetition
+        tool_cooldown = {"context": 5, "index": 300, "emb-index": 600, "intel": 10, "vretr": 5, "esearch": 3, "grep": 2}
+        last_run: dict[str, float] = {}
+        step_history: list[dict] = []
         for step in range(1, max_steps + 1):
             state = build_state() + (f" | history: {history_summary[:4000]}" if history_summary else "")
             tool = None
             args = {}
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
-            if lm is not None:
+            # Prefer RL suggestion among safe tools
+            if rl_enabled:
                 try:
-                    orch = Orchestrator(use_cot=True)
-                    pred = orch(query=nl, state=state)
-                    tool = (pred.tool or "").strip()
-                    import json as _json
-                    try:
-                        args = _json.loads(pred.args_json or "{}")
-                    except Exception:
-                        args = {}
+                    tool = bandit.select()
+                    console.print(f"[cyan]RL suggested tool: {tool}[/cyan]")
                 except Exception:
                     tool = None
+            # Enforce cooldowns to bound latency/cost
+            if tool and tool in tool_cooldown:
+                import time as _t
+                now = _t.time()
+                if now - float(last_run.get(tool, 0.0)) < float(tool_cooldown[tool]):
+                    console.print(f"[dim]Skipping '{tool}' due to cooldown.[/dim]")
+                    tool = None
+            # Autogenerate minimal args for RL-suggested tools
+            if tool and not args:
+                if tool == 'grep':
+                    args = {"pattern": nl}
+                elif tool == 'esearch':
+                    args = {"query": nl, "k": 5}
+                elif tool == 'plan':
+                    args = {"task": nl}
+                elif tool == 'tree':
+                    args = {"depth": 2}
+                elif tool == 'ls':
+                    args = {}
+                elif tool == 'intel':
+                    args = {"query": nl, "k": 5}
+                elif tool == 'vretr':
+                    args = {"query": nl, "k": 5}
+                elif tool == 'index':
+                    args = {}
+                elif tool == 'emb-index':
+                    args = {"model": "all-MiniLM-L6-v2", "hf": True}
+            # If RL not enabled or failed, try LLM orchestrator
+            if not tool:
+                lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+                if lm is not None:
+                    try:
+                        orch = Orchestrator(use_cot=True)
+                        pred = orch(query=nl, state=state)
+                        tool = (pred.tool or "").strip()
+                        import json as _json
+                        try:
+                            args = _json.loads(pred.args_json or "{}")
+                        except Exception:
+                            args = {}
+                        console.print(f"[green]LLM selected tool: {tool}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]LLM failed ({e}), using fallback[/yellow]")
+                        tool = None
             if not tool:
                 # fallback heuristic single shot
                 tool = "context" if (logs_path.exists() if isinstance(logs_path, Path) else True) else "codectx"
@@ -2753,7 +3196,7 @@ def start(
             console.print(Panel.fit(f"{tool} {args}", title=f"Step {step}: action", border_style="yellow"))
             # Stop if repeating same choice
             if last_tool == tool and last_args == args:
-                console.print("[dim]No new action; stopping.[/dim]")
+                console.print("[dim]No new action; summarizing results.[/dim]")
                 break
             last_tool, last_args = tool, dict(args)
 
@@ -2766,16 +3209,53 @@ def start(
                         # Do not update history summary, simply continue to next step
                         continue
                 dispatch_tool(tool, args)
+                # Record last run time for cooldowns
+                try:
+                    import time as _t
+                    last_run[tool] = _t.time()
+                except Exception:
+                    pass
             except Exception as e:
-                console.print(Panel(str(e), title=f"agent failed ({tool})", border_style="red"))
+                console.print(Panel(escape(str(e)), title=f"agent failed ({tool})", border_style="red"))
                 break
 
             # Summarize outcome to feed back
             try:
                 outcome = evaluate_tool_choice(tool, args, workspace=ws, logs_path=logs_path, targets=targets)
                 piece = f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
+                # Update RL bandit with a clipped reward in [0,1]
+                try:
+                    r = float(outcome.score)
+                    r = 0.0 if not (r == r) else max(0.0, min(1.0, r / 2.0))
+                    if tool in rl_tools:
+                        bandit.update(tool, r)
+                        console.print(f"[dim]RL updated: {tool} reward={r:.2f}[/dim]")
+                        # Append event for background trainer to learn from
+                        try:
+                            import time as _t2
+                            evt = {"ts": int(_t2.time()), "tool": tool, "reward": float(r)}
+                            # Append to local events file
+                            (ws / '.dspy_rl_events.jsonl').open('a').write(json.dumps(evt) + "\n")
+                            # Also publish to Kafka if available
+                            try:
+                                from confluent_kafka import Producer  # type: ignore
+                                bootstrap = os.getenv('KAFKA_BOOTSTRAP') or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
+                                if _kafka_is_available(bootstrap):
+                                    silent = logging.getLogger('kafka.silent'); silent.addHandler(logging.NullHandler()); silent.setLevel(logging.CRITICAL)
+                                    p = Producer({'bootstrap.servers': bootstrap}, logger=silent)
+                                    p.produce('agent.learning', json.dumps(evt).encode('utf-8'))
+                                    p.flush(0)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    # Keep in history
+                    step_history.append({"tool": tool, "args": args, "score": float(outcome.score), "evidence": str(outcome.evidence)})
+                except Exception:
+                    pass
             except Exception:
                 piece = f"{tool}: done"
+                step_history.append({"tool": tool, "args": args, "score": 0.0, "evidence": ""})
             history_summary = (history_summary + " | " + piece).strip()
             # Simple stop conditions
             if tool in {"esearch", "grep", "extract"} and "hits=0" in piece:
@@ -2785,6 +3265,31 @@ def start(
             # If good score, and we've run at least 2 steps, stop
             if step >= 2 and ("score=" in piece and float(piece.split("score=")[1].split(";")[0]) >= 1.2):
                 break
+
+        # Final summary & next steps
+        try:
+            _print_header("Session Summary")
+            if step_history:
+                avg = sum(h.get("score", 0.0) for h in step_history) / max(1, len(step_history))
+                lines = [f"- step {i+1}: {h['tool']} score={h.get('score',0.0):.2f}" for i,h in enumerate(step_history)]
+                console.print(Panel.fit("\n".join(lines), title=f"actions (avg={avg:.2f})", border_style="cyan"))
+                # Recommend next actions
+                recs: list[str] = []
+                seen_tools = {h['tool'] for h in step_history}
+                if "index" not in seen_tools:
+                    recs.append("index")
+                if "emb-index" not in seen_tools:
+                    recs.append("emb-index")
+                if "intel" not in seen_tools:
+                    recs.append("intel --query '<your question>'")
+                if "esearch" not in seen_tools:
+                    recs.append("esearch --q '<keywords>'")
+                if recs:
+                    console.print(Panel.fit("\n".join(f"- {r}" for r in recs), title="suggested next steps", border_style="yellow"))
+            else:
+                console.print(Panel.fit("No actions executed.", title="actions", border_style="yellow"))
+        except Exception:
+            pass
 
     def dispatch_tool(tool: str, args: dict):
         nonlocal last_extract, logs_path, ws, model, provider_is_ollama, base_url, api_key
@@ -2797,7 +3302,7 @@ def start(
             if not bundle:
                 console.print("[yellow]No logs found.[/yellow]"); return
             _print_header("Log Key Events"); key = extract_key_events(bundle)
-            console.print(Panel.fit(key, title="Extracted Events", border_style="magenta"))
+            console.print(Panel.fit(escape(key), title="Extracted Events", border_style="magenta"))
         elif t == "plan":
             bundle, count = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""
             lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
@@ -2826,13 +3331,13 @@ def start(
                 res = python_extract_symbol(fpath, symbol)
                 if not res: console.print("[yellow]Symbol not found.[/yellow]"); return
                 start, end, seg = res; last_extract = seg
-                console.print(Panel(seg, title=f"{fpath}::{symbol} lines {start}-{end}", border_style="green"))
+                console.print(Panel(escape(seg), title=f"{fpath}::{symbol} lines {start}-{end}", border_style="green"))
             elif regex:
                 hits = file_search(fpath, regex, regex=True)
                 if not hits: console.print("[yellow]No regex match.[/yellow]"); return
                 hit = hits[0]; text = fpath.read_text(errors="ignore");
                 s,e,seg = extract_context(text, hit.line_no, before=args.get("before",3), after=args.get("after",3)); last_extract=seg
-                console.print(Panel(seg, title=f"{fpath} lines {s}-{e}", border_style="green"))
+                console.print(Panel(escape(seg), title=f"{fpath} lines {s}-{e}", border_style="green"))
             else:
                 console.print("[yellow]Provide --symbol or --regex for extract.[/yellow]")
         elif t == "tree":
@@ -2840,16 +3345,36 @@ def start(
             console.print(_render_tree(ws, max_depth=depth, show_hidden=hidden))
         elif t == "ls":
             console.print(Panel("\n".join(p.name+("/" if p.is_dir() else "") for p in sorted(ws.iterdir())[:500]), title=str(ws), border_style="blue"))
+        elif t == "emb-index":
+            # Build embeddings index for semantic search
+            model = args.get("model") or "all-MiniLM-L6-v2"
+            hf = bool(args.get("hf", True))
+            try:
+                if hf:
+                    from sentence_transformers import SentenceTransformer  # type: ignore
+                    embedder = SentenceTransformer(model)
+                else:
+                    embedder = dspy.Embeddings(model=model)
+                from .embedding.indexer import build_index as build_code_index, save_index as save_code_index
+                from .embedding.embeddings_index import build_emb_index as _build_emb_index, save_emb_index as _save_emb_index
+            except Exception as e:
+                console.print(Panel(escape(str(e)), title="emb-index setup failed", border_style="red")); return
+            try:
+                items = _build_emb_index(ws, embedder)
+                out_dir = _save_emb_index(ws, items, persist=False)
+                console.print(Panel.fit(f"Embedded {len(items)} chunks → {out_dir}", title="emb-index", border_style="cyan"))
+            except Exception as e:
+                console.print(Panel(escape(str(e)), title="emb-index failed", border_style="red"))
         elif t == "codectx":
             path = args.get("path"); target = (ws / path).resolve() if path else ws
             snap = build_code_snapshot(target); _print_header("Code Snapshot")
-            console.print(Panel.fit(snap[:8000] + ("\n..." if len(snap)>8000 else ""), title=str(target), border_style="magenta"))
+            console.print(Panel.fit(escape(snap[:8000] + ("\n..." if len(snap)>8000 else "")), title=str(target), border_style="magenta"))
             lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
             if lm:
                 cc = CodeContext(); code_graph = _get_code_summary(ws)
                 out = cc(snapshot=snap, ask="Summarize key parts and modification points.", code_graph=code_graph)
-                console.print(Panel.fit(out.summary, title="Summary", border_style="cyan"))
-                console.print(Panel.fit(out.bullets, title="Bullets", border_style="green"))
+                console.print(Panel.fit(escape(out.summary), title="Summary", border_style="cyan"))
+                console.print(Panel.fit(escape(out.bullets), title="Bullets", border_style="green"))
         elif t == "knowledge":
             # args: file, import, class, function, lang
             g = _get_code_graph(ws)
@@ -2911,17 +3436,27 @@ def start(
                     from sentence_transformers import SentenceTransformer  # type: ignore
                     embedder = SentenceTransformer(model)
                 except Exception as e:
-                    console.print(Panel(str(e), title="HF embeddings missing", border_style="red")); return
+                    console.print(Panel(escape(str(e)), title="HF embeddings missing", border_style="red")); return
             else:
                 try:
                     embedder = dspy.Embeddings(model=model)
                 except Exception as e:
-                    console.print(Panel(str(e), title="DSPy embeddings missing", border_style="red")); return
+                    console.print(Panel(escape(str(e)), title="DSPy embeddings missing", border_style="red")); return
             try:
-                from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
+                from .embedding.embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query, build_emb_index as _build_emb_index, save_emb_index as _save_emb_index
+                # Try load; if missing or yields no hits, build index automatically once
                 items = load_emb_index(ws)
                 qv = _embed_query(embedder, q)
                 hits = _emb_search(qv, items, top_k=k)
+                if not hits:
+                    console.print("[yellow]No vector matches. Building embeddings index...[/yellow]")
+                    try:
+                        new_items = _build_emb_index(ws, embedder)
+                        _save_emb_index(ws, new_items, persist=False)
+                        items = new_items
+                        hits = _emb_search(qv, items, top_k=k)
+                    except Exception as _e2:
+                        console.print(Panel(escape(str(_e2)), title="emb-index build failed", border_style="red"))
                 if not hits:
                     console.print("[yellow]No vector matches.")
                     return
@@ -2936,9 +3471,9 @@ def start(
                     except Exception:
                         seg = "(unreadable)"; s = it.start_line; e = it.end_line
                     title = f"{p} score={score_i:.3f} lines {s}-{e}"
-                    console.print(Panel(seg, title=title, border_style="cyan"))
+                    console.print(Panel(escape(seg), title=title, border_style="cyan"))
             except Exception as e:
-                console.print(Panel(str(e), title="vretr failed", border_style="red"))
+                console.print(Panel(escape(str(e)), title="vretr failed", border_style="red"))
         elif t == "intel":
             # High-level evidence composition: knowledge + vretr (+ optional sg)
             q = args.get('query') or args.get('q') or ''
@@ -2968,21 +3503,30 @@ def start(
             if hf:
                 try:
                     from sentence_transformers import SentenceTransformer  # type: ignore
-                    embedder = SentenceTransformer(model)
-                    def _emb(text): return embedder.encode(text)
+                    embedder_obj = SentenceTransformer(model)
+                    def _emb(text): return embedder_obj.encode(text)
                 except Exception as e:
-                    console.print(Panel(str(e), title="HF embeddings missing", border_style="red")); return
+                    console.print(Panel(escape(str(e)), title="HF embeddings missing", border_style="red")); return
             else:
                 try:
-                    eobj = dspy.Embeddings(model=model)
-                    def _emb(text): return eobj.embed(text)  # type: ignore
+                    embedder_obj = dspy.Embeddings(model=model)
+                    def _emb(text): return embedder_obj.embed(text)  # type: ignore
                 except Exception as e:
-                    console.print(Panel(str(e), title="DSPy embeddings missing", border_style="red")); return
+                    console.print(Panel(escape(str(e)), title="DSPy embeddings missing", border_style="red")); return
             try:
-                from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
+                from .embedding.embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query, build_emb_index as _build_emb_index, save_emb_index as _save_emb_index
                 items = load_emb_index(ws)
                 qv = _emb([q])[0]
                 hits = _emb_search(list(qv), items, top_k=k)
+                if not hits:
+                    console.print("[yellow]No vector matches. Building embeddings index...[/yellow]")
+                    try:
+                        new_items = _build_emb_index(ws, embedder_obj)
+                        _save_emb_index(ws, new_items, persist=False)
+                        items = new_items
+                        hits = _emb_search(list(qv), items, top_k=k)
+                    except Exception as _e2:
+                        console.print(Panel(escape(str(_e2)), title="emb-index build failed", border_style="red"))
             except Exception:
                 hits = []
             # Render evidence
@@ -3001,7 +3545,7 @@ def start(
                     except Exception:
                         seg = "(unreadable)"; s = it.start_line; e = it.end_line
                     title = f"{p} score={score_i:.3f} lines {s}-{e}"
-                    console.print(Panel(seg, title=title, border_style="cyan"))
+                    console.print(Panel(escape(seg), title=title, border_style="cyan"))
             else:
                 console.print("[yellow]No vector matches.[/yellow]")
         elif t == "index":
@@ -3019,7 +3563,7 @@ def start(
                     text = p.read_text(errors="ignore"); lines = text.splitlines(); s=max(1,it.start_line-3); e=min(len(lines), it.end_line+3)
                     seg = "\n".join(lines[s-1:e])
                 except Exception: seg="(unreadable)"; s=it.start_line; e=it.end_line
-                console.print(Panel(seg, title=f"{p} score={score:.3f} lines {s}-{e}", border_style="blue"))
+                console.print(Panel(escape(seg), title=f"{p} score={score:.3f} lines {s}-{e}", border_style="blue"))
         elif t == "open":
             spec = args.get("path");
             if not spec: console.print("[yellow]No path for open[/yellow]"); return
@@ -3027,32 +3571,17 @@ def start(
             target = (ws / file_part).resolve(); editor = os.environ.get("EDITOR"); quoted = shlex.quote(str(target))
             if editor:
                 ed = os.path.basename(editor)
-                editor_args = shlex.split(editor, posix=(os.name != 'nt'))
-                if line is not None and ("code" in ed):
-                    loc = f"{str(target)}:{line}:{col or 1}"
-                    proc = subprocess.run([*editor_args, "-g", loc])
-                elif line is not None and ("subl" in ed or "sublime" in ed):
-                    proc = subprocess.run([*editor_args, f"{str(target)}:{line}:{col or 1}"])
-                elif line is not None and ("vim" in ed or "nvim" in ed):
-                    proc = subprocess.run([*editor_args, f"+{line}", str(target)])
-                elif line is not None and ("emacs" in ed):
-                    plus = f"+{line}:{col}" if col is not None else f"+{line}"
-                    proc = subprocess.run([*editor_args, plus, str(target)])
-                elif line is not None and ("idea" in ed):
-                    proc = subprocess.run([*editor_args, "--line", str(line), str(target)])
-                else:
-                    proc = subprocess.run([*editor_args, str(target)])
+                if line is not None and ("code" in ed): os.system(f"{editor} -g {quoted}:{line}:{col or 1}")
+                elif line is not None and ("subl" in ed or "sublime" in ed): os.system(f"{editor} {quoted}:{line}:{col or 1}")
+                elif line is not None and ("vim" in ed or "nvim" in ed): os.system(f"{editor} +{line} {quoted}")
+                elif line is not None and ("emacs" in ed): os.system(f"{editor} +{line}{(':'+str(col)) if col else ''} {quoted}")
+                elif line is not None and ("idea" in ed): os.system(f"{editor} --line {line} {quoted}")
+                else: os.system(f"{editor} {quoted}")
             else:
-                if os.name=='nt':
-                    proc = subprocess.run(["cmd", "/c", "start", "", f"\"{str(target)}\""])
-                elif sys.platform=='darwin':
-                    proc = subprocess.run(["open", str(target)])
-                else:
-                    proc = subprocess.run(["xdg-open", str(target)])
-            if proc.returncode == 0:
-                console.print(f"[green]Opened {target}[/green]")
-            else:
-                console.print(Panel(f"Failed to open {target} (exit {proc.returncode})", title="open", border_style="err"))
+                if os.name=='nt': os.system(f'start "" {quoted}')
+                elif sys.platform=='darwin': os.system(f'open {quoted}')
+                else: os.system(f'xdg-open {quoted}')
+            console.print(f"[green]Opened {target}[/green]")
         elif t == "watch":
             _watch_logs(logs_path, tail_lines=int(args.get("tail",20)), interval=float(args.get("interval",2)))
         elif t == "sg":
@@ -3074,7 +3603,7 @@ def start(
             if not last_extract: console.print("[yellow]No extract buffer. Run extract first.[/yellow]"); return
             file = args.get("file"); p=(ws / file).resolve() if file else None
             if not p: console.print("[yellow]diff needs a file[/yellow]"); return
-            from .diffutil import unified_diff_file_vs_text
+            from .code_tools.diffutil import unified_diff_file_vs_text
             patch_text = unified_diff_file_vs_text(p, last_extract, n=3); console.print(patch_text or "(no differences)")
         elif t == "git_status":
             import subprocess; proc = subprocess.run(["git","-C",str(ws),"status","-s"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -3267,7 +3796,7 @@ def start(
                 if ctx_n and text:
                     start, end, seg = extract_context(text, h.line_no, before=ctx_n, after=ctx_n)
                     title = f"{h.path} :{h.line_no} (lines {start}-{end})"
-                    console.print(Panel(seg, title=title, border_style="blue"))
+                    console.print(Panel(escape(seg), title=title, border_style="blue"))
                 else:
                     console.print(f"{h.path}:{h.line_no}: {h.line}")
         elif cmd == "extract":
@@ -3304,7 +3833,7 @@ def start(
                         console.print("[yellow]Symbol not found.[/yellow]")
                         continue
                     start, end, seg = res
-                    console.print(Panel(seg, title=f"{file_arg}::{symbol} (lines {start}-{end})", border_style="green"))
+                    console.print(Panel(escape(seg), title=f"{file_arg}::{symbol} (lines {start}-{end})", border_style="green"))
                     last_extract = seg
                 else:
                     console.print("[yellow]--symbol currently supports Python files only.[/yellow]")
@@ -3316,7 +3845,7 @@ def start(
                 hit = hits[nth - 1] if len(hits) >= nth else hits[-1]
                 text = file_arg.read_text(errors="ignore")
                 start, end, seg = extract_context(text, hit.line_no, before=before, after=after)
-                console.print(Panel(seg, title=f"{file_arg} lines {start}-{end}", border_style="green"))
+                console.print(Panel(escape(seg), title=f"{file_arg} lines {start}-{end}", border_style="green"))
                 last_extract = seg
             else:
                 console.print("[yellow]Provide --symbol or --regex for extract.[/yellow]")
@@ -3352,7 +3881,7 @@ def start(
                     start = it.start_line
                     end = it.end_line
                 title = f"{p}  score={score:.3f}  lines {start}-{end}"
-                console.print(Panel(seg, title=title, border_style="blue"))
+                console.print(Panel(escape(seg), title=title, border_style="blue"))
         elif cmd == "open":
             if not args:
                 console.print("[yellow]Usage: open <PATH[:LINE[:COL]]>[/yellow]")
@@ -3370,32 +3899,29 @@ def start(
                     quoted = shlex.quote(str(target))
                     if line is not None and ("code" in ed):
                         loc = f"{quoted}:{line}:{col or 1}"
-                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), "-g", loc])
+                        os.system(f"{editor} -g {loc}")
                     elif line is not None and ("subl" in ed or "sublime" in ed):
-                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"{str(target)}:{line}:{col or 1}"])
+                        os.system(f"{editor} {quoted}:{line}:{col or 1}")
                     elif line is not None and ("vim" in ed or "nvim" in ed):
-                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"+{line}", str(target)])
+                        os.system(f"{editor} +{line} {quoted}")
                     elif line is not None and ("emacs" in ed):
                         if col is not None:
-                            proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"+{line}:{col}", str(target)])
+                            os.system(f"{editor} +{line}:{col} {quoted}")
                         else:
-                            proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), f"+{line}", str(target)])
+                            os.system(f"{editor} +{line} {quoted}")
                     elif line is not None and ("idea" in ed):
-                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), "--line", str(line), str(target)])
+                        os.system(f"{editor} --line {line} {quoted}")
                     else:
-                        proc = subprocess.run([*shlex.split(editor, posix=(os.name != 'nt')), str(target)])
+                        os.system(f"{editor} {quoted}")
                 else:
                     # macOS 'open', Linux 'xdg-open', Windows 'start'
                     if os.name == 'nt':
-                        proc = subprocess.run(["cmd", "/c", "start", "", f"\"{str(target)}\""]) 
+                        os.system(f'start "" {shlex.quote(str(target))}')
                     elif sys.platform == 'darwin':
-                        proc = subprocess.run(["open", str(target)])
+                        os.system(f'open {shlex.quote(str(target))}')
                     else:
-                        proc = subprocess.run(["xdg-open", str(target)])
-                if proc.returncode == 0:
-                    console.print(f"[green]Opened {target}[/green]")
-                else:
-                    console.print(Panel(f"Failed to open {target} (exit {proc.returncode})", title="open", border_style="err"))
+                        os.system(f'xdg-open {shlex.quote(str(target))}')
+                console.print(f"[green]Opened {target}[/green]")
             except Exception as e:
                 console.print(f"[red]Failed to open: {e}[/red]")
         elif cmd == "diff":
@@ -3574,7 +4100,7 @@ def grep(
         if context and text:
             start, end, seg = extract_context(text, h.line_no, before=context, after=context)
             title = f"{h.path} :{h.line_no} (lines {start}-{end})"
-            console.print(Panel(seg, title=title, border_style="blue"))
+            console.print(Panel(escape(seg), title=title, border_style="blue"))
         else:
             console.print(f"{h.path}:{h.line_no}: {h.line}")
 
@@ -3597,7 +4123,7 @@ def extract(
                 console.print("[yellow]Symbol not found or file not parseable.[/yellow]")
                 raise typer.Exit(1)
             start, end, seg = res
-            console.print(Panel(seg, title=f"{file}::{symbol} (lines {start}-{end})", border_style="green"))
+            console.print(Panel(escape(seg), title=f"{file}::{symbol} (lines {start}-{end})", border_style="green"))
             if out:
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(seg)
@@ -3615,7 +4141,7 @@ def extract(
         hit = hits[nth - 1] if len(hits) >= nth else hits[-1]
         text = file.read_text(errors="ignore")
         start, end, seg = extract_context(text, hit.line_no, before=before, after=after)
-        console.print(Panel(seg, title=f"{file} lines {start}-{end}", border_style="green"))
+        console.print(Panel(escape(seg), title=f"{file} lines {start}-{end}", border_style="green"))
         if out:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(seg)

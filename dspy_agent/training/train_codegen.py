@@ -6,8 +6,8 @@ import json
 
 import dspy
 
-from .skills.code_edit import CodeEdit
-from .code_eval import EvalConfig, evaluate_patch
+from ..skills.code_edit import CodeEdit
+from ..code_tools.code_eval import EvalConfig, evaluate_patch
 
 
 def _read_jsonl(path: Path) -> List[dict]:

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .indexer import Chunk, iter_chunks
-from .db.factory import get_storage
+from ..db.factory import get_storage
 import hashlib
 
 
