@@ -247,9 +247,9 @@ class Worker(threading.Thread):
         super().__init__(daemon=True)
         self.container=container; self.root=root; self.bus=bus; self.in_q=bus.subscribe(ctx_topic); self.results_topic=results_topic; self._stop=threading.Event()
         from ..llm import configure_lm
-        from .skills.context_builder import ContextBuilder
-        from .skills.task_agent import TaskAgent
-        from .skills.code_edit import CodeEdit
+        from ..skills.context_builder import ContextBuilder
+        from ..skills.task_agent import TaskAgent
+        from ..skills.code_edit import CodeEdit
         self.lm = configure_lm(provider="ollama", model_name=None, base_url=None, api_key=None)
         self.builder = ContextBuilder(); self.agent = TaskAgent(); self.editor = CodeEdit()
         self.auto_patch = os.getenv("AUTO_PATCH", "false").lower() in {"1","true","yes","on"}
@@ -358,9 +358,9 @@ class KafkaParams:
 class WorkerLoop:
     def __init__(self, params: KafkaParams):
         self.p = params; self.running = False
-        from .skills.context_builder import ContextBuilder
-        from .skills.task_agent import TaskAgent
-        from .skills.code_edit import CodeEdit
+        from ..skills.context_builder import ContextBuilder
+        from ..skills.task_agent import TaskAgent
+        from ..skills.code_edit import CodeEdit
         from ..llm import configure_lm
         self.builder = ContextBuilder(); self.agent = TaskAgent(); self.lm = configure_lm(provider="ollama", model_name=None, base_url=None, api_key=None); self.editor = CodeEdit()
         self.auto_patch = os.getenv("AUTO_PATCH", "false").lower() in {"1","true","yes","on"}; self.auto_commit = os.getenv("AUTO_COMMIT", "false").lower() in {"1","true","yes","on"}

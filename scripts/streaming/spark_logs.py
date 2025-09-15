@@ -30,6 +30,7 @@ def main():
         .option("kafka.bootstrap.servers", args.bootstrap)
         .option("subscribePattern", args.pattern)
         .option("startingOffsets", "latest")
+        .option("failOnDataLoss", "false")
         .load()
     )
 
@@ -58,4 +59,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
