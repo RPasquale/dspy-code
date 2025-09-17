@@ -1,197 +1,211 @@
 services:
-  dspy-agent:
-    image: dspy-lightweight:latest
-    build:
-      context: ../../
-      dockerfile: docker/lightweight/Dockerfile
-    environment:
-      - LOCAL_MODE=false
-      - USE_OLLAMA=true
-      - AUTO_PATCH=true
-      - AUTO_PATCH_APPROVAL=manual
-      - AUTO_PATCH_MAX_FILES=0
-      - AUTO_PATCH_MAX_LINES=0
-      - WORKSPACE=/workspace
-      - DB_BACKEND=auto
-      - REDDB_URL
-      - REDDB_NAMESPACE=dspy
-      - REDDB_TOKEN
-      - MODEL_NAME=qwen3:1.7b
-      - OPENAI_API_KEY=
-      - OPENAI_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=qwen3:1.7b
-      - OLLAMA_API_KEY=
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_CLIENT_ID=dspy-agent
-      - KAFKA_TOPIC_PREFIX
-      - AUTO_COMMIT=false
-      - AUTO_TEST_CMD=python -m compileall -q .
-      - AUTO_TEST_STRICT=false
-      - AUTO_TEST_TIMEOUT=600
-      - AUTO_PATCH_REQUIRE_KEYWORDS=true
-      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
-    working_dir: /app
-    entrypoint: ["/app/entrypoints/run_dspy_agent.sh"]
-    volumes:
-      - ../../:/workspace:rw
-    ports:
-      - "127.0.0.1:8765:8765"  # reserved for future HTTP status
-    restart: unless-stopped
-    depends_on:
-      ollama:
-        condition: service_started
-      kafka:
-        condition: service_healthy
+    dspy-agent:
+      image: dspy-lightweight:latest
+      build:
+        context: .
+        dockerfile: Dockerfile
+      environment:
+        - LOCAL_MODE=false
+        - USE_OLLAMA=true
+        - DB_BACKEND=auto
+        - REDDB_URL
+        - REDDB_NAMESPACE=dspy
+        - REDDB_TOKEN
+        - MODEL_NAME=qwen3:1.7b
+        - OPENAI_API_KEY=
+        - OPENAI_BASE_URL=http://ollama:11434
+        - OLLAMA_MODEL=qwen3:1.7b
+        - OLLAMA_API_KEY=
+        - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+        - KAFKA_CLIENT_ID=dspy-agent
+        - KAFKA_TOPIC_PREFIX
+      entrypoint: ["/entrypoints/run_dspy_agent.sh"]
+      volumes:
+        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - /Users/robbiepasquale/dspy_stuff/logs:/workspace/logs:ro
+        - ./entrypoints:/entrypoints:ro
+      ports:
+        - "127.0.0.1:8765:8765"
+      restart: unless-stopped
+      depends_on:
+        kafka:
+          condition: service_healthy
 
-  ollama:
-    image: ollama/ollama:latest
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        ollama serve &
-        sleep 3;
-        ollama pull qwen3:1.7b || true;
-        wait
-    ports:
-      - "127.0.0.1:11435:11434"  # host->container; use 11435 to avoid conflicts
-    volumes:
-      - ollama:/root/.ollama
+    ollama:
+      image: ollama/ollama:latest
+      entrypoint: ["/bin/sh", "/entrypoints/run_ollama.sh"]
+      ports:
+        - "127.0.0.1:11435:11434"
+      volumes:
+        - ollama:/root/.ollama
+        - ./entrypoints:/entrypoints:ro
+      healthcheck:
+        test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+        interval: 10s
+        timeout: 3s
+        retries: 20
+        start_period: 5s
 
-  zookeeper:
-    image: bitnami/zookeeper:3.9
-    environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
-    ports:
-      - "127.0.0.1:2181:2181"
+    zookeeper:
+      image: bitnami/zookeeper:3.9
+      environment:
+        - ALLOW_ANONYMOUS_LOGIN=yes
+      ports:
+        - "127.0.0.1:2181:2181"
+      healthcheck:
+        test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok || exit 1"]
+        interval: 10s
+        timeout: 3s
+        retries: 20
+        start_period: 5s
 
-  kafka:
-    image: bitnami/kafka:3.6
-    depends_on:
-      - zookeeper
-    environment:
-      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
-      - ALLOW_PLAINTEXT_LISTENER=yes
-      - KAFKA_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
-    ports:
-      - "127.0.0.1:9092:9092"
-      - "127.0.0.1:29092:29092"
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+    kafka:
+      image: bitnami/kafka:3.6
+      depends_on:
+        - zookeeper
+      environment:
+        - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+        - ALLOW_PLAINTEXT_LISTENER=yes
+        - KAFKA_LISTENERS=PLAINTEXT://:9092
+        - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+        - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      ports:
+        - "127.0.0.1:9092:9092"
+      healthcheck:
+        test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+        interval: 10s
+        timeout: 3s
+        retries: 20
+        start_period: 10s
 
-  dspy-worker:
-    image: dspy-lightweight:latest
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/app/entrypoints/run_worker.sh", "app"]
-    working_dir: /app
-    volumes:
-      - ../../:/workspace:rw
-    environment:
-      - AUTO_PATCH=true
-      - AUTO_PATCH_APPROVAL=manual
-      - AUTO_PATCH_MAX_FILES=0
-      - AUTO_PATCH_MAX_LINES=0
-      - WORKSPACE=/workspace
-      - AUTO_COMMIT=false
-      - AUTO_TEST_CMD=python -m compileall -q .
-      - AUTO_TEST_STRICT=false
-      - AUTO_TEST_TIMEOUT=600
-      - AUTO_PATCH_REQUIRE_KEYWORDS=true
-      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
+    spark:
+      image: bitnami/spark:3.5
+      depends_on:
+        kafka:
+          condition: service_healthy
+      user: "0:0"
+      environment:
+        - HOME=/opt/bitnami/spark
+        - USER=spark
+        - SPARK_USER=spark
+        - HADOOP_USER_NAME=spark
+        - SPARK_LOCAL_DIRS=/tmp
+        - SPARK_CONF_DIR=/opt/bitnami/spark/conf
+      volumes:
+        - /Users/robbiepasquale/dspy_stuff:/workspace
+        - ./scripts:/app/scripts:ro
+        - ./entrypoints:/entrypoints:ro
+      entrypoint: ["/entrypoints/run_spark.sh"]
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'spark_logs.py' >/dev/null 2>&1 || exit 1"]
+        interval: 30s
+        timeout: 5s
+        retries: 10
+        start_period: 20s
 
-  spark:
-    image: bitnami/spark:3.5
-    user: "0:0"
-    depends_on:
-      kafka:
-        condition: service_healthy
-    environment:
-      - HOME=/tmp
-      - USER=spark
-      - SPARK_USER=spark
-      - HADOOP_USER_NAME=spark
-      - JAVA_TOOL_OPTIONS=-Duser.name=spark
-      - HADOOP_OPTS=-Duser.name=spark
-    volumes:
-      - ../../:/workspace
-      - ../../scripts:/app/scripts
-    entrypoint:
-      - /bin/sh
-      - -c
-      - >-
-        spark-submit \
-          --conf spark.hadoop.hadoop.security.authentication=simple \
-          --conf spark.hadoop.fs.defaultFS=file:/// \
-          --conf spark.hadoop.fs.file.impl=org.apache.hadoop.fs.LocalFileSystem \
-          --conf spark.driver.extraJavaOptions=-Duser.name=spark \
-          --conf spark.executor.extraJavaOptions=-Duser.name=spark \
-          --conf spark.jars.ivy=/tmp/.ivy2 \
-          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-          /app/scripts/streaming/spark_logs.py \
-          --bootstrap kafka:9092 \
-          --pattern 'logs.raw.*' \
-          --checkpoint /workspace/.dspy_checkpoints/spark_logs
+    dspy-worker:
+      image: dspy-lightweight:latest
+      depends_on:
+        kafka:
+          condition: service_healthy
+      entrypoint: ["/entrypoints/run_worker.sh", "app"]
+      volumes:
+        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker --topic app' >/dev/null 2>&1 || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
 
-  dspy-worker-backend:
-    image: dspy-lightweight:latest
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/app/entrypoints/run_worker.sh", "backend"]
-    working_dir: /app
-    volumes:
-      - ../../:/workspace:rw
-    environment:
-      - AUTO_PATCH=true
-      - AUTO_PATCH_APPROVAL=manual
-      - AUTO_PATCH_MAX_FILES=0
-      - AUTO_PATCH_MAX_LINES=0
-      - WORKSPACE=/workspace
-      - AUTO_COMMIT=false
-      - AUTO_TEST_CMD=python -m compileall -q .
-      - AUTO_TEST_STRICT=false
-      - AUTO_TEST_TIMEOUT=600
-      - AUTO_PATCH_REQUIRE_KEYWORDS=true
-      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
+    dspy-worker-backend:
+      image: dspy-lightweight:latest
+      depends_on:
+        kafka:
+          condition: service_healthy
+      entrypoint: ["/entrypoints/run_worker.sh", "backend"]
+      volumes:
+        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker --topic backend' >/dev/null 2>&1 || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
 
-  dspy-worker-frontend:
-    image: dspy-lightweight:latest
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/app/entrypoints/run_worker.sh", "frontend"]
-    working_dir: /app
-    volumes:
-      - ../../:/workspace:rw
-    environment:
-      - AUTO_PATCH=true
-      - AUTO_PATCH_APPROVAL=manual
-      - AUTO_PATCH_MAX_FILES=0
-      - AUTO_PATCH_MAX_LINES=0
-      - WORKSPACE=/workspace
-      - AUTO_COMMIT=false
-      - AUTO_TEST_CMD=python -m compileall -q .
-      - AUTO_TEST_STRICT=false
-      - AUTO_TEST_TIMEOUT=600
-      - AUTO_PATCH_REQUIRE_KEYWORDS=true
-      - AUTO_PATCH_KEYWORDS=error,exception,fail,timeout
+    dspy-worker-frontend:
+      image: dspy-lightweight:latest
+      depends_on:
+        kafka:
+          condition: service_healthy
+      entrypoint: ["/entrypoints/run_worker.sh", "frontend"]
+      volumes:
+        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker --topic frontend' >/dev/null 2>&1 || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
 
-  dspy-router:
-    image: dspy-lightweight:latest
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/app/entrypoints/run_router.sh"]
-    working_dir: /app
+    dspy-code-watch:
+      image: dspy-lightweight:latest
+      depends_on:
+        kafka:
+          condition: service_healthy
+      entrypoint: ["/bin/bash", "-lc"]
+      command: >-
+        python - <<'PY'
+        from dspy_agent.code_tools.code_watch import CodeWatcher
+        from pathlib import Path
+        CodeWatcher(Path('/workspace')).run()
+        PY
+      volumes:
+        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+
+    dspy-code-indexer:
+      image: dspy-lightweight:latest
+      depends_on:
+        kafka:
+          condition: service_healthy
+      entrypoint: ["/bin/bash", "-lc"]
+      command: >-
+        python - <<'PY'
+        from dspy_agent.code_tools.code_indexer_worker import CodeIndexerWorker
+        CodeIndexerWorker('kafka:9092').run()
+        PY
+      volumes:
+        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+
+    dspy-router:
+      image: dspy-lightweight:latest
+      depends_on:
+        kafka:
+          condition: service_healthy
+      entrypoint: ["/entrypoints/run_router.sh"]
+      volumes:
+        - ./entrypoints:/entrypoints:ro
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'router_worker' >/dev/null 2>&1 || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
 
 volumes:
   ollama: {}

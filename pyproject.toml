@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Simple local coding agent using DSPy that reads logs and proposes plans/commands."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [
     { name = "Your Name" }
 ]
@@ -44,4 +44,7 @@ dev-dependencies = []
 package = true
 
 [tool.setuptools]
-packages = ["dspy_agent", "dspy_agent.skills", "dspy_agent.db", "dspy_agent.rl", "dspy_agent.streaming", "dspy_agent.embedding", "dspy_agent.code_tools", "dspy_agent.agents", "dspy_agent.training"]
+packages = []
+
+[tool.setuptools.packages.find]
+include = ["dspy_agent", "dspy_agent.*"]

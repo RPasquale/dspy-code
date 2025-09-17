@@ -8,6 +8,6 @@ until (echo > /dev/tcp/kafka/9092) >/dev/null 2>&1; do
 done
 
 python - <<'PY'
-from dspy_agent.router_worker import RouterWorker
+from dspy_agent.agents.router_worker import RouterWorker
 RouterWorker('kafka:9092').run()
 PY
