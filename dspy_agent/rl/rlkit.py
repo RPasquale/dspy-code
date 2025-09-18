@@ -594,11 +594,16 @@ class ToolchainExecutor:
                 info.update({"error": f"patch deps unavailable: {e}"}); metrics.update({"pass_rate": 0.0, "blast_radius": 0.0}); return _finalize('error')
             # Locate files -> propose patch
             hints = ""
+            hint_list: List[str] = []
             try:
                 loc = FileLocator(); loc_out = loc(task=task, context=context, code_graph=""); hints = getattr(loc_out, 'file_candidates', '') or ''
                 info.update({"locator": getattr(loc_out, 'notes', '') or ''})
             except Exception:
                 pass
+            if isinstance(hints, str):
+                hint_list = [h.strip() for h in hints.split(',') if h.strip()]
+            elif isinstance(hints, (list, tuple)):
+                hint_list = [str(h).strip() for h in hints if str(h).strip()]
             ce = CodeEdit(use_cot=True)
             try:
                 pred = ce(task=task, context=context, code_graph="", file_hints=hints)
@@ -663,6 +668,8 @@ class ToolchainExecutor:
             # Summarize patch size (blast radius)
             summary = summarize_patch(patch_text)
             metrics.update({"pass_rate": float(pr), "blast_radius": float(summary.get('added_lines', 0) + summary.get('removed_lines', 0))})
+            metrics.setdefault("retrieval_precision", float(pr))
+            metrics.setdefault("retrieval_coverage", float(len(hint_list)))
             # Revert to keep training environment consistent
             if revert_always:
                 try:
@@ -756,6 +763,9 @@ class RLConfig:
     ucb_c: float = 2.0
     n_envs: int = 2
     puffer: bool = False
+    temperature: float = 0.85
+    target_entropy: float = 0.3
+    clip_higher: float = 1.1
     verifiers_module: Optional[str] = None
     actions: Optional[List[str]] = None
     weights: Dict[str, float] = field(default_factory=dict)

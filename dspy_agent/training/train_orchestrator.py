@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +9,7 @@ import dspy
 
 from ..skills.orchestrator import Orchestrator
 from ..agents.orchestrator_runtime import evaluate_tool_choice
+from ..db import get_enhanced_data_manager, TrainingMetrics, Environment, create_log_entry
 from datetime import datetime
 
 
@@ -78,9 +80,68 @@ def _score_of(res) -> float:
     return 0.0
 
 
-def make_logging_metric_orchestrator(progress_path: Optional[str]):
+def make_logging_metric_orchestrator(progress_path: Optional[str], session_id: Optional[str] = None):
+    data_manager = get_enhanced_data_manager()
+    
     def metric(gold: dspy.Example, pred: dspy.Prediction, trace=None, pred_name=None, pred_trace=None):
         res = gepa_metric_for_orchestrator(gold, pred, trace=trace, pred_name=pred_name, pred_trace=pred_trace)
+        score = _score_of(res)
+        
+        # Store in RedDB
+        try:
+            training_metrics = TrainingMetrics(
+                session_id=session_id or f"orchestrator_{int(time.time())}",
+                timestamp=time.time(),
+                epoch=getattr(pred, 'epoch', 1),
+                training_accuracy=score,
+                validation_accuracy=score,  # For orchestrator, training and validation are similar
+                loss=1.0 - score,  # Convert score to loss
+                learning_rate=0.001,  # Default learning rate
+                batch_size=1,
+                model_type="gepa",
+                environment=Environment.DEVELOPMENT,
+                hyperparameters={
+                    "module": "orchestrator",
+                    "split": getattr(gold, "split", "train"),
+                    "auto_mode": "light"
+                },
+                convergence_metrics={
+                    "feedback": res.get("feedback", "") if isinstance(res, dict) else "",
+                    "tool": getattr(pred, "tool", ""),
+                    "args_json": getattr(pred, "args_json", "{}"),
+                    "execution_time": time.time()
+                }
+            )
+            data_manager.store_training_metrics(training_metrics)
+            
+            # Log the training step
+            log_entry = create_log_entry(
+                level="INFO",
+                source="training.orchestrator",
+                message=f"Training step completed with score: {score:.3f}",
+                context={
+                    "session_id": training_metrics.session_id,
+                    "score": score,
+                    "split": getattr(gold, "split", "train"),
+                    "tool": getattr(pred, "tool", ""),
+                    "feedback": res.get("feedback", "") if isinstance(res, dict) else ""
+                },
+                environment=Environment.DEVELOPMENT
+            )
+            data_manager.log(log_entry)
+            
+        except Exception as e:
+            # Fallback to file logging if RedDB fails
+            error_log = create_log_entry(
+                level="ERROR",
+                source="training.orchestrator",
+                message=f"Failed to store training metrics in RedDB: {str(e)}",
+                context={"error": str(e)},
+                environment=Environment.DEVELOPMENT
+            )
+            data_manager.log(error_log)
+        
+        # Also maintain file logging for backward compatibility
         if progress_path:
             try:
                 p = Path(progress_path)
@@ -89,43 +150,144 @@ def make_logging_metric_orchestrator(progress_path: Optional[str]):
                     "ts": datetime.utcnow().isoformat(),
                     "module": "orchestrator",
                     "split": getattr(gold, "split", "train"),
-                    "score": _score_of(res),
+                    "score": score,
                 }
                 with p.open("a") as f:
                     f.write(json.dumps(rec) + "\n")
             except Exception:
                 pass
-        return _score_of(res)
+        
+        return score
 
     return metric
 
 
 def run_gepa_orchestrator(train_jsonl: Path, *, auto: Optional[str] = "light", reflection_lm: Optional[dspy.LM] = None, log_dir: Optional[str] = None, track_stats: bool = True, progress_path: Optional[str] = None) -> dspy.Module:
+    # Generate unique session ID
+    session_id = f"orchestrator_gepa_{int(time.time())}"
+    data_manager = get_enhanced_data_manager()
+    
+    # Log training session start
+    start_log = create_log_entry(
+        level="INFO",
+        source="training.orchestrator",
+        message=f"Starting GEPA orchestrator training session: {session_id}",
+        context={
+            "session_id": session_id,
+            "train_jsonl": str(train_jsonl),
+            "auto": auto,
+            "track_stats": track_stats,
+            "dataset_size": 0  # Will update after loading
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(start_log)
+    
     trainset = load_orchestrator_trainset(train_jsonl)
     for ex in trainset:
         setattr(ex, "split", "train")
+    
+    # Update log with dataset size
+    dataset_log = create_log_entry(
+        level="INFO",
+        source="training.orchestrator",
+        message=f"Loaded training dataset with {len(trainset)} examples",
+        context={
+            "session_id": session_id,
+            "dataset_size": len(trainset)
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(dataset_log)
+    
     if not auto:
         auto = "light"
-    metric = make_logging_metric_orchestrator(progress_path)
+    
+    metric = make_logging_metric_orchestrator(progress_path, session_id)
     gepa = dspy.GEPA(metric=metric, auto=auto, reflection_lm=reflection_lm, log_dir=str(log_dir) if log_dir else None, track_stats=track_stats)
     student = Orchestrator(use_cot=True)
+    
+    # Time the compilation
+    compile_start = time.time()
     optimized = gepa.compile(student, trainset=trainset, valset=trainset)
+    compile_time = time.time() - compile_start
+    
+    # Log training completion
+    completion_log = create_log_entry(
+        level="INFO",
+        source="training.orchestrator",
+        message=f"Completed GEPA orchestrator training session: {session_id}",
+        context={
+            "session_id": session_id,
+            "compile_time": compile_time,
+            "dataset_size": len(trainset),
+            "auto_mode": auto
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(completion_log)
+    
     return optimized
 
 
 def run_gepa_orchestrator_with_val(train_jsonl: Path, val_jsonl: Path, *, auto: Optional[str] = "light", reflection_lm: Optional[dspy.LM] = None, log_dir: Optional[str] = None, track_stats: bool = True, progress_path: Optional[str] = None) -> dspy.Module:
+    # Generate unique session ID
+    session_id = f"orchestrator_gepa_val_{int(time.time())}"
+    data_manager = get_enhanced_data_manager()
+    
     trainset = load_orchestrator_trainset(train_jsonl)
     valset = load_orchestrator_trainset(val_jsonl)
     for ex in trainset:
         setattr(ex, "split", "train")
     for ex in valset:
         setattr(ex, "split", "val")
+    
+    # Log training session start with validation
+    start_log = create_log_entry(
+        level="INFO",
+        source="training.orchestrator",
+        message=f"Starting GEPA orchestrator training with validation: {session_id}",
+        context={
+            "session_id": session_id,
+            "train_jsonl": str(train_jsonl),
+            "val_jsonl": str(val_jsonl),
+            "train_size": len(trainset),
+            "val_size": len(valset),
+            "auto": auto,
+            "track_stats": track_stats
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(start_log)
+    
     if not auto:
         auto = "light"
-    metric = make_logging_metric_orchestrator(progress_path)
+    
+    metric = make_logging_metric_orchestrator(progress_path, session_id)
     gepa = dspy.GEPA(metric=metric, auto=auto, reflection_lm=reflection_lm, log_dir=str(log_dir) if log_dir else None, track_stats=track_stats)
     student = Orchestrator(use_cot=True)
+    
+    # Time the compilation
+    compile_start = time.time()
     optimized = gepa.compile(student, trainset=trainset, valset=valset)
+    compile_time = time.time() - compile_start
+    
+    # Log training completion
+    completion_log = create_log_entry(
+        level="INFO",
+        source="training.orchestrator",
+        message=f"Completed GEPA orchestrator training with validation: {session_id}",
+        context={
+            "session_id": session_id,
+            "compile_time": compile_time,
+            "train_size": len(trainset),
+            "val_size": len(valset),
+            "auto_mode": auto
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(completion_log)
+    
     return optimized
 
 

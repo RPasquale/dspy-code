@@ -8,6 +8,7 @@ services:
         - LOCAL_MODE=false
         - USE_OLLAMA=true
         - DB_BACKEND=auto
+        - DSPY_AUTO_APPLY_PATCHES=0
         - REDDB_URL
         - REDDB_NAMESPACE=dspy
         - REDDB_TOKEN
@@ -23,10 +24,19 @@ services:
       volumes:
         - /Users/robbiepasquale/dspy_stuff:/workspace:rw
         - /Users/robbiepasquale/dspy_stuff/logs:/workspace/logs:ro
+        - /Users/robbiepasquale:/host:rw
         - ./entrypoints:/entrypoints:ro
       ports:
         - "127.0.0.1:8765:8765"
       restart: unless-stopped
+      deploy:
+        resources:
+          limits:
+            memory: 4G
+            cpus: '2.0'
+          reservations:
+            memory: 2G
+            cpus: '1.0'
       depends_on:
         kafka:
           condition: service_healthy
@@ -39,12 +49,24 @@ services:
       volumes:
         - ollama:/root/.ollama
         - ./entrypoints:/entrypoints:ro
+      environment:
+        - OLLAMA_MAX_LOADED_MODELS=1
+        - OLLAMA_NUM_PARALLEL=1
+        - OLLAMA_MAX_QUEUE=512
+      deploy:
+        resources:
+          limits:
+            memory: 6G
+            cpus: '4.0'
+          reservations:
+            memory: 3G
+            cpus: '2.0'
       healthcheck:
         test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
         interval: 10s
-        timeout: 3s
+        timeout: 5s
         retries: 20
-        start_period: 5s
+        start_period: 10s
 
     zookeeper:
       image: bitnami/zookeeper:3.9

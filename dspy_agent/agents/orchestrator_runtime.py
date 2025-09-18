@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 from ..streaming.log_reader import load_logs, extract_key_events
 from ..code_tools.code_search import search_text, search_file as file_search, extract_context, python_extract_symbol
@@ -11,7 +11,10 @@ from ..embedding.indexer import build_index, save_index, load_index, semantic_se
 from ..code_tools.code_snapshot import build_code_snapshot
 
 
-SAFE_TOOLS = {"context", "plan", "grep", "extract", "codectx", "index", "esearch", "knowledge", "vretr", "intel"}
+SAFE_TOOLS = {
+    "context", "plan", "grep", "extract", "codectx", "index", "esearch",
+    "knowledge", "vretr", "intel", "edit", "patch", "run_tests", "lint", "build"
+}
 
 
 @dataclass
@@ -39,6 +42,8 @@ def evaluate_tool_choice(
     workspace: Path,
     logs_path: Optional[Path] = None,
     targets: Optional[List[str]] = None,
+    result_metrics: Optional[Mapping[str, Any]] = None,
+    result_info: Optional[Mapping[str, Any]] = None,
 ) -> EvalOutcome:
     """Execute a safe, non-destructive evaluation for a tool choice.
 
@@ -53,6 +58,8 @@ def evaluate_tool_choice(
     """
     t = (tool or "").lower().strip()
     argd = _json_arg(args)
+    metrics = dict(result_metrics or {})
+    info = dict(result_info or {})
     evidence = []
     score = 0.0
     fb = []
@@ -217,6 +224,90 @@ def evaluate_tool_choice(
                 fb.append("vretr: results miss: " + ", ".join(miss))
         else:
             fb.append("vretr found no results. Consider building embeddings index first.")
+
+    elif t == "edit":
+        patch_text = argd.get("patch") or argd.get("diff") or ""
+        if not patch_text and metrics.get("patch"):
+            patch_text = str(metrics.get("patch", ""))
+        patch_text = patch_text or ""
+        lines = [ln for ln in patch_text.splitlines() if ln.strip()]
+        evidence.append(f"edit patch_lines={len(lines)}")
+        if patch_text.strip():
+            score += 0.8
+            if len(lines) <= 200:
+                score += 0.2
+        else:
+            fb.append("edit produced no patch content.")
+
+    elif t == "patch":
+        applied = bool(metrics.get("applied"))
+        raw_pr = metrics.get("pass_rate", metrics.get("tests_pass_rate", 0.0))
+        try:
+            pass_rate = float(raw_pr)
+        except Exception:
+            pass_rate = 0.0
+        raw_blast = metrics.get("blast_radius", 0.0)
+        try:
+            blast_radius = float(raw_blast)
+        except Exception:
+            blast_radius = 0.0
+        evidence.append(f"patch applied={applied} pass_rate={pass_rate:.2f} blast_radius={blast_radius:.1f}")
+        if applied:
+            score += 1.0 + 0.5 * max(0.0, min(1.0, pass_rate))
+            if pass_rate >= 1.0:
+                score += 0.3
+            if blast_radius > 400:
+                score -= 0.3
+        else:
+            fb.append("patch was not applied or failed verification.")
+        if metrics.get("reverted"):
+            fb.append("patch reverted after tests/lint failures.")
+        if info.get("error"):
+            fb.append(f"patch error: {info['error']}")
+
+    elif t == "run_tests":
+        total = metrics.get("tests_total")
+        passed = metrics.get("tests_passed")
+        failed = metrics.get("tests_failed")
+        try:
+            pass_rate = float(metrics.get("pass_rate", 0.0))
+        except Exception:
+            pass_rate = 0.0
+        evidence.append(f"run_tests total={total} passed={passed} failed={failed} pr={pass_rate:.2f}")
+        if total is None:
+            score += 0.3
+            fb.append("run_tests metrics unavailable; ensure toolchain detected.")
+        else:
+            score += 0.4
+            if total and total > 0:
+                score += 0.6 * max(0.0, min(1.0, pass_rate))
+                if failed:
+                    fb.append(f"run_tests: {failed} failure(s).")
+                elif passed == total:
+                    score += 0.2
+
+    elif t == "lint":
+        try:
+            issues = int(metrics.get("lint_issues", 0) or 0)
+        except Exception:
+            issues = 0
+        lint_ok = metrics.get("lint_ok")
+        lint_ok = bool(lint_ok) if lint_ok is not None else (issues == 0)
+        evidence.append(f"lint ok={lint_ok} issues={issues}")
+        score += 0.4
+        if lint_ok:
+            score += 0.6
+        else:
+            fb.append(f"lint reported {issues} issue(s).")
+
+    elif t == "build":
+        build_ok = bool(metrics.get("build_ok"))
+        evidence.append(f"build ok={build_ok}")
+        score += 0.4
+        if build_ok:
+            score += 0.6
+        else:
+            fb.append("build command failed.")
 
     elif t == "intel":
         # Compose knowledge + vretr given a natural-language query

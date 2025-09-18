@@ -8,7 +8,8 @@ import time
 import hashlib
 import shutil
 from datetime import datetime
-from typing import Optional, List, Iterable, Tuple, Dict, Any, Literal
+from dataclasses import asdict
+from typing import Optional, List, Iterable, Tuple, Dict, Any, Literal, Mapping
 
 import typer
 from rich.console import Console
@@ -51,6 +52,7 @@ from .training.train_gepa import run_gepa, run_gepa_with_val, evaluate_on_set
 from .training.train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
 from .training.train_codegen import run_gepa_codegen
 from .training.autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
+from .training.rl_sweep import run_sweep as _run_rl_sweep, load_sweep_config as _load_sweep_config, SweepSettings as _SweepSettings
 from .agents.orchestrator_runtime import evaluate_tool_choice
 from .embedding.indexer import tokenize
 from .agents.router_worker import RouterWorker
@@ -73,6 +75,7 @@ from .streaming.streaming_config import (
 from .streaming.streamkit import TRAINER_SETTINGS_PATH
 from .streaming.streaming_runtime import start_local_stack, autodiscover_logs
 from .context.context_manager import ContextManager
+from .agentic import log_retrieval_event
 from .streaming.kafka_log import get_kafka_logger
 from .training.deploy import DeploymentLogger
 from .status_http import start_status_server
@@ -97,6 +100,7 @@ from .rl.rlkit import (
     aggregate_reward,
     ToolchainConfig,
     ToolchainExecutor,
+    ToolAction,
     detect_toolchain,
     load_from_module,
     get_verifiers as _rl_default_verifiers,
@@ -141,6 +145,10 @@ def _rl_build_make_env(
 
     settings = _load_stream_rl_settings(workspace)
     base_weights = dict(weights or {"pass_rate": 1.0, "blast_radius": 1.0})
+    base_weights.setdefault('retrieval_precision', 0.3)
+    base_weights.setdefault('retrieval_coverage', 0.05)
+    base_weights.setdefault('retrieval_avg_score', 0.1)
+    base_weights.setdefault('retrieval_query_count', 0.05)
     if isinstance(settings, dict):
         extra_weights = settings.get('reward_weights')
         if isinstance(extra_weights, dict):
@@ -240,9 +248,9 @@ def _rl_build_make_env(
                 trace += s.count('traceback (most recent call last)')
             def norm(x: int, cap: int = 10) -> float:
                 return min(float(x), float(cap)) / float(cap)
-            return [norm(err), norm(warn), norm(timeout), norm(trace)]
+            return [norm(err), norm(warn), norm(timeout), norm(trace)] + _agentic_features(workspace)
         except Exception:
-            return _logs_ctx_features(workspace)
+            return _logs_ctx_features(workspace) + _agentic_features(workspace)
 
     def make_env() -> RLToolEnv:
         ecfg = EnvConfig(
@@ -287,6 +295,24 @@ def _kafka_is_available(bootstrap: str, timeout: float = 0.2) -> bool:
     except Exception:
         return False
     return False
+
+_AGENTIC_CACHE: Dict[str, tuple[float, list[float]]] = {}
+
+
+def _agentic_features(workspace: Path, ttl: float = 5.0) -> list[float]:
+    key = str(workspace)
+    now = time.time()
+    cached = _AGENTIC_CACHE.get(key)
+    if cached and now - cached[0] < ttl:
+        return cached[1]
+    try:
+        cm = ContextManager(workspace)
+        feats = cm.agentic_features()
+    except Exception:
+        feats = []
+    _AGENTIC_CACHE[key] = (now, feats)
+    return feats
+
 
 def _logs_ctx_features(workspace: Path) -> list[float]:
     try:
@@ -706,7 +732,7 @@ class AutoTrainingLoop:
                 'updated_at': time.time(),
             })
             return
-        lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+        lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=ws)
         if lm is None:
             self.console.print(Panel("LM unavailable for auto-training; skipping cycle", title="auto-train", border_style="yellow"))
             self._write_status({
@@ -933,6 +959,13 @@ def rl_train(
         except Exception as e:
             console.print(Panel(escape(str(e)), title="rl config load failed", border_style="red"))
             raise typer.Exit(1)
+    else:
+        cfg_data = _load_effective_rl_config_dict(workspace)
+        if cfg_data:
+            try:
+                cfg = _rl_config_from_dict(cfg_data)
+            except Exception:
+                cfg = None
 
     # Resolve effective parameters (CLI > config defaults)
     eff_policy = policy or (cfg.policy if cfg else "epsilon-greedy")
@@ -998,6 +1031,200 @@ def rl_train(
         f"tools={dict(tools)}"
     )
     console.print(Panel.fit(body, title="rl train result", border_style="cyan"))
+
+
+@rl_app.command("guide")
+def rl_hparam_guide(
+    json_output: bool = typer.Option(False, '--json', help="Emit JSON instead of rich panels"),
+):
+    """Show curated reasoning-RL hyperparameter guidance."""
+
+    from .training.rl_sweep import describe_default_hparams
+
+    guide = describe_default_hparams()
+    if json_output:
+        console.print(Panel.fit(json.dumps(guide, indent=2), title="rl guide", border_style="cyan"))
+        return
+
+    for group in guide:
+        rows = []
+        for item in group['items']:
+            target = item.get('target')
+            tgt_str = f" → {target:.2f}" if isinstance(target, (int, float)) else ""
+            unit = item.get('unit') or ""
+            desc = f"{item['low']:.2f}–{item['high']:.2f}{tgt_str} {unit}\n{item['rationale']}"
+            rows.append(f"[bold]{item['name']}[/bold]\n{desc}")
+        console.print(Panel(Columns(rows, expand=True), title=group['title'], border_style="cyan"))
+
+
+@rl_app.command("sweep")
+def rl_sweep_command(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+    config: Optional[Path] = typer.Option(None, '--config', exists=True, help="Sweep configuration JSON"),
+    rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Base RL config"),
+    iterations: Optional[int] = typer.Option(None, '--iterations', help="Override number of sweep iterations"),
+    method: Optional[str] = typer.Option(None, '--method', help="Override sweep strategy (random|pareto|protein|carbs)"),
+    metric: Optional[str] = typer.Option(None, '--metric', help="Metric to optimise (reward|pass_rate|blast_radius)"),
+    goal: Optional[str] = typer.Option(None, '--goal', help="Optimization goal (maximize|minimize)"),
+    trainer_steps: Optional[int] = typer.Option(None, '--trainer-steps', help="Force trainer steps per trial"),
+    puffer: bool = typer.Option(False, '--puffer/--no-puffer', help="Use vectorized PufferLib trainer"),
+    persist: Optional[Path] = typer.Option(None, '--persist', help="Where to store best config summary"),
+    update_config: bool = typer.Option(True, '--update-config/--no-update-config', help="Update workspace .dspy_rl.json with best result"),
+):
+    """Run a hyperparameter sweep over the RL toolchain using PufferLib strategies."""
+    try:
+        sweep_cfg = _load_sweep_config(config)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="sweep config", border_style="red"))
+        raise typer.Exit(1)
+
+    if iterations is not None:
+        sweep_cfg['iterations'] = int(iterations)
+    if method:
+        sweep_cfg['method'] = method
+    if metric:
+        sweep_cfg['metric'] = metric
+    if goal:
+        sweep_cfg['goal'] = goal
+
+    base_cfg: Optional[_RLConfig] = None
+    base_path: Optional[Path] = None
+    if rl_config:
+        base_path = rl_config
+    else:
+        candidate = workspace / '.dspy_rl.json'
+        if candidate.exists():
+            base_path = candidate
+    if base_path and base_path.exists():
+        try:
+            base_cfg = _load_rl_config(base_path)
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="rl config load failed", border_style="yellow"))
+
+    settings = _SweepSettings()
+    if persist:
+        settings.persist_path = persist
+    if trainer_steps is not None:
+        settings.trainer_steps = int(trainer_steps)
+    settings.puffer_backend = bool(puffer)
+    settings.method = sweep_cfg.get('method', settings.method)
+    settings.metric = sweep_cfg.get('metric', settings.metric)
+    settings.goal = sweep_cfg.get('goal', settings.goal)
+    if 'iterations' in sweep_cfg:
+        try:
+            settings.iterations = int(sweep_cfg['iterations'])
+        except Exception:
+            pass
+
+    try:
+        outcome = _run_rl_sweep(workspace, sweep_cfg, base_config=base_cfg, settings=settings)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="sweep failed", border_style="red"))
+        raise typer.Exit(1)
+
+    best = outcome.best_summary
+    best_cfg = outcome.best_config
+    body = (
+        f"metric={best.metric:.4f} ({settings.metric})\n"
+        f"avg_reward={best.avg_reward:.4f}\n"
+        f"avg_pass_rate={best.avg_pass_rate:.4f}\n"
+        f"avg_blast_radius={best.avg_blast_radius:.4f}\n"
+        f"cost={best.cost:.2f}s\n"
+        f"iterations={len(outcome.history)}"
+    )
+    console.print(Panel.fit(body, title="rl sweep", border_style="cyan"))
+
+    if update_config:
+        target = base_path or (workspace / '.dspy_rl.json')
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = asdict(best_cfg)
+            # Convert tuples to lists for JSON serialisation
+            data['scales'] = {k: list(v) for k, v in (data.get('scales') or {}).items()}
+            target.write_text(json.dumps(data, indent=2))
+            console.print(Panel.fit(f"Updated {target}", title="rl config", border_style="green"))
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="config update failed", border_style="yellow"))
+
+    console.print(Panel.fit("Tip: run 'dspy-agent rl guide' for recommended temperature/entropy targets and curriculum stages.", title="next", border_style="dim"))
+
+
+@rl_app.command("async-train")
+def rl_async_train(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+    steps: int = typer.Option(200, '--steps', help="Rough number of learner updates to run"),
+    rollout_workers: int = typer.Option(2, '--rollout-workers', help="Concurrent action selectors"),
+    judge_workers: int = typer.Option(2, '--judge-workers', help="Concurrent tool executors"),
+    policy: str = typer.Option("epsilon-greedy", '--policy', help="Bandit policy"),
+    epsilon: float = typer.Option(0.1, '--epsilon', help="Epsilon for epsilon-greedy"),
+    ucb_c: float = typer.Option(2.0, '--ucb-c', help="Exploration constant for UCB"),
+    rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Optional RL config JSON"),
+    wall_clock: float = typer.Option(120.0, '--wall-clock', help="Seconds to run before stopping"),
+):
+    """Run the asynchronous rollout→judge→learner pipeline."""
+
+    cfg: Optional[_RLConfig] = None
+    if rl_config:
+        try:
+            cfg = _load_rl_config(rl_config)
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="rl config load failed", border_style="red"))
+            raise typer.Exit(1)
+    else:
+        cfg_data = _load_effective_rl_config_dict(workspace)
+        if cfg_data:
+            try:
+                cfg = _rl_config_from_dict(cfg_data)
+            except Exception:
+                cfg = None
+
+    make_env = _rl_build_make_env(
+        workspace,
+        verifiers_module=(cfg.verifiers_module if cfg else None) if cfg else None,
+        weights=(cfg.weights if cfg and cfg.weights else {"pass_rate": 1.0, "blast_radius": 1.0}),
+        penalty_kinds=(cfg.penalty_kinds if cfg else []),
+        clamp01_kinds=(cfg.clamp01_kinds if cfg else []),
+        scales=(cfg.scales if cfg else {}),
+        test_cmd=(cfg.test_cmd if cfg else None),
+        lint_cmd=(cfg.lint_cmd if cfg else None),
+        build_cmd=(cfg.build_cmd if cfg else None),
+        timeout_sec=(cfg.timeout_sec if cfg else None),
+        actions=(cfg.actions if cfg else None),
+    )
+
+    kwargs: Dict[str, float] = {}
+    pol = policy.lower().strip()
+    if pol in {"epsilon", "epsilon-greedy", "egreedy", "eps"}:
+        kwargs["epsilon"] = float(epsilon)
+    elif pol in {"ucb", "ucb1"}:
+        kwargs["c"] = float(ucb_c)
+
+    from .rl.async_loop import AsyncRLTrainer
+
+    trainer = AsyncRLTrainer(
+        make_env,
+        policy=policy,
+        policy_kwargs=kwargs,
+        rollout_workers=rollout_workers,
+        judge_workers=judge_workers,
+    )
+    trainer.start()
+    console.print(Panel.fit(
+        f"Async trainer started with {rollout_workers} rollout worker(s) and {judge_workers} judge(s). Running for {wall_clock}s...",
+        title="async rl",
+        border_style="cyan",
+    ))
+    t0 = time.time()
+    try:
+        while time.time() - t0 < wall_clock and trainer.snapshot_stats().get("count", 0.0) < steps:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        console.print("[yellow]Interrupted, stopping trainer...[/yellow]")
+    finally:
+        trainer.stop()
+        trainer.join()
+    summary = trainer.snapshot_stats()
+    console.print(Panel.fit(json.dumps(summary, indent=2), title="async stats", border_style="green"))
 
 
 @rl_app.command("ppo")
@@ -1123,6 +1350,8 @@ def main(
         logs_path = Path(logs) if logs else (ws / 'logs')
         
         console.print("[green]Starting enhanced interactive session with memory and performance optimizations...[/green]")
+        # Disable auto-training by default to avoid threading issues
+        os.environ.setdefault('DSPY_AUTO_TRAIN', 'false')
         _start_interactive_session(
             workspace=workspace,
             logs=logs,
@@ -1251,6 +1480,24 @@ def _build_patch_context_bundle(workspace: Path, logs: Path, task: str) -> dict:
     return bundle
 
 
+def _render_toolchain_console(action: str, result) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    metrics = dict(getattr(result, 'metrics', {}) or {})
+    info = dict(getattr(result, 'info', {}) or {})
+    if metrics:
+        try:
+            console.print(Panel.fit(json.dumps(metrics, indent=2), title=f"{action} metrics", border_style="green"))
+        except Exception:
+            console.print(Panel(str(metrics), title=f"{action} metrics", border_style="green"))
+    stdout = info.get('stdout')
+    if stdout:
+        console.print(Panel(escape(str(stdout)[-4000:]), title=f"{action} output", border_style="dim"))
+    if info.get('error'):
+        console.print(Panel(escape(str(info['error'])), title=f"{action} error", border_style="red"))
+    if info.get('warn'):
+        console.print(Panel(escape(str(info['warn'])), title=f"{action} warning", border_style="yellow"))
+    return metrics, info
+
+
 def _render_recent_fixes(console: Console, bundle: dict) -> None:
     patches = bundle.get('patches') or []
     if not patches:
@@ -1286,6 +1533,40 @@ def _safe_read_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _load_effective_rl_config_dict(workspace: Path) -> Dict[str, Any]:
+    best_path = workspace / '.dspy' / 'rl' / 'best.json'
+    try:
+        raw = json.loads(best_path.read_text())
+        if isinstance(raw, dict) and isinstance(raw.get('config'), dict):
+            return dict(raw['config'])
+    except Exception:
+        pass
+    return _safe_read_json(workspace / '.dspy_rl.json')
+
+
+def _rl_config_from_dict(data: Mapping[str, Any]) -> _RLConfig:
+    cfg = _RLConfig()
+    for key, value in data.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+    if isinstance(cfg.weights, dict):
+        cfg.weights = {str(k): float(v) for k, v in cfg.weights.items()}  # type: ignore[arg-type]
+    if isinstance(cfg.penalty_kinds, (list, tuple)):
+        cfg.penalty_kinds = [str(x) for x in cfg.penalty_kinds]
+    if isinstance(cfg.clamp01_kinds, (list, tuple)):
+        cfg.clamp01_kinds = [str(x) for x in cfg.clamp01_kinds]
+    if isinstance(cfg.scales, dict):
+        cfg.scales = {
+            str(k): (
+                (float(v[0]), float(v[1])) if isinstance(v, (list, tuple)) and len(v) == 2 else tuple(v) if isinstance(v, tuple) else v
+            )
+            for k, v in cfg.scales.items()
+        }
+    if isinstance(cfg.actions, (list, tuple)):
+        cfg.actions = [str(a) for a in cfg.actions]
+    return cfg
+
+
 def _render_stats_page(console: Console, workspace: Path) -> None:
     console.print(Panel.fit(str(workspace), title='workspace', border_style='cyan'))
     try:
@@ -1314,7 +1595,7 @@ def _render_stats_page(console: Console, workspace: Path) -> None:
                 val_str = str(val)
             table.add_row(str(name), val_str, str(cnt))
         console.print(Panel(table, title='RL Toolchain', border_style='magenta'))
-    rl_cfg = _safe_read_json(workspace / '.dspy_rl.json')
+    rl_cfg = _load_effective_rl_config_dict(workspace)
     weights = rl_cfg.get('weights', {}) if isinstance(rl_cfg, dict) else {}
     if weights:
         w_table = Table(show_header=True, header_style='bold yellow')
@@ -1398,15 +1679,49 @@ def _repo_layout_summary(ws: Path) -> str:
         return ""
 
 
-def _maybe_configure_lm(use_lm: bool, ollama: bool, model: Optional[str], base_url: Optional[str], api_key: Optional[str]):
+def _maybe_configure_lm(use_lm: bool, ollama: bool, model: Optional[str], base_url: Optional[str], api_key: Optional[str], workspace: Optional[Path] = None):
     settings = get_settings()
     if not use_lm or settings.local_mode:
         return None
+    temperature = None
+    target_entropy = None
+    clip_higher = None
+    effective_ws: Optional[Path] = workspace
+    if effective_ws is None:
+        env_ws = os.getenv("DSPY_WORKSPACE")
+        if env_ws:
+            try:
+                effective_ws = Path(env_ws)
+            except Exception:
+                effective_ws = None
+        if effective_ws is None:
+            effective_ws = Path.cwd()
+    try:
+        cfg_dict = _load_effective_rl_config_dict(effective_ws)
+    except Exception:
+        cfg_dict = {}
+    if isinstance(cfg_dict, dict):
+        try:
+            temperature = float(cfg_dict.get('temperature')) if cfg_dict.get('temperature') is not None else None
+        except Exception:
+            temperature = None
+        try:
+            target_entropy = float(cfg_dict.get('target_entropy')) if cfg_dict.get('target_entropy') is not None else None
+        except Exception:
+            target_entropy = None
+        try:
+            clip_higher = float(cfg_dict.get('clip_higher')) if cfg_dict.get('clip_higher') is not None else None
+        except Exception:
+            clip_higher = None
+
     return configure_lm(
         provider="ollama" if ollama else None,
         model_name=model,
         base_url=base_url,
         api_key=api_key,
+        temperature=temperature,
+        target_entropy=target_entropy,
+        clip_higher=clip_higher,
     )
 
 
@@ -1564,7 +1879,7 @@ def context(
         console.print("[dim]LOCAL_MODE or --no-lm: showing heuristics only.[/dim]")
         raise typer.Exit(0)
 
-    lm = _maybe_configure_lm(use_lm, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(use_lm, ollama, model, base_url, api_key, workspace=ws)
     if lm is None:
         console.print("[yellow]No LM configured; skipping enhanced context.[/yellow]")
         raise typer.Exit(0)
@@ -1612,7 +1927,7 @@ def codectx(
     console.print(Panel.fit(escape(snap[:8000] + ("\n..." if len(snap) > 8000 else "")), title=str(target), border_style="magenta"))
     if not use_lm:
         raise typer.Exit(0)
-    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=workspace)
     if lm is None:
         raise typer.Exit(0)
     _print_header("Code Context (DSPy)")
@@ -2478,6 +2793,32 @@ def chat(
         approval_mode = "auto"
 
     console.print(Panel.fit(f"Workspace: {ws}\nLogs: {logs_path}\nApproval: {approval_mode}", title="chat session", border_style="cyan"))
+
+    toolchain_executor: Optional[ToolchainExecutor] = None
+
+    def _refresh_toolchain() -> None:
+        nonlocal toolchain_executor
+        try:
+            toolchain_executor = ToolchainExecutor(detect_toolchain(ws))
+        except Exception:
+            toolchain_executor = None
+
+    def _execute_toolchain(action: ToolAction, action_args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        nonlocal toolchain_executor
+        if toolchain_executor is None:
+            _refresh_toolchain()
+        if toolchain_executor is None:
+            console.print(f"[yellow]Toolchain executor unavailable for {action.name.lower()} (configure toolchain commands).[/yellow]")
+            return {}, {}
+        try:
+            result = toolchain_executor(action, action_args)
+        except Exception as exc:
+            console.print(Panel(escape(str(exc)), title=f"{action.name.lower()} failed", border_style="red"))
+            return {}, {}
+        return _render_toolchain_console(action.name.lower(), result)
+
+    _refresh_toolchain()
+
     # Reuse orchestrate_chain
     # Since orchestrate_chain is nested inside start, replicate minimal logic here
     def _extract_targets_from_query(nl: str, k: int = 5) -> list[str]:
@@ -2495,8 +2836,8 @@ def chat(
     last_args = None
     for step in range(1, steps + 1):
         state = f"workspace={ws}, logs={logs_path} | history: {history_summary[:4000]}"
-        tool = None; args = {}
-        lm = _maybe_configure_lm(True, provider_is_ollama, model_name, base, key)
+        tool = None; args: Dict[str, Any] = {}
+        lm = _maybe_configure_lm(True, provider_is_ollama, model_name, base, key, workspace=ws)
         if lm is not None:
             try:
                 # Confidence gating: use fast Predict first; escalate to CoT if ambiguous
@@ -2514,11 +2855,19 @@ def chat(
                 tool = None; args = {}
         if not tool:
             tool = "context" if logs_path.exists() else "codectx"; args = {}
+        else:
+            args = dict(args or {})
+        if tool == "edit":
+            args.setdefault("apply", auto_apply_env)
+        if tool == "patch":
+            args.setdefault("task", task)
         console.print(Panel.fit(escape(f"{tool} {args}"), title=f"Step {step}: action", border_style="yellow"))
         if last_tool == tool and last_args == args:
             console.print("[dim]No new action; stopping.[/dim]")
             break
         last_tool, last_args = tool, dict(args)
+        tool_metrics: Dict[str, Any] = {}
+        tool_info: Dict[str, Any] = {}
         try:
             # If manual approval is required, confirm before executing tool
             if approval_mode == "manual":
@@ -2543,13 +2892,61 @@ def chat(
                 fp = (ws / args.get("file",".")).resolve(); sym=args.get("symbol"); rx=args.get("regex");
                 if sym and fp.suffix==".py": res = python_extract_symbol(fp, sym); 
                 elif rx: hits=file_search(fp, rx, regex=True); text=fp.read_text(errors="ignore"); s,e,seg=extract_context(text, hits[0].line_no, before=3, after=3); console.print(Panel(escape(seg), title=f"{fp} lines {s}-{e}", border_style="green"))
+            elif tool == "run_tests":
+                tool_metrics, tool_info = _execute_toolchain(ToolAction.RUN_TESTS, dict(args))
+            elif tool == "lint":
+                tool_metrics, tool_info = _execute_toolchain(ToolAction.LINT, dict(args))
+            elif tool == "build":
+                tool_metrics, tool_info = _execute_toolchain(ToolAction.BUILD, dict(args))
+            elif tool == "patch" and not args.get("file"):
+                patch_args = dict(args)
+                patch_task = patch_args.get("task") or task
+                if not isinstance(patch_task, str):
+                    patch_task = str(patch_task)
+                bundle = _build_patch_context_bundle(ws, logs_path, patch_task)
+                combined = bundle.get('combined_context') or bundle.get('text') or ''
+                patch_args.setdefault("task", patch_task)
+                patch_args.setdefault("context", combined)
+                tool_metrics, tool_info = _execute_toolchain(ToolAction.PATCH, patch_args)
+                patch_done = True
+            elif tool == "patch":
+                pf = args.get("file"); p = (ws / pf).resolve() if pf else None
+                if not p or not p.exists():
+                    console.print("[yellow]patch needs --file[/yellow]")
+                    continue
+                text = p.read_text(errors="ignore")
+                ok, msg = apply_unified_patch(text, ws)
+                tool_metrics = {"applied": bool(ok)}
+                if ok:
+                    console.print(f"[ok]{msg}[/ok]")
+                    summ = summarize_patch(text)
+                    blast = float(summ['added_lines'] + summ['removed_lines'])
+                    tool_metrics.update({"blast_radius": blast})
+                    console.print(Panel.fit(
+                        f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
+                        title="patch metrics", border_style="accent"
+                    ))
+                else:
+                    console.print(Panel(msg, title="patch failed", border_style="err"))
+                patch_done = True
+            elif tool == "edit":
+                tool_metrics, tool_info = _run_edit_tool(args)
+                patch_done = True
             else:
                 # default to context snapshot
                 bundle, _ = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""; console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
         except Exception as e:
             console.print(Panel(escape(str(e)), title=f"agent failed ({tool})", border_style="red")); break
         try:
-            outcome = evaluate_tool_choice(tool, args, workspace=ws, logs_path=logs_path, targets=targets); piece=f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
+            outcome = evaluate_tool_choice(
+                tool,
+                args,
+                workspace=ws,
+                logs_path=logs_path,
+                targets=targets,
+                result_metrics=tool_metrics or None,
+                result_info=tool_info or None,
+            ); piece=f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
         except Exception:
             piece=f"{tool}: done"
         history_summary = (history_summary + " | " + piece).strip()
@@ -2587,7 +2984,7 @@ def run(
         console.print("[yellow]LOCAL_MODE or --no-lm: cannot generate a plan.[/yellow]")
         raise typer.Exit(0)
 
-    lm = _maybe_configure_lm(use_lm, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(use_lm, ollama, model, base_url, api_key, workspace=ws)
     if lm is None:
         _print_header("Heuristic Context")
         console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
@@ -2638,6 +3035,9 @@ def esearch(
     if not hits:
         console.print("[yellow]No results.[/yellow]")
         raise typer.Exit(0)
+    event_hits = [{"path": str(Path(it.path)), "score": float(score), "source": "esearch"} for score, it in hits]
+    if event_hits:
+        log_retrieval_event(workspace, query, event_hits)
     for score, it in hits:
         p = Path(it.path)
         try:
@@ -2996,7 +3396,7 @@ def gepa_train(
         raise typer.Exit(2)
 
     # Configure reflection LM
-    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=workspace or Path.cwd())
     if lm is None:
         console.print("[yellow]No LM configured for reflection. Configure Ollama or pass --no-ollama with OpenAI-compatible envs.[/yellow]")
         raise typer.Exit(1)
@@ -3164,7 +3564,7 @@ def gepa_orchestrator(
         os.environ['DSPY_FORCE_JSON_OBJECT'] = 'false'
     elif force_json:
         os.environ['DSPY_FORCE_JSON_OBJECT'] = 'true'
-    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=workspace or Path.cwd())
     if lm is None:
         console.print("[yellow]No LM configured for reflection.[/yellow]")
         raise typer.Exit(1)
@@ -3283,7 +3683,7 @@ def gepa_codegen(
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
 ):
-    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=Path.cwd())
     if lm is None:
         console.print("[yellow]No LM configured; cannot run codegen GEPA.[/yellow]")
         raise typer.Exit(1)
@@ -3328,7 +3728,7 @@ def code_edit(
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
 ):
-    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=workspace)
     if lm is None:
         console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]"); raise typer.Exit(1)
     bundle = _build_patch_context_bundle(workspace, workspace / 'logs', task)
@@ -3422,7 +3822,7 @@ def init(
         return
 
     _print_header("Light GEPA Training")
-    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=ws)
     if lm is None:
         console.print("[yellow]No LM configured; skipping training.[/yellow]")
         return
@@ -3473,7 +3873,7 @@ def live_train(
     - Persist evaluation reports under --report-dir
     """
     report_dir.mkdir(parents=True, exist_ok=True)
-    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=workspace)
     if lm is None:
         console.print("[yellow]No LM configured; cannot train. Exiting.")
         raise typer.Exit(1)
@@ -3721,18 +4121,6 @@ def patch(
         console.print(Panel(msg, title="patch failed", border_style="err"))
 
 
-def code_entry():
-    """Entry point for 'dspy-code' shortcut: launches interactive agent with defaults."""
-    try:
-        _print_banner(console)
-        # Use cwd as workspace and ./logs if exists
-        ws = Path.cwd()
-        logs = ws / 'logs'
-        start(workspace=ws, logs=logs if logs.exists() else None, ollama=True, model="qwen3:1.7b", base_url=None, api_key=None, force_json=False, structured=False, approval=None)  # type: ignore[arg-type]
-    except SystemExit:
-        pass
-
-
 @app.command()
 def diff(
     file: Path = typer.Option(..., '--file', exists=True, help="Existing file to diff against"),
@@ -3773,8 +4161,32 @@ def start_command(
     """Interactive session to pick workspace/logs and run tasks."""
     ws = Path(workspace) if workspace else Path.cwd()
     logs_path = Path(logs) if logs else (ws / 'logs')
-    
-    
+
+    toolchain_executor: Optional[ToolchainExecutor] = None
+
+    def _refresh_toolchain() -> None:
+        nonlocal toolchain_executor
+        try:
+            toolchain_executor = ToolchainExecutor(detect_toolchain(ws))
+        except Exception:
+            toolchain_executor = None
+
+    def _execute_toolchain(action: ToolAction, action_args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        nonlocal toolchain_executor
+        if toolchain_executor is None:
+            _refresh_toolchain()
+        if toolchain_executor is None:
+            console.print(f"[yellow]Toolchain executor unavailable for {action.name.lower()} (configure RL/toolchain commands).[/yellow]")
+            return {}, {}
+        try:
+            result = toolchain_executor(action, action_args)
+        except Exception as exc:
+            console.print(Panel(escape(str(exc)), title=f"{action.name.lower()} failed", border_style="red"))
+            return {}, {}
+        return _render_toolchain_console(action.name.lower(), result)
+
+    _refresh_toolchain()
+
     use_lm = True
     provider_is_ollama = ollama
     last_extract: Optional[str] = None
@@ -3934,6 +4346,49 @@ def start_command(
         tool_cooldown = {"context": 5, "index": 300, "emb-index": 600, "intel": 10, "vretr": 5, "esearch": 3, "grep": 2, "edit": 20}
         last_run: dict[str, float] = {}
         step_history: list[dict] = []
+        patch_done = False
+        auto_apply_env = os.getenv("DSPY_AUTO_APPLY_PATCHES", "true").lower() in {"1", "true", "yes", "on"}
+
+        def _run_edit_tool(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+            metrics: Dict[str, Any] = {}
+            info: Dict[str, Any] = {}
+            task_text = args.get("task") or nl
+            file_hints = args.get("file_hints") or args.get("files") or ""
+            auto_apply_flag = bool(args.get("apply", True))
+            lm = _maybe_configure_lm(use_lm, provider_is_ollama, model, base_url, api_key, workspace=ws)
+            if lm is None:
+                console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]")
+                return metrics, info
+            bundle_logs, _ = load_logs([logs_path])
+            ctx_text = extract_key_events(bundle_logs) if bundle_logs else ""
+            from .skills.code_edit import CodeEdit
+            code_graph = _get_code_summary(ws)
+            ce = CodeEdit(use_cot=True)
+            out = ce(task=task_text, context=ctx_text, code_graph=code_graph, file_hints=file_hints)
+            _print_header("Proposed Patch")
+            console.print(out.patch or "(no patch)")
+            _print_header("Rationale")
+            console.print(out.rationale or "(no rationale)")
+            info["patch"] = out.patch or ""
+            if auto_apply_flag and out.patch:
+                do_apply = True
+                if approval_mode == "manual":
+                    do_apply = typer.confirm("Apply this patch?", default=False)
+                if do_apply:
+                    ok, msg = apply_unified_patch(out.patch, ws)
+                    metrics = {"applied": bool(ok)}
+                    if ok:
+                        console.print(f"[green]{msg}[/green]")
+                        summ = summarize_patch(out.patch)
+                        blast = float(summ['added_lines'] + summ['removed_lines'])
+                        metrics.update({"blast_radius": blast})
+                        console.print(Panel.fit(
+                            f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
+                            title="patch metrics", border_style="accent"
+                        ))
+                    else:
+                        console.print(Panel(msg, title="apply failed", border_style="red"))
+            return metrics, info
         for step in range(1, max_steps + 1):
             state = build_state() + (f" | history: {history_summary[:4000]}" if history_summary else "")
             tool = None
@@ -4015,7 +4470,7 @@ def start_command(
                     args = {"task": nl, "apply": False}
             # If RL not enabled or failed, try LLM orchestrator
             if not tool:
-                lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+                lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
                 if lm is not None:
                     try:
                         orch = Orchestrator(use_cot=True)
@@ -4108,6 +4563,36 @@ def start_command(
             if step >= 2 and ("score=" in piece and float(piece.split("score=")[1].split(";")[0]) >= 1.2):
                 break
 
+        if not patch_done:
+            console.print("[cyan]No diff proposed during exploration; generating patch suggestion now.[/cyan]")
+            forced_args = {"task": nl, "apply": auto_apply_env}
+            tool_metrics, tool_info = _run_edit_tool(forced_args)
+            patch_done = True
+            forced_outcome = None
+            forced_evidence = ""
+            try:
+                forced_outcome = evaluate_tool_choice(
+                    "edit",
+                    forced_args,
+                    workspace=ws,
+                    logs_path=logs_path,
+                    targets=targets,
+                    result_metrics=tool_metrics or None,
+                    result_info=tool_info or None,
+                )
+                forced_evidence = forced_outcome.evidence
+                piece = f"edit: score={forced_outcome.score:.2f}; {forced_evidence}"
+            except Exception as e:
+                forced_evidence = str(e)
+                piece = f"edit: forced patch failed ({e})"
+            step_history.append({
+                "tool": "edit",
+                "args": forced_args,
+                "score": float(forced_outcome.score) if forced_outcome else 0.0,
+                "evidence": forced_evidence,
+            })
+            history_summary = (history_summary + " | " + piece).strip()
+
         # Enhanced session summary with memory
         try:
             if memory:
@@ -4151,7 +4636,7 @@ def start_command(
             console.print(Panel.fit(escape(key), title="Extracted Events", border_style="magenta"))
         elif t == "plan":
             bundle, count = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
             if lm is None:
                 console.print("[yellow]No LM configured for planning.[/yellow]"); return
             builder = ContextBuilder(); ctx = builder(task=args.get("task", ""), logs_preview=key)
@@ -4215,7 +4700,7 @@ def start_command(
             path = args.get("path"); target = (ws / path).resolve() if path else ws
             snap = build_code_snapshot(target); _print_header("Code Snapshot")
             console.print(Panel.fit(escape(snap[:8000] + ("\n..." if len(snap)>8000 else "")), title=str(target), border_style="magenta"))
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
             if lm:
                 cc = CodeContext(); code_graph = _get_code_summary(ws)
                 out = cc(snapshot=snap, ask="Summarize key parts and modification points.", code_graph=code_graph)
@@ -4270,6 +4755,14 @@ def start_command(
             title = f"knowledge matches={len(matches)}"
             body = "\n".join(f"- {m.get('path')} | classes={len(m.get('classes') or [])} funcs={len(m.get('functions') or [])}" for m in matches[:50])
             console.print(Panel(body, title=title, border_style="blue"))
+            query_label = f"knowledge:{f or ''}:{imp or ''}:{cls or ''}:{fn or ''}:{lang or ''}"
+            event_hits = []
+            for rec in matches[:50]:
+                path = rec.get('path')
+                if path:
+                    event_hits.append({"path": str(path), "score": 1.0, "source": "knowledge"})
+            if event_hits:
+                log_retrieval_event(ws, query_label, event_hits)
         elif t == "vretr":
             # Manual vector retrieval
             q = args.get('query') or args.get('q') or ''
@@ -4306,6 +4799,9 @@ def start_command(
                 if not hits:
                     console.print("[yellow]No vector matches.")
                     return
+                event_hits = [{"path": str(Path(it.path)), "score": float(score_i), "source": "vretr"} for score_i, it in hits]
+                if event_hits:
+                    log_retrieval_event(ws, q, event_hits)
                 for score_i, it in hits:
                     p = Path(it.path)
                     try:
@@ -4377,13 +4873,19 @@ def start_command(
                 hits = []
             # Render evidence
             _print_header("Intel: Knowledge matches")
+            event_hits: List[Dict[str, object]] = []
             if kn_matches:
                 body = "\n".join(f"- {m.get('path')} | classes={len(m.get('classes') or [])} funcs={len(m.get('functions') or [])}" for m in kn_matches[:50])
                 console.print(Panel(body, title=f"{len(kn_matches)} files", border_style="blue"))
+                for rec in kn_matches[:50]:
+                    path = rec.get('path')
+                    if path:
+                        event_hits.append({"path": str(path), "score": 1.0, "source": "intel-knowledge"})
             else:
                 console.print("[yellow]No knowledge matches.[/yellow]")
             _print_header("Intel: Vector retrieval")
             if hits:
+                event_hits.extend({"path": str(Path(it.path)), "score": float(score_i), "source": "intel-vretr"} for score_i, it in hits)
                 for score_i, it in hits:
                     p = Path(it.path)
                     try:
@@ -4394,6 +4896,8 @@ def start_command(
                     console.print(Panel(escape(seg), title=title, border_style="cyan"))
             else:
                 console.print("[yellow]No vector matches.[/yellow]")
+            if event_hits:
+                log_retrieval_event(ws, q, event_hits)
         elif t == "index":
             _print_header("Building index"); meta, items = build_index(ws, smart=True); out_dir = save_index(ws, meta, items)
             console.print(f"[green]Indexed {len(items)} chunks. Saved to {out_dir}[/green]")
@@ -4410,6 +4914,9 @@ def start_command(
                 s = p.as_posix()
                 return ("/.venv/" in s) or ("/site-packages/" in s) or ("/node_modules/" in s) or ("/.git/" in s)
             hits = [(sc, it) for sc, it in hits if not _skip_path(Path(it.path))]
+            event_hits = [{"path": str(Path(it.path)), "score": float(score), "source": "esearch"} for score, it in hits]
+            if event_hits:
+                log_retrieval_event(ws, q, event_hits)
             for score,it in hits:
                 p = Path(it.path)
                 try:
@@ -4421,8 +4928,9 @@ def start_command(
             # LLM-powered code edit: propose minimal unified diff, ask before applying
             task_text = args.get("task") or nl
             file_hints = args.get("file_hints") or args.get("files") or ""
-            apply_flag = bool(args.get("apply", False))
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+            auto_apply_default = os.getenv("DSPY_AUTO_APPLY_PATCHES", "true").lower() in {"1", "true", "yes", "on"}
+            apply_flag = bool(args.get("apply", auto_apply_default))
+            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
             if lm is None:
                 console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]")
                 return
@@ -4437,15 +4945,20 @@ def start_command(
             _print_header("Rationale"); console.print(out.rationale or "(no rationale)")
             if apply_flag and out.patch:
                 do_apply = True
-                # Always ask in manual mode; in auto mode, do not auto-apply
                 if approval_mode == "manual":
                     do_apply = typer.confirm("Apply this patch?", default=False)
-                else:
-                    do_apply = False
                 if do_apply:
                     ok, msg = apply_unified_patch(out.patch, ws)
+                    tool_metrics = {"applied": bool(ok)}
                     if ok:
                         console.print(f"[green]{msg}[/green]")
+                        summ = summarize_patch(out.patch)
+                        blast = float(summ['added_lines'] + summ['removed_lines'])
+                        tool_metrics.update({"blast_radius": blast})
+                        console.print(Panel.fit(
+                            f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
+                            title="patch metrics", border_style="accent"
+                        ))
                     else:
                         console.print(Panel(msg, title="apply failed", border_style="red"))
         elif t == "open":
@@ -4473,16 +4986,43 @@ def start_command(
             code,out,err = run_ast_grep(root=ws, pattern=pattern, lang=lang, rule_file=(ws / rule) if rule else None, json=as_json)
             if err.strip(): console.print(Panel(err, title="ast-grep stderr", border_style="red"))
             if out.strip(): console.print(out)
+        elif t == "run_tests":
+            tool_metrics, tool_info = _execute_toolchain(ToolAction.RUN_TESTS, dict(args))
+        elif t == "lint":
+            tool_metrics, tool_info = _execute_toolchain(ToolAction.LINT, dict(args))
+        elif t == "build":
+            tool_metrics, tool_info = _execute_toolchain(ToolAction.BUILD, dict(args))
         elif t == "patch":
-            pf = args.get("file"); p = (ws / pf).resolve() if pf else None
-            if not p or not p.exists(): console.print("[yellow]patch needs --file[/yellow]"); return
-            text = p.read_text(errors="ignore"); ok,msg = apply_unified_patch(text, ws);
-            if ok:
-                console.print(f"[ok]{msg}[/ok]")
-                summ = summarize_patch(text)
-                console.print(Panel.fit(f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}", title="patch metrics", border_style="accent"))
+            pf = args.get("file")
+            if pf:
+                p = (ws / pf).resolve()
+                if not p.exists():
+                    console.print("[yellow]patch needs --file[/yellow]")
+                    return
+                text = p.read_text(errors="ignore")
+                ok, msg = apply_unified_patch(text, ws)
+                tool_metrics = {"applied": bool(ok)}
+                if ok:
+                    console.print(f"[ok]{msg}[/ok]")
+                    summ = summarize_patch(text)
+                    blast = float(summ['added_lines'] + summ['removed_lines'])
+                    tool_metrics.update({"blast_radius": blast})
+                    console.print(Panel.fit(
+                        f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
+                        title="patch metrics", border_style="accent"
+                    ))
+                else:
+                    console.print(Panel(msg, title="patch failed", border_style="err"))
             else:
-                console.print(Panel(msg, title="patch failed", border_style="err"))
+                patch_args = dict(args)
+                patch_task = patch_args.get("task") or "Fix workspace issues"
+                if not isinstance(patch_task, str):
+                    patch_task = str(patch_task)
+                bundle = _build_patch_context_bundle(ws, logs_path, patch_task)
+                combined = bundle.get('combined_context') or bundle.get('text') or ''
+                patch_args.setdefault("task", patch_task)
+                patch_args.setdefault("context", combined)
+                tool_metrics, tool_info = _execute_toolchain(ToolAction.PATCH, patch_args)
         elif t == "diff":
             if not last_extract: console.print("[yellow]No extract buffer. Run extract first.[/yellow]"); return
             file = args.get("file"); p=(ws / file).resolve() if file else None
@@ -4663,7 +5203,7 @@ def start_command(
             _print_header("Log Key Events")
             key = extract_key_events(bundle)
             console.print(Panel.fit(key, title="Extracted Events", border_style="magenta"))
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
             if lm is None:
                 continue
             _print_header("Enhanced Context (DSPy)")
@@ -4676,7 +5216,7 @@ def start_command(
             snap = build_code_snapshot(path_arg)
             _print_header("Code Snapshot")
             console.print(Panel.fit(snap[:8000] + ("\n..." if len(snap) > 8000 else ""), title=str(path_arg), border_style="magenta"))
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
             if lm:
                 _print_header("Code Context (DSPy)")
                 cc = CodeContext()
@@ -4688,7 +5228,7 @@ def start_command(
                 console.print("[yellow]Usage: edit <TASK> [--apply][/yellow]"); continue
             task_text = " ".join([a for a in args if not a.startswith("--")])
             apply_flag = any(a in {"--apply", "-y"} for a in args)
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
             if lm is None:
                 console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]")
                 continue
@@ -4718,7 +5258,7 @@ def start_command(
             task = " ".join(args)
             bundle, count = load_logs([logs_path])
             key = extract_key_events(bundle) if bundle else ""
-            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key)
+            lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
             if lm is None:
                 console.print("[yellow]No LM configured; cannot generate a plan.[/yellow]")
                 continue
@@ -5156,6 +5696,110 @@ def sg(
     if out.strip():
         console.print(out)
     raise typer.Exit(code)
+
+
+start = start_command
+
+
+def code_entry() -> None:
+    """Entry point for the `dspy-code` console script (interactive defaults)."""
+    try:
+        _print_banner(console)
+        ws = Path.cwd()
+        logs = ws / 'logs'
+        from .ui.interactive import run_interactive_shell
+        run_interactive_shell(ws, logs if logs.exists() else None)
+    except SystemExit:
+        pass
+
+
+@app.command()
+def code(
+    open_dashboard: bool = typer.Option(
+        False,
+        "--open-dashboard/--no-open-dashboard",
+        help="Automatically open the dashboard in your default browser after the server starts.",
+    ),
+):
+    """
+    Integrated entry point for dspy-code command.
+    Starts the dashboard server and runs the CLI agent.
+    """
+    import threading
+    import time
+    import subprocess
+    import signal
+    import sys
+    from pathlib import Path
+    
+    # Print welcome banner
+    console.print("\n🚀 [bold cyan]DSPy Code Agent[/bold cyan] - Integrated Development Environment")
+    console.print("   [dim]Starting dashboard server and CLI agent...[/dim]\n")
+    
+    # Start the dashboard server in a separate process
+    dashboard_process = None
+    try:
+        # Get the path to the enhanced dashboard server
+        dashboard_path = Path(__file__).parent.parent / "enhanced_dashboard_server.py"
+        
+        console.print("📊 Starting dashboard server...")
+        dashboard_process = subprocess.Popen([
+            sys.executable, str(dashboard_path), "8081"
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Wait a moment for the server to start
+        time.sleep(2)
+        
+        # Check if server started successfully
+        try:
+            import urllib.request
+
+            urllib.request.urlopen("http://localhost:8081/api/status", timeout=1)
+            console.print("✅ Dashboard server started successfully at http://localhost:8081")
+
+            if open_dashboard:
+                import webbrowser
+
+                console.print("🌐 Opening dashboard in browser...")
+                webbrowser.open("http://localhost:8081/dashboard")
+            else:
+                console.print("ℹ️  Run with --open-dashboard to launch the dashboard in your browser automatically.")
+
+        except Exception as e:
+            console.print(f"⚠️  Dashboard server may not be ready yet: {e}")
+            console.print("   You can manually open http://localhost:8081/dashboard")
+
+        console.print("\n🎯 [bold green]Ready![/bold green] You now have:")
+        console.print("   📊 Web Dashboard: http://localhost:8081/dashboard")
+        console.print("   💻 CLI Agent: Running in this terminal")
+        console.print("   🔗 Both interfaces are connected to the same RedDB backend")
+        console.print("\n💡 [dim]Use the web interface for monitoring and the CLI for direct interaction[/dim]")
+        console.print("🛑 [dim]Press Ctrl+C to stop both the dashboard and CLI agent[/dim]\n")
+        
+        # Set up signal handler to clean up dashboard process
+        def signal_handler(sig, frame):
+            console.print("\n🛑 Shutting down DSPy Code Agent...")
+            if dashboard_process:
+                console.print("   Stopping dashboard server...")
+                dashboard_process.terminate()
+                dashboard_process.wait()
+            console.print("   ✅ Cleanup complete. Goodbye!")
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Run the main CLI application
+        try:
+            app()
+        except KeyboardInterrupt:
+            signal_handler(signal.SIGINT, None)
+            
+    except Exception as e:
+        console.print(f"❌ Error starting integrated environment: {e}")
+        if dashboard_process:
+            dashboard_process.terminate()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+@@ -1,4 +1,5 @@
+ # Overview of dspy_agent codebase
+-# Files: dspy_agent/cli.py (135 funcs), dspy_agent/db/data_models.py (51 funcs), dspy_agent/rl/rlkit.py (43 funcs)
++# Files: dspy_agent/cli.py (135 funcs), dspy_agent/db/data_models.py (51 funcs), dspy_agent/rl/rlkit.py (43 funcs)
++#       dspy_agent/streaming/streamkit.py (44 funcs)
+ #
+ # Key components:

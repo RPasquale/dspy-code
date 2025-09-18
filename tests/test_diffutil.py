@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from dspy_agent.diffutil import unified_diff_from_texts, unified_diff_file_vs_text
+from dspy_agent.code_tools.diffutil import unified_diff_from_texts, unified_diff_file_vs_text
 
 
 class TestDiffUtil(unittest.TestCase):

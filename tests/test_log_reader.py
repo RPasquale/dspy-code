@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from dspy_agent.log_reader import iter_log_paths, read_capped, extract_key_events, load_logs
+from dspy_agent.streaming.log_reader import iter_log_paths, read_capped, extract_key_events, load_logs
 
 
 class TestLogReader(unittest.TestCase):

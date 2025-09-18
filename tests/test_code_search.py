@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from dspy_agent.code_search import (
+from dspy_agent.code_tools.code_search import (
     search_text,
     search_file,
     extract_context,
@@ -54,7 +54,7 @@ def target():
 
     def test_run_ast_grep_missing(self):
         # Simulate ast-grep not being available
-        with mock.patch("dspy_agent.code_search.shutil.which", return_value=None):
+        with mock.patch("dspy_agent.code_tools.code_search.shutil.which", return_value=None):
             code, out, err = run_ast_grep(Path.cwd(), pattern="def ", lang="python")
             self.assertEqual(code, 127)
             self.assertIn("ast-grep not found", err)
@@ -62,8 +62,8 @@ def target():
     def test_run_ast_grep_invocation(self):
         # Simulate ast-grep available and returning success
         fake_proc = mock.Mock(returncode=0, stdout="OK", stderr="")
-        with mock.patch("dspy_agent.code_search.shutil.which", return_value="ast-grep"), \
-             mock.patch("dspy_agent.code_search.subprocess.run", return_value=fake_proc) as mrun:
+        with mock.patch("dspy_agent.code_tools.code_search.shutil.which", return_value="ast-grep"), \
+             mock.patch("dspy_agent.code_tools.code_search.subprocess.run", return_value=fake_proc) as mrun:
             code, out, err = run_ast_grep(Path("/tmp/x"), pattern="def ", lang="python", json=True)
             self.assertEqual(code, 0)
             self.assertEqual(out, "OK")

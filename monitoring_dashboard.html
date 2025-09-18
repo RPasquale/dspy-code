@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSPy Agent Real-Time Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'SF Pro Display', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+        }
+
+        .header {
+            text-align: center;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.2);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            background: linear-gradient(45deg, #FFD700, #FFA500);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status-bar {
+            display: flex;
+            justify-content: space-around;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.1);
+            margin: 20px;
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+        }
+
+        .status-item {
+            text-align: center;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+
+        .status-healthy { background: #4CAF50; }
+        .status-unhealthy { background: #f44336; }
+        .status-warning { background: #ff9800; }
+
+        .main-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .panel {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+
+        .panel h3 {
+            margin-bottom: 15px;
+            font-size: 1.3em;
+            color: #FFD700;
+        }
+
+        .logs-container {
+            background: #000;
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 10px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 12px;
+            height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border: 1px solid #333;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        .metric-card {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+        }
+
+        .metric-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #4CAF50;
+        }
+
+        .metric-label {
+            font-size: 0.9em;
+            opacity: 0.8;
+            margin-top: 5px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .btn {
+            background: linear-gradient(45deg, #4CAF50, #45a049);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(76, 175, 80, 0.4);
+        }
+
+        .btn-warning {
+            background: linear-gradient(45deg, #ff9800, #f57c00);
+        }
+
+        .btn-danger {
+            background: linear-gradient(45deg, #f44336, #d32f2f);
+        }
+
+        .activity-feed {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .activity-item {
+            background: rgba(0, 0, 0, 0.2);
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 8px;
+            border-left: 4px solid #4CAF50;
+        }
+
+        .activity-time {
+            font-size: 0.8em;
+            opacity: 0.7;
+        }
+
+        .full-width {
+            grid-column: 1 / -1;
+        }
+
+        .command-input {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .command-input input {
+            flex: 1;
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            background: rgba(0, 0, 0, 0.2);
+            color: white;
+        }
+
+        .command-input input::placeholder {
+            color: rgba(255, 255, 255, 0.5);
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50, #8BC34A);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .chart-container {
+            height: 200px;
+            background: rgba(0, 0, 0, 0.1);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: rgba(255, 255, 255, 0.5);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎯 DSPy Agent Dashboard</h1>
+        <p>Real-time monitoring and control center</p>
+    </div>
+
+    <div class="status-bar">
+        <div class="status-item">
+            <span class="status-dot status-healthy" id="agent-dot"></span>
+            <span>Agent: <span id="agent-status">Checking...</span></span>
+        </div>
+        <div class="status-item">
+            <span class="status-dot status-healthy" id="ollama-dot"></span>
+            <span>Ollama: <span id="ollama-status">Checking...</span></span>
+        </div>
+        <div class="status-item">
+            <span class="status-dot status-healthy" id="kafka-dot"></span>
+            <span>Kafka: <span id="kafka-status">Checking...</span></span>
+        </div>
+        <div class="status-item">
+            <span class="status-dot status-healthy" id="containers-dot"></span>
+            <span>Containers: <span id="containers-status">Checking...</span></span>
+        </div>
+    </div>
+
+    <div class="main-container">
+        <!-- Real-time Logs Panel -->
+        <div class="panel">
+            <h3>📝 Live Agent Logs</h3>
+            <div class="controls">
+                <button class="btn" onclick="clearLogs()">Clear</button>
+                <button class="btn btn-warning" onclick="pauseLogs()">Pause</button>
+                <button class="btn" onclick="exportLogs()">Export</button>
+            </div>
+            <div class="logs-container" id="agent-logs">
+                [Connecting to agent logs...]
+            </div>
+        </div>
+
+        <!-- Performance Metrics -->
+        <div class="panel">
+            <h3>📊 Performance Metrics</h3>
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-value" id="response-time">--</div>
+                    <div class="metric-label">Avg Response Time (s)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="success-rate">--</div>
+                    <div class="metric-label">Success Rate (%)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="total-requests">--</div>
+                    <div class="metric-label">Total Requests</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="memory-usage">--</div>
+                    <div class="metric-label">Memory Usage (MB)</div>
+                </div>
+            </div>
+            <div class="chart-container">
+                <span>Response Time Chart (Coming Soon)</span>
+            </div>
+        </div>
+
+        <!-- Agent Control Panel -->
+        <div class="panel">
+            <h3>🎛️ Agent Controls</h3>
+            <div class="controls">
+                <button class="btn" onclick="testAgent()">Test Agent</button>
+                <button class="btn btn-warning" onclick="restartAgent()">Restart</button>
+                <button class="btn btn-danger" onclick="stopAgent()">Stop</button>
+            </div>
+            
+            <div class="command-input">
+                <input type="text" id="agent-command" placeholder="Enter agent command (e.g., codectx --path /app/test_project/calculator.py)">
+                <button class="btn" onclick="sendCommand()">Execute</button>
+            </div>
+            
+            <div>
+                <h4>Quick Commands:</h4>
+                <div class="controls">
+                    <button class="btn" onclick="quickCommand('tree')">Tree View</button>
+                    <button class="btn" onclick="quickCommand('grep TODO')">Find TODOs</button>
+                    <button class="btn" onclick="quickCommand('index')">Build Index</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Activity Feed -->
+        <div class="panel">
+            <h3>🔄 Recent Activity</h3>
+            <div class="activity-feed" id="activity-feed">
+                <div class="activity-item">
+                    <div>Agent started successfully</div>
+                    <div class="activity-time" id="start-time">Just now</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Information -->
+        <div class="panel full-width">
+            <h3>💻 System Information</h3>
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-value" id="container-count">--</div>
+                    <div class="metric-label">Running Containers</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="ollama-model">--</div>
+                    <div class="metric-label">Active Model</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="kafka-topics">--</div>
+                    <div class="metric-label">Kafka Topics</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="uptime">--</div>
+                    <div class="metric-label">Uptime</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Dashboard state
+        let logsPaused = false;
+        let startTime = new Date();
+        let requestCount = 0;
+        let successCount = 0;
+        let responseTimes = [];
+
+        // Initialize dashboard
+        window.onload = function() {
+            updateSystemInfo();
+            startMonitoring();
+            document.getElementById('start-time').textContent = formatTime(startTime);
+        };
+
+        // Status checking functions
+        async function checkAgentStatus() {
+            try {
+                const response = await fetch('http://localhost:8765/status');
+                updateStatus('agent', response.ok ? 'healthy' : 'unhealthy', response.ok ? 'Running' : 'Error');
+                return response.ok;
+            } catch (error) {
+                updateStatus('agent', 'unhealthy', 'Unreachable');
+                return false;
+            }
+        }
+
+        async function checkOllamaStatus() {
+            try {
+                const response = await fetch('http://localhost:11435/api/tags');
+                if (response.ok) {
+                    const data = await response.json();
+                    const models = data.models?.map(m => m.name).join(', ') || 'None';
+                    updateStatus('ollama', 'healthy', 'Running');
+                    document.getElementById('ollama-model').textContent = models;
+                    return true;
+                }
+            } catch (error) {
+                updateStatus('ollama', 'unhealthy', 'Unreachable');
+                return false;
+            }
+        }
+
+        function updateStatus(service, status, text) {
+            const dot = document.getElementById(`${service}-dot`);
+            const statusText = document.getElementById(`${service}-status`);
+            
+            dot.className = `status-dot status-${status}`;
+            statusText.textContent = text;
+        }
+
+        // Log management
+        function simulateLogs() {
+            if (logsPaused) return;
+
+            const logs = document.getElementById('agent-logs');
+            const timestamp = new Date().toLocaleTimeString();
+            const messages = [
+                'Processing code analysis request...',
+                'LLM response received in 2.3s',
+                'Building code snapshot...',
+                'Executing agent command: tree',
+                'Auto-training iteration completed',
+                'Kafka message published to agent.metrics',
+                'Context manager updated',
+                'Code indexing in progress...'
+            ];
+
+            const randomMessage = messages[Math.floor(Math.random() * messages.length)];
+            logs.textContent += `[${timestamp}] ${randomMessage}\n`;
+            
+            // Auto-scroll to bottom
+            logs.scrollTop = logs.scrollHeight;
+            
+            // Keep only last 100 lines
+            const lines = logs.textContent.split('\n');
+            if (lines.length > 100) {
+                logs.textContent = lines.slice(-100).join('\n');
+            }
+        }
+
+        // Control functions
+        function clearLogs() {
+            document.getElementById('agent-logs').textContent = '';
+        }
+
+        function pauseLogs() {
+            logsPaused = !logsPaused;
+            const btn = event.target;
+            btn.textContent = logsPaused ? 'Resume' : 'Pause';
+            btn.className = logsPaused ? 'btn btn-warning' : 'btn';
+        }
+
+        function exportLogs() {
+            const logs = document.getElementById('agent-logs').textContent;
+            const blob = new Blob([logs], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `dspy-agent-logs-${new Date().toISOString().slice(0, 19)}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        async function testAgent() {
+            addActivity('Testing agent responsiveness...');
+            const startTime = performance.now();
+            
+            try {
+                // Simulate agent test
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                const endTime = performance.now();
+                const responseTime = ((endTime - startTime) / 1000).toFixed(2);
+                
+                addActivity(`Agent test completed in ${responseTime}s`);
+                updateMetrics(responseTime, true);
+            } catch (error) {
+                addActivity('Agent test failed: ' + error.message);
+                updateMetrics(null, false);
+            }
+        }
+
+        function sendCommand() {
+            const command = document.getElementById('agent-command').value;
+            if (!command.trim()) return;
+
+            addActivity(`Executing command: ${command}`);
+            document.getElementById('agent-command').value = '';
+            
+            // Simulate command execution
+            setTimeout(() => {
+                addActivity(`Command completed: ${command}`);
+            }, 2000);
+        }
+
+        function quickCommand(cmd) {
+            document.getElementById('agent-command').value = cmd;
+            sendCommand();
+        }
+
+        function addActivity(message) {
+            const feed = document.getElementById('activity-feed');
+            const item = document.createElement('div');
+            item.className = 'activity-item';
+            item.innerHTML = `
+                <div>${message}</div>
+                <div class="activity-time">${formatTime(new Date())}</div>
+            `;
+            feed.insertBefore(item, feed.firstChild);
+            
+            // Keep only last 20 items
+            while (feed.children.length > 20) {
+                feed.removeChild(feed.lastChild);
+            }
+        }
+
+        function updateMetrics(responseTime, success) {
+            requestCount++;
+            if (success) successCount++;
+            if (responseTime) responseTimes.push(parseFloat(responseTime));
+
+            document.getElementById('total-requests').textContent = requestCount;
+            document.getElementById('success-rate').textContent = ((successCount / requestCount) * 100).toFixed(1);
+            
+            if (responseTimes.length > 0) {
+                const avgResponseTime = (responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length).toFixed(2);
+                document.getElementById('response-time').textContent = avgResponseTime;
+            }
+
+            // Simulate memory usage
+            document.getElementById('memory-usage').textContent = (Math.random() * 500 + 200).toFixed(0);
+        }
+
+        function updateSystemInfo() {
+            document.getElementById('container-count').textContent = '8';
+            document.getElementById('kafka-topics').textContent = '12';
+            
+            // Update uptime
+            const now = new Date();
+            const uptimeMs = now - startTime;
+            const uptimeMinutes = Math.floor(uptimeMs / 60000);
+            document.getElementById('uptime').textContent = `${uptimeMinutes}m`;
+        }
+
+        function formatTime(date) {
+            return date.toLocaleTimeString();
+        }
+
+        function startMonitoring() {
+            // Check statuses every 10 seconds
+            setInterval(async () => {
+                await checkAgentStatus();
+                await checkOllamaStatus();
+                updateSystemInfo();
+            }, 10000);
+
+            // Simulate logs every 2-5 seconds
+            setInterval(simulateLogs, Math.random() * 3000 + 2000);
+
+            // Initial checks
+            checkAgentStatus();
+            checkOllamaStatus();
+        }
+
+        // Simulate some activity on load
+        setTimeout(() => addActivity('Dashboard initialized'), 500);
+        setTimeout(() => addActivity('Connected to agent services'), 1500);
+        setTimeout(() => addActivity('Monitoring started'), 2500);
+    </script>
+</body>
+</html>

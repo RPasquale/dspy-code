@@ -11,12 +11,18 @@ from collections import deque
 import dspy
 from types import SimpleNamespace
 
+from ..db import (
+    get_enhanced_data_manager, ActionRecord, LogEntry, 
+    Environment, ActionType, AgentState, 
+    create_action_record, create_log_entry
+)
+
 
 TOOLS = [
     "context", "plan", "grep", "extract", "tree", "ls",
     "codectx", "index", "esearch", "emb_index", "emb_search", "knowledge", "vretr", "intel",
-    "open", "watch", "sg", "patch", "diff", "git_status",
-    "git_add", "git_commit"
+    "edit", "patch", "run_tests", "lint", "build",
+    "open", "watch", "sg", "diff", "git_status", "git_add", "git_commit"
 ]
 
 
@@ -244,27 +250,90 @@ class Orchestrator(dspy.Module):
         self.prediction_cache: Dict[str, Any] = {}
         self.last_cache_cleanup = time.time()
         
+        # RedDB integration
+        self.data_manager = get_enhanced_data_manager()
+        self.session_id = f"orchestrator_{int(time.time())}"
+        
         # Initialize memory if workspace provided
         if workspace:
             self.memory = SessionMemory(workspace)
+            
+        # Log orchestrator initialization
+        init_log = create_log_entry(
+            level="INFO",
+            source="skills.orchestrator",
+            message=f"Orchestrator initialized with session: {self.session_id}",
+            context={
+                "session_id": self.session_id,
+                "use_cot": use_cot,
+                "workspace": str(workspace) if workspace else None
+            },
+            environment=Environment.DEVELOPMENT
+        )
+        self.data_manager.log(init_log)
 
     def __call__(self, query: str, state: str, memory: Optional[SessionMemory] = None):
         """Enhanced forward with memory, caching, and performance tracking"""
+        overall_start_time = time.time()
+        
         # Use provided memory or instance memory
         active_memory = memory or self.memory
         
+        # Record initial state for action tracking
+        initial_state = {
+            "query": query,
+            "state": state,
+            "has_memory": active_memory is not None,
+            "cache_size": len(self.prediction_cache)
+        }
+        
         # Add memory context to state
+        enhanced_state = state
         if active_memory:
             context = active_memory.get_context_for_query(query)
             if context:
-                state = f"{state} | Memory context: {context}"
+                enhanced_state = f"{state} | Memory context: {context}"
+                initial_state["memory_context_added"] = True
         
         # Check cache first
-        cache_key = self._get_cache_key(query, state)
+        cache_key = self._get_cache_key(query, enhanced_state)
+        cache_hit = False
         if cache_key in self.prediction_cache:
             cached_result = self.prediction_cache[cache_key]
             # Only use cache if less than 2 minutes old
             if time.time() - cached_result.get('timestamp', 0) < 120:
+                cache_hit = True
+                execution_time = time.time() - overall_start_time
+                
+                # Log cache hit
+                cache_log = create_log_entry(
+                    level="DEBUG",
+                    source="skills.orchestrator",
+                    message=f"Cache hit for query: {query[:50]}...",
+                    context={
+                        "session_id": self.session_id,
+                        "cache_key": cache_key,
+                        "execution_time": execution_time,
+                        "tool": cached_result['tool']
+                    },
+                    environment=Environment.DEVELOPMENT
+                )
+                self.data_manager.log(cache_log)
+                
+                # Record cache hit action
+                cache_action = create_action_record(
+                    action_type=ActionType.TOOL_SELECTION,
+                    state_before=initial_state,
+                    state_after={"tool": cached_result['tool'], "cached": True},
+                    parameters={"query": query, "cache_hit": True},
+                    result={"tool": cached_result['tool'], "args_json": cached_result['args_json']},
+                    reward=0.9,  # High reward for cache hits
+                    confidence=0.95,
+                    execution_time=execution_time,
+                    environment=Environment.DEVELOPMENT
+                )
+                self.data_manager.record_action(cache_action)
+                
                 return SimpleNamespace(
                     tool=cached_result['tool'],
                     args_json=cached_result['args_json'],
@@ -278,13 +347,16 @@ class Orchestrator(dspy.Module):
             self.last_cache_cleanup = time.time()
         
         # Predict tool selection with error handling and validation
-        start_time = time.time()
+        prediction_start_time = time.time()
+        success = True
+        error_msg = None
+        
         try:
-            pred = self.predict(query=query, state=state)
-            execution_time = time.time() - start_time
+            pred = self.predict(query=query, state=enhanced_state)
+            prediction_time = time.time() - prediction_start_time
             
             # Cache successful predictions
-            if execution_time < 3.0:  # Only cache fast predictions
+            if prediction_time < 3.0:  # Only cache fast predictions
                 self.prediction_cache[cache_key] = {
                     'tool': pred.tool,
                     'args_json': pred.args_json,
@@ -293,17 +365,116 @@ class Orchestrator(dspy.Module):
                 }
             
         except Exception as e:
-            # Sensible default fallback when routing fails
-            return SimpleNamespace(
+            success = False
+            error_msg = str(e)
+            prediction_time = time.time() - prediction_start_time
+            
+            # Log prediction error
+            error_log = create_log_entry(
+                level="ERROR",
+                source="skills.orchestrator",
+                message=f"Prediction failed for query: {query[:50]}...",
+                context={
+                    "session_id": self.session_id,
+                    "error": error_msg,
+                    "prediction_time": prediction_time
+                },
+                environment=Environment.DEVELOPMENT
+            )
+            self.data_manager.log(error_log)
+            
+            # Create fallback prediction
+            pred = SimpleNamespace(
                 tool="plan",
                 args_json="{}",
                 rationale=f"Fallback to 'plan' due to prediction error: {e}",
                 cached=False
             )
 
+        # Validate tool selection
         tool = (getattr(pred, "tool", None) or "").strip()
         if tool not in TOOLS:
+            success = False
+            error_msg = f"Invalid tool '{tool}' not in TOOLS"
+            
+            # Log validation error
+            validation_log = create_log_entry(
+                level="ERROR",
+                source="skills.orchestrator",
+                message=f"Invalid tool selected: {tool}",
+                context={
+                    "session_id": self.session_id,
+                    "tool": tool,
+                    "valid_tools": TOOLS,
+                    "query": query[:100]
+                },
+                environment=Environment.DEVELOPMENT
+            )
+            self.data_manager.log(validation_log)
+            
             raise ValueError(f"Predicted tool '{tool}' is not in supported TOOLS: {', '.join(TOOLS)}")
+
+        # Calculate final metrics
+        total_execution_time = time.time() - overall_start_time
+        
+        # Determine reward based on performance and success
+        reward = 0.8 if success else 0.3
+        if total_execution_time < 0.5:
+            reward += 0.1  # Bonus for fast execution
+        if cache_hit:
+            reward += 0.1  # Bonus for cache efficiency
+        
+        confidence = 0.9 if success else 0.5
+        
+        # Record the orchestration action
+        final_state = {
+            "tool": tool,
+            "args_json": getattr(pred, 'args_json', '{}'),
+            "rationale": getattr(pred, 'rationale', ''),
+            "success": success,
+            "cached": cache_hit
+        }
+        
+        orchestration_action = create_action_record(
+            action_type=ActionType.TOOL_SELECTION,
+            state_before=initial_state,
+            state_after=final_state,
+            parameters={
+                "query": query,
+                "enhanced_state": enhanced_state,
+                "cache_checked": True,
+                "cache_hit": cache_hit
+            },
+            result={
+                "tool": tool,
+                "args_json": getattr(pred, 'args_json', '{}'),
+                "success": success,
+                "error": error_msg
+            },
+            reward=reward,
+            confidence=confidence,
+            execution_time=total_execution_time,
+            environment=Environment.DEVELOPMENT
+        )
+        self.data_manager.record_action(orchestration_action)
+        
+        # Log successful orchestration
+        if success:
+            success_log = create_log_entry(
+                level="INFO",
+                source="skills.orchestrator",
+                message=f"Successfully orchestrated tool '{tool}' for query: {query[:50]}...",
+                context={
+                    "session_id": self.session_id,
+                    "tool": tool,
+                    "execution_time": total_execution_time,
+                    "reward": reward,
+                    "confidence": confidence,
+                    "cache_hit": cache_hit
+                },
+                environment=Environment.DEVELOPMENT
+            )
+            self.data_manager.log(success_log)
 
         return pred
     

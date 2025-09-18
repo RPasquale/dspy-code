@@ -111,10 +111,11 @@ class RedDBStorage:
         with _req.urlopen(req, timeout=5): return None
 
 
-def get_storage() -> Optional[Storage]:
+def get_storage() -> Storage:
     from .config import get_settings
     s = get_settings()
     if s.db_backend.lower() == "reddb":
         return RedDBStorage(url=s.reddb_url, namespace=s.reddb_namespace or "dspy")
-    return None
+    # Always return a storage instance, even if it's in-memory fallback
+    return RedDBStorage(url=None, namespace=s.reddb_namespace or "dspy")
 

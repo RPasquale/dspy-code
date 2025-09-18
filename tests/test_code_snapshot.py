@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from dspy_agent.code_snapshot import build_code_snapshot
+from dspy_agent.code_tools.code_snapshot import build_code_snapshot
 
 
 class TestCodeSnapshot(unittest.TestCase):

@@ -33,18 +33,16 @@ RedDB = "https://github.com/redbco/redb-open.git"
 
 [project.optional-dependencies]
 rl = [
-    "pufferlib>=0.5.0",
+    "pufferlib>=3.0.0",
     "gymnasium>=0.27",
     "torch>=2.0.0",
     "verifiers @ git+https://github.com/willccbb/verifiers.git",
+    "pyro-ppl>=1.9.0",
 ]
 
 [tool.uv]
 dev-dependencies = []
 package = true
-
-[tool.setuptools]
-packages = []
 
 [tool.setuptools.packages.find]
 include = ["dspy_agent", "dspy_agent.*"]

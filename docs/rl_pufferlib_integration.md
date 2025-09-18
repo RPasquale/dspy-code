@@ -21,7 +21,10 @@ CLI commands:
 - `dspy-agent rl train`: Train with real toolchain executor (tests/lint/build). Supports bandit or `--neural` trainer. Add `--puffer` to enable PufferLib vectorization.
 - `dspy-agent rl eval`: Evaluate with the same wiring (stub; extend for checkpoints).
 - `dspy-agent rl tune`: Simple epsilon sweep for epsilon-greedy.
+- `dspy-agent rl sweep`: Run a PufferLib-backed hyperparameter search and persist the best config per repo.
 - `dspy-agent rl ppo`: Run a PuffeRL PPO example shell on the same env.
+- `dspy-agent rl guide`: Print research-backed hyperparameter ranges (temperature, entropy, clip settings, curriculum stages).
+- `dspy-agent rl async-train`: Launch the asynchronous rollout→judge→learner pipeline that streams knowledge-graph features into the policy.
 
 ## Toolchain Environment
 
@@ -31,7 +34,10 @@ The environment wraps the toolchain behind a discrete action space:
 
 Observation vector: `obs = [verifier_scores...] + context_features` where:
 - `verifier_scores` are scaled/clamped per `RewardConfig`.
-- `context_features` come from Kafka/Spark (optional) and should be normalized.
+- `context_features` combine Kafka/Spark (optional) counters **and** knowledge-graph
+  retrieval signals sourced from `.dspy_agentic` and RedDB (precision, coverage,
+  average retrieval score, query volume). All features are normalized before
+  reaching the policy.
 
 Extend the action set by adding new enum values in `ToolAction` and updating your executor mapping.
 
@@ -98,6 +104,31 @@ RL_VERIFIERS_MODULE=verifiers dspy-agent rl train --steps 1000 --neural --n-envs
 # PuffeRL PPO example shell
 RL_VERIFIERS_MODULE=verifiers dspy-agent rl ppo --n-envs 8 --total-steps 200000
 ```
+
+### Hyperparameter Sweep Quickstart
+
+Leverage the sweep wrapper to tune bandit/RL hyperparameters automatically:
+
+```
+dspy-agent rl sweep --workspace . --iterations 20 --update-config
+```
+
+The command evaluates candidate configurations with the live toolchain,
+persists the best result to `.dspy/rl/best.json`, and (with
+`--update-config`) refreshes `.dspy_rl.json` so future runs inherit the
+optimised settings.
+
+### Asynchronous Trainer
+
+The async trainer keeps samplers, judges, and the learner busy while
+emitting retrieval-quality rewards and structured memory features:
+
+```
+dspy-agent rl async-train --workspace . --rollout-workers 3 --judge-workers 3 --wall-clock 180
+```
+
+Combine this with `dspy-agent rl guide` to ensure temperature, entropy, and
+clip settings stay within the recommended bands.
 
 ## Kafka/Spark Context
 

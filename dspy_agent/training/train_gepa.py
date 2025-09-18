@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from datetime import datetime
 
 import dspy
+
+from ..db import get_enhanced_data_manager, TrainingMetrics, Environment, create_log_entry
 
 
 def _read_jsonl(path: Path) -> List[dict]:
@@ -148,11 +151,71 @@ def _score_of(res) -> float:
     return 0.0
 
 
-def make_logging_metric(module: str, progress_path: Optional[str]) -> Callable:
+def make_logging_metric(module: str, progress_path: Optional[str], session_id: Optional[str] = None) -> Callable:
     base_metric = metric_for_module(module)
+    data_manager = get_enhanced_data_manager()
 
     def logging_metric(gold: dspy.Example, pred: dspy.Prediction, trace=None, pred_name=None, pred_trace=None):
         res = base_metric(gold, pred, trace=trace, pred_name=pred_name, pred_trace=pred_trace)
+        score = _score_of(res)
+        
+        # Store in RedDB
+        try:
+            training_metrics = TrainingMetrics(
+                session_id=session_id or f"{module}_gepa_{int(time.time())}",
+                timestamp=time.time(),
+                epoch=getattr(pred, 'epoch', 1),
+                training_accuracy=score,
+                validation_accuracy=score,
+                loss=1.0 - score,  # Convert score to loss
+                learning_rate=0.001,  # Default learning rate
+                batch_size=1,
+                model_type="gepa",
+                environment=Environment.DEVELOPMENT,
+                hyperparameters={
+                    "module": module,
+                    "split": getattr(gold, "split", "train"),
+                    "auto_mode": "light"
+                },
+                convergence_metrics={
+                    "feedback": res.get("feedback", "") if isinstance(res, dict) else "",
+                    "score": score,
+                    "execution_time": time.time()
+                }
+            )
+            data_manager.store_training_metrics(training_metrics)
+            
+            # Log the training step
+            log_entry = create_log_entry(
+                level="INFO",
+                source=f"training.{module}",
+                message=f"Training step completed with score: {score:.3f}",
+                context={
+                    "session_id": training_metrics.session_id,
+                    "module": module,
+                    "score": score,
+                    "split": getattr(gold, "split", "train"),
+                    "feedback": res.get("feedback", "") if isinstance(res, dict) else ""
+                },
+                environment=Environment.DEVELOPMENT
+            )
+            data_manager.log(log_entry)
+            
+        except Exception as e:
+            # Fallback logging if RedDB fails
+            error_log = create_log_entry(
+                level="ERROR",
+                source=f"training.{module}",
+                message=f"Failed to store training metrics in RedDB: {str(e)}",
+                context={"error": str(e), "module": module},
+                environment=Environment.DEVELOPMENT
+            )
+            try:
+                data_manager.log(error_log)
+            except:
+                pass  # Silent fallback
+        
+        # Maintain file logging for backward compatibility
         if progress_path:
             try:
                 p = Path(progress_path)
@@ -161,14 +224,15 @@ def make_logging_metric(module: str, progress_path: Optional[str]) -> Callable:
                     "ts": datetime.utcnow().isoformat(),
                     "module": module,
                     "split": getattr(gold, "split", "train"),
-                    "score": _score_of(res),
+                    "score": score,
                 }
                 with p.open("a") as f:
                     f.write(json.dumps(rec) + "\n")
             except Exception:
                 pass
+        
         # Return a pure float score to be robust across DSPy versions
-        return _score_of(res)
+        return score
 
     return logging_metric
 
@@ -200,10 +264,47 @@ def run_gepa(
     progress_path: Optional[str] = None,
     code_summary: Optional[str] = None,
 ) -> dspy.Module:
+    # Generate unique session ID
+    session_id = f"{module}_gepa_{int(time.time())}"
+    data_manager = get_enhanced_data_manager()
+    
+    # Log training session start
+    start_log = create_log_entry(
+        level="INFO",
+        source=f"training.{module}",
+        message=f"Starting GEPA {module} training session: {session_id}",
+        context={
+            "session_id": session_id,
+            "module": module,
+            "train_jsonl": str(train_jsonl),
+            "auto": auto,
+            "max_full_evals": max_full_evals,
+            "max_metric_calls": max_metric_calls,
+            "track_stats": track_stats
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(start_log)
+    
     trainset = load_examples_for_module(module, train_jsonl, code_summary=code_summary)
     for ex in trainset:
         setattr(ex, "split", "train")
-    metric = make_logging_metric(module, progress_path)
+    
+    # Log dataset info
+    dataset_log = create_log_entry(
+        level="INFO",
+        source=f"training.{module}",
+        message=f"Loaded training dataset with {len(trainset)} examples",
+        context={
+            "session_id": session_id,
+            "module": module,
+            "dataset_size": len(trainset)
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(dataset_log)
+    
+    metric = make_logging_metric(module, progress_path, session_id)
 
     if not (auto or max_full_evals or max_metric_calls):
         auto = "light"
@@ -218,7 +319,28 @@ def run_gepa(
         track_stats=track_stats,
     )
     student = student_module(module)
+    
+    # Time the compilation
+    compile_start = time.time()
     optimized = gepa.compile(student, trainset=trainset, valset=trainset)
+    compile_time = time.time() - compile_start
+    
+    # Log training completion
+    completion_log = create_log_entry(
+        level="INFO",
+        source=f"training.{module}",
+        message=f"Completed GEPA {module} training session: {session_id}",
+        context={
+            "session_id": session_id,
+            "module": module,
+            "compile_time": compile_time,
+            "dataset_size": len(trainset),
+            "auto_mode": auto
+        },
+        environment=Environment.DEVELOPMENT
+    )
+    data_manager.log(completion_log)
+    
     return optimized
 
 

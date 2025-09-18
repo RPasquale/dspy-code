@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from ..db.factory import get_storage
+from ..streaming.kafka_log import get_kafka_logger
 from .deploy_model import (
     DEPLOY_LOG_STREAM,
     DEPLOY_EVENT_STREAM,
@@ -47,7 +48,6 @@ class DeploymentLogger:
         self.storage = get_storage()
         # Optional Kafka for deployment logs
         try:
-            from .kafka_log import get_kafka_logger
             self.kafka = get_kafka_logger()
         except Exception:
             self.kafka = None

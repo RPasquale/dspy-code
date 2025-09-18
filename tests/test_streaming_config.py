@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from dspy_agent.streaming_config import StreamConfig, save_config, load_config
+from dspy_agent.streaming.streaming_config import StreamConfig, save_config, load_config
 
 
 def test_stream_config_roundtrip(tmp_path: Path):

@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from dspy_agent.indexer import (
+from dspy_agent.embedding.indexer import (
     tokenize,
     iter_chunks,
     build_index,

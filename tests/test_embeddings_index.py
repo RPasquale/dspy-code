@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from dspy_agent.embeddings_index import (
+from dspy_agent.embedding.embeddings_index import (
     build_emb_index,
     save_emb_index,
     load_emb_index,

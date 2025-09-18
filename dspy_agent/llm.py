@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 import dspy
 
@@ -13,7 +13,7 @@ import urllib.request as _req
 import urllib.error as _err
 
 
-def _clamp_litellm_timeout(max_seconds: int = 30) -> None:
+def _clamp_litellm_timeout(max_seconds: int = 120) -> None:
     """Ensure LiteLLM timeouts are not excessively high.
 
     Some LiteLLM adapters default to 600s when environment is unset or mis-set.
@@ -78,11 +78,24 @@ def _truthy(env: str, default: bool = False) -> bool:
     return val.lower() in {"1", "true", "yes", "on"}
 
 
+_SAMPLING_HINTS: Dict[str, float] = {}
+
+
+def get_sampling_hints() -> Dict[str, float]:
+    """Return the most recently applied sampling hints (temperature, entropy, etc.)."""
+
+    return dict(_SAMPLING_HINTS)
+
+
 def configure_lm(
     provider: Optional[str] = None,
     model_name: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    temperature: Optional[float] = None,
+    target_entropy: Optional[float] = None,
+    clip_higher: Optional[float] = None,
 ) -> Optional[dspy.LM]:
     settings = get_settings()
     if settings.local_mode:
@@ -147,6 +160,29 @@ def configure_lm(
         "max_retries": 2,
         "num_retries": 2,
     })
+
+    if temperature is not None:
+        try:
+            temp_val = float(temperature)
+            lm_kwargs["temperature"] = temp_val
+            _SAMPLING_HINTS["temperature"] = temp_val
+            os.environ["DSPY_SAMPLING_TEMPERATURE"] = f"{temp_val:.4f}"
+        except Exception:
+            pass
+    if target_entropy is not None:
+        try:
+            entropy_val = float(target_entropy)
+            _SAMPLING_HINTS["target_entropy"] = entropy_val
+            os.environ["DSPY_TARGET_ENTROPY"] = f"{entropy_val:.4f}"
+        except Exception:
+            pass
+    if clip_higher is not None:
+        try:
+            clip_val = float(clip_higher)
+            _SAMPLING_HINTS["clip_higher"] = clip_val
+            os.environ["DSPY_CLIP_HIGHER"] = f"{clip_val:.4f}"
+        except Exception:
+            pass
     
     lm = dspy.LM(
         model=provider_model,

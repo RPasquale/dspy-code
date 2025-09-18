@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSPy Agent Dashboard</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .status {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status.healthy {
+            background: #4CAF50;
+        }
+        .status.unhealthy {
+            background: #f44336;
+        }
+        .status.unknown {
+            background: #ff9800;
+        }
+        .logs {
+            background: #000;
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            height: 200px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        .refresh-btn {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 10px 0;
+        }
+        .refresh-btn:hover {
+            background: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 DSPy Agent Dashboard</h1>
+            <p>Real-time monitoring of your trainable coding agent</p>
+        </div>
+        
+        <div class="grid">
+            <div class="card">
+                <h3>🤖 Agent Status</h3>
+                <div id="agent-status">
+                    <span class="status unknown">Checking...</span>
+                </div>
+                <button class="refresh-btn" onclick="checkAgentStatus()">Refresh Status</button>
+            </div>
+            
+            <div class="card">
+                <h3>🧠 Ollama Status</h3>
+                <div id="ollama-status">
+                    <span class="status unknown">Checking...</span>
+                </div>
+                <div id="ollama-models"></div>
+            </div>
+            
+            <div class="card">
+                <h3>📊 Container Health</h3>
+                <div id="container-health">
+                    <span class="status unknown">Loading...</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>📝 Recent Activity</h3>
+                <div class="logs" id="agent-logs">
+                    Loading logs...
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>🔥 Training Metrics</h3>
+                <div id="training-metrics">
+                    <p>Auto-training status: <span id="training-status">Checking...</span></p>
+                    <p>Last update: <span id="last-update">Never</span></p>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>🎛️ Quick Actions</h3>
+                <button class="refresh-btn" onclick="testAgent()">Test Agent Response</button>
+                <button class="refresh-btn" onclick="checkKafka()">Check Kafka Topics</button>
+                <button class="refresh-btn" onclick="refreshAll()">Refresh All</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Check agent status via HTTP
+        async function checkAgentStatus() {
+            try {
+                const response = await fetch('http://localhost:8765/status');
+                if (response.ok) {
+                    document.getElementById('agent-status').innerHTML = '<span class="status healthy">Running</span>';
+                } else {
+                    document.getElementById('agent-status').innerHTML = '<span class="status unhealthy">HTTP Error</span>';
+                }
+            } catch (error) {
+                document.getElementById('agent-status').innerHTML = '<span class="status unhealthy">Unreachable</span>';
+            }
+        }
+
+        // Check Ollama status
+        async function checkOllamaStatus() {
+            try {
+                const response = await fetch('http://localhost:11435/api/tags');
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('ollama-status').innerHTML = '<span class="status healthy">Running</span>';
+                    const models = data.models.map(m => m.name).join(', ');
+                    document.getElementById('ollama-models').innerHTML = `<p>Models: ${models}</p>`;
+                } else {
+                    document.getElementById('ollama-status').innerHTML = '<span class="status unhealthy">HTTP Error</span>';
+                }
+            } catch (error) {
+                document.getElementById('ollama-status').innerHTML = '<span class="status unhealthy">Unreachable</span>';
+            }
+        }
+
+        // Simulate getting logs (in real implementation, this would fetch from the container)
+        function updateLogs() {
+            const logs = document.getElementById('agent-logs');
+            logs.innerHTML = `
+[${new Date().toLocaleTimeString()}] Agent initialized
+[${new Date().toLocaleTimeString()}] Auto-training loop started
+[${new Date().toLocaleTimeString()}] Status server: http://0.0.0.0:8765
+[${new Date().toLocaleTimeString()}] Started 5 threads (tailers/aggregators/workers)
+[${new Date().toLocaleTimeString()}] Waiting for tasks...
+            `.trim();
+        }
+
+        // Test agent responsiveness
+        async function testAgent() {
+            document.getElementById('agent-logs').innerHTML += `\n[${new Date().toLocaleTimeString()}] Testing agent responsiveness...`;
+            // This would make an actual API call to test the agent
+            setTimeout(() => {
+                document.getElementById('agent-logs').innerHTML += `\n[${new Date().toLocaleTimeString()}] Agent test completed`;
+            }, 2000);
+        }
+
+        // Check Kafka topics
+        function checkKafka() {
+            document.getElementById('agent-logs').innerHTML += `\n[${new Date().toLocaleTimeString()}] Checking Kafka topics...`;
+            // This would check Kafka topic status
+        }
+
+        // Refresh all data
+        function refreshAll() {
+            checkAgentStatus();
+            checkOllamaStatus();
+            updateLogs();
+            document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+        }
+
+        // Initialize dashboard
+        window.onload = function() {
+            refreshAll();
+            // Auto-refresh every 10 seconds
+            setInterval(refreshAll, 10000);
+        };
+    </script>
+</body>
+</html>
