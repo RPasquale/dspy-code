@@ -8,8 +8,10 @@ from __future__ import annotations
 # dspy_agent.rl.__init__ for stable imports.
 
 import json
+import os
 import math
 import random
+import shlex
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -26,6 +28,11 @@ class ToolAction(IntEnum):
     LINT = 1
     BUILD = 2
     PATCH = 3
+    SHELL_LS = 4
+    SHELL_PWD = 5
+    SHELL_CAT = 6
+    SHELL_CD = 7
+    SHELL_RUN = 8
 
     @classmethod
     def names(cls) -> List[str]:
@@ -51,6 +58,17 @@ class ToolAction(IntEnum):
             aliases = {
                 'tests': cls.RUN_TESTS,
                 'test': cls.RUN_TESTS,
+                'ls': cls.SHELL_LS,
+                'list': cls.SHELL_LS,
+                'pwd': cls.SHELL_PWD,
+                'cat': cls.SHELL_CAT,
+                'view': cls.SHELL_CAT,
+                'cd': cls.SHELL_CD,
+                'chdir': cls.SHELL_CD,
+                'shell': cls.SHELL_RUN,
+                'sh': cls.SHELL_RUN,
+                'run': cls.SHELL_RUN,
+                'cli': cls.SHELL_RUN,
             }
             if normalized in aliases:
                 return aliases[normalized]
@@ -346,8 +364,11 @@ def bandit_trainer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig) -> Epi
 
 def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig, backend: str = "multiprocessing") -> EpisodeStats:
     try:
-        import pufferlib.emulation as emulation  # type: ignore
-        import pufferlib.vector as pvector  # type: ignore
+        try:
+            import pufferlib.emulation as emulation  # type: ignore
+            import pufferlib.vector as pvector  # type: ignore
+        except ImportError:
+            raise ImportError("PufferLib not available. Install with: pip install pufferlib>=3.0.0")
     except Exception as e:  # pragma: no cover - optional
         raise RuntimeError("PufferLib not available. Install with 'pip install .[rl]'") from e
     tmp_env = make_env(); n_actions = tmp_env.action_dim
@@ -377,8 +398,11 @@ def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000,
     # Try PufferLib vectorized env for speed
     using_vec = False
     try:
-        import pufferlib.emulation as emulation  # type: ignore
-        import pufferlib.vector as pvector  # type: ignore
+        try:
+            import pufferlib.emulation as emulation  # type: ignore
+            import pufferlib.vector as pvector  # type: ignore
+        except ImportError:
+            raise ImportError("PufferLib not available. Install with: pip install pufferlib>=3.0.0")
         def creator(): return emulation.GymnasiumPufferEnv(make_env())
         venv = pvector.make(creator, num_envs=max(1, n_envs), backend="multiprocessing")
         tmp = make_env(); act_dim = tmp.action_dim
@@ -490,11 +514,35 @@ class ToolchainConfig:
     lint_cmd: Optional[str] = None
     build_cmd: Optional[str] = None
     timeout_sec: int = 180
+    shell_timeout: int = 60
+    shell_defaults: Dict[str, str] = field(default_factory=dict)
 
 
 class ToolchainExecutor:
     def __init__(self, cfg: ToolchainConfig) -> None:
         self.cfg = cfg
+        self._workspace_root = cfg.workspace.resolve()
+        self._cwd = self._workspace_root
+
+    def _is_within_workspace(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self._workspace_root)
+            return True
+        except Exception:
+            return False
+
+    def _resolve_within_workspace(self, base: Path, target: str) -> Path:
+        candidate = Path(target or '.')
+        resolved = (base / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+        if not self._is_within_workspace(resolved):
+            raise ValueError(f'Path {resolved} outside workspace')
+        return resolved
+
+    def _shell_timeout(self, override: Optional[object]) -> int:
+        try:
+            return int(override or self.cfg.shell_timeout or max(30, self.cfg.timeout_sec // 2))
+        except Exception:
+            return self.cfg.shell_timeout or max(30, self.cfg.timeout_sec // 2)
     def _log_patch_attempt(self, workspace: Path, record: Dict[str, Any]) -> None:
         try:
             path = workspace / '.dspy_patches' / 'history.jsonl'
@@ -679,13 +727,100 @@ class ToolchainExecutor:
                     pass
             result_status = 'success' if float(metrics.get('pass_rate', 0.0)) >= 1.0 and metrics.get('applied') else 'failure'
             return _finalize(result_status)
+        elif tool == ToolAction.SHELL_LS:
+            cmd = args.get('cmd') or self.cfg.shell_defaults.get('shell_ls') or 'ls -lah'
+            timeout = self._shell_timeout(args.get('timeout'))
+            ok, out, dt = _run(str(cmd), self._cwd, timeout)
+            metrics.update({
+                'shell_exit_code': 0 if ok else 1,
+                'shell_stdout_lines': len(out.splitlines()),
+                'shell_cmd': str(cmd),
+                'cwd': str(self._cwd),
+            })
+            info.update({'stdout': out[-4000:], 'duration_sec': dt})
+        elif tool == ToolAction.SHELL_PWD:
+            cmd = args.get('cmd') or self.cfg.shell_defaults.get('shell_pwd') or 'pwd'
+            timeout = self._shell_timeout(args.get('timeout'))
+            ok, out, dt = _run(str(cmd), self._cwd, timeout)
+            metrics.update({
+                'shell_exit_code': 0 if ok else 1,
+                'shell_stdout': out.strip(),
+                'shell_cmd': str(cmd),
+                'cwd': str(self._cwd),
+            })
+            info.update({'stdout': out[-4000:], 'duration_sec': dt})
+        elif tool == ToolAction.SHELL_CAT:
+            target = args.get('path') or self.cfg.shell_defaults.get('shell_cat') or ''
+            try:
+                path = self._resolve_within_workspace(self._cwd, target) if target else None
+                if path is None or not path.exists():
+                    fallback = self._cwd / 'README.md'
+                    if fallback.exists():
+                        path = fallback.resolve()
+                    else:
+                        for candidate in self._cwd.iterdir():
+                            if candidate.is_file():
+                                path = candidate.resolve()
+                                break
+                if path is None:
+                    raise FileNotFoundError('no file available for shell_cat')
+                cmd = args.get('cmd') or self.cfg.shell_defaults.get('shell_cat_cmd') or f"head -n 200 {shlex.quote(str(path))}"
+                timeout = self._shell_timeout(args.get('timeout'))
+                ok, out, dt = _run(str(cmd), self._cwd, timeout)
+                metrics.update({
+                    'shell_exit_code': 0 if ok else 1,
+                    'shell_bytes': len(out.encode('utf-8', errors='ignore')),
+                    'shell_cmd': str(cmd),
+                    'shell_target': str(path),
+                    'cwd': str(self._cwd),
+                })
+                info.update({'stdout': out[-4000:], 'duration_sec': dt, 'target': str(path)})
+            except Exception as exc:
+                metrics.update({'shell_exit_code': 1, 'shell_cmd': 'cat', 'shell_error': str(exc), 'cwd': str(self._cwd)})
+                info.update({'error': str(exc)})
+        elif tool == ToolAction.SHELL_CD:
+            target = args.get('path') or self.cfg.shell_defaults.get('shell_cd') or '.'
+            try:
+                new_cwd = self._resolve_within_workspace(self._cwd, target)
+                if not new_cwd.is_dir():
+                    raise NotADirectoryError(str(new_cwd))
+                self._cwd = new_cwd
+                metrics.update({'shell_cd_ok': 1.0, 'cwd': str(self._cwd)})
+                info.update({'cwd': str(self._cwd)})
+            except Exception as exc:
+                metrics.update({'shell_cd_ok': 0.0, 'shell_error': str(exc), 'cwd': str(self._cwd)})
+                info.update({'error': str(exc)})
+        elif tool == ToolAction.SHELL_RUN:
+            cmd = args.get('cmd') or self.cfg.shell_defaults.get('shell_run')
+            if not cmd:
+                metrics.update({'shell_exit_code': 1, 'shell_error': 'no command provided', 'cwd': str(self._cwd)})
+                info.update({'error': 'no command provided'})
+            else:
+                timeout = self._shell_timeout(args.get('timeout'))
+                ok, out, dt = _run(str(cmd), self._cwd, timeout)
+                metrics.update({
+                    'shell_exit_code': 0 if ok else 1,
+                    'shell_stdout_lines': len(out.splitlines()),
+                    'shell_cmd': str(cmd),
+                    'cwd': str(self._cwd),
+                })
+                info.update({'stdout': out[-4000:], 'duration_sec': dt})
         else:
             info.update({"warning": f"unhandled tool: {tool}"})
         if "blast_radius" not in metrics: metrics["blast_radius"] = 0.0
         return AgentResult(metrics=metrics, info=info)
 
 
-def detect_toolchain(workspace: Path, *, test_cmd: Optional[str] = None, lint_cmd: Optional[str] = None, build_cmd: Optional[str] = None, timeout_sec: Optional[int] = None) -> ToolchainConfig:
+def detect_toolchain(
+    workspace: Path,
+    *,
+    test_cmd: Optional[str] = None,
+    lint_cmd: Optional[str] = None,
+    build_cmd: Optional[str] = None,
+    timeout_sec: Optional[int] = None,
+    shell_timeout: Optional[int] = None,
+    shell_defaults: Optional[Mapping[str, str]] = None,
+) -> ToolchainConfig:
     ws = workspace.resolve()
     test_cmd = test_cmd or None
     lint_cmd = lint_cmd or None
@@ -693,7 +828,30 @@ def detect_toolchain(workspace: Path, *, test_cmd: Optional[str] = None, lint_cm
     if not test_cmd and (ws / "tests").exists(): test_cmd = "pytest -q"
     if not lint_cmd: lint_cmd = "ruff check --output-format json ."
     if not build_cmd: build_cmd = "python -m compileall -q ."
-    return ToolchainConfig(workspace=ws, test_cmd=test_cmd, lint_cmd=lint_cmd, build_cmd=build_cmd, timeout_sec=int(timeout_sec or 180))
+    env_shell_timeout = os.getenv('RL_SHELL_TIMEOUT')
+    timeout_val = int(timeout_sec or 180)
+    if shell_timeout is None:
+        try:
+            shell_timeout = int(env_shell_timeout) if env_shell_timeout else max(30, timeout_val // 2)
+        except Exception:
+            shell_timeout = max(30, timeout_val // 2)
+    defaults: Dict[str, str] = {}
+    if shell_defaults:
+        defaults.update({str(k): str(v) for k, v in shell_defaults.items()})
+    for key in ('shell_ls', 'shell_pwd', 'shell_cat', 'shell_cat_cmd', 'shell_cd', 'shell_run'):
+        env_key = f'RL_{key.upper()}'
+        val = os.getenv(env_key)
+        if val:
+            defaults[key] = val
+    return ToolchainConfig(
+        workspace=ws,
+        test_cmd=test_cmd,
+        lint_cmd=lint_cmd,
+        build_cmd=build_cmd,
+        timeout_sec=timeout_val,
+        shell_timeout=int(shell_timeout),
+        shell_defaults=defaults,
+    )
 
 
 # ---------------
@@ -803,9 +961,15 @@ def load_rl_config(path: Path) -> RLConfig:
 
 def run_puffer_ppo(make_env: Callable[[], RLToolEnv], n_envs: int = 8, total_steps: int = 100_000):  # pragma: no cover - optional
     try:
-        import pufferlib.emulation as emulation  # type: ignore
-        import pufferlib.vector as pvector  # type: ignore
-        import pufferlib.pufferl as ppo  # type: ignore
+        try:
+            import pufferlib.emulation as emulation  # type: ignore
+            import pufferlib.vector as pvector  # type: ignore
+        except ImportError:
+            raise ImportError("PufferLib not available. Install with: pip install pufferlib>=3.0.0")
+        try:
+            import pufferlib.pufferl as ppo  # type: ignore
+        except ImportError:
+            raise ImportError("PufferLib not available. Install with: pip install pufferlib>=3.0.0")
         import torch
         import torch.nn as nn
     except Exception as e:

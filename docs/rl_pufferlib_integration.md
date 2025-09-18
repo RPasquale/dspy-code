@@ -4,7 +4,8 @@ This page captures the agreed design for wiring a bandit/RL loop around the codi
 
 ## Editorial Notes
 
-- Prereqs: Pin a minimal working set (PufferLib v0.5+, Gymnasium v0.27, Torch 2.x). Add an extras group: `pip install .[rl]`.
+- Prereqs: Pin a minimal working set (PufferLib v0.5+, Gymnasium v0.27, Torch 2.x). Install extras with `pip install .[rl]` which now pulls in Pyro (`pyro-ppl`) and CARBS so the Protein/Carbs sweep strategies run without manual wiring.
+- Architecture note: PufferLib’s prebuilt raylib bundle presently targets `x86_64`. On Apple Silicon/ARM the `.[rl]` extras will install everything except PufferLib; either skip the Puffer vectorization paths or build/link PufferLib manually against an ARM raylib toolchain.
 - Action space: Call out the initial discrete tools explicitly (run_tests, lint, build) and how to extend. Keep a table mapping action→tool args.
 - Observations: Define the exact order of features: `[verifier_scores..., context_features...]`. Document each `verifier.kind` and its expected scale.
 - Rewards: Specify weight semantics and shaping for penalties. For unbounded metrics (e.g., blast_radius), either min–max scale to [0,1] (with rolling window) or treat as a penalty whose magnitude is subtracted.
@@ -90,7 +91,7 @@ Two options:
 
 Examples:
 ```
-pip install .[rl]
+pip install .[rl]  # On ARM, install pufferlib separately once raylib is available
 
 # Initialize a config file (no env vars needed)
 dspy-agent rl config init --out .dspy_rl.json --verifiers-module verifiers --puffer
@@ -116,7 +117,10 @@ dspy-agent rl sweep --workspace . --iterations 20 --update-config
 The command evaluates candidate configurations with the live toolchain,
 persists the best result to `.dspy/rl/best.json`, and (with
 `--update-config`) refreshes `.dspy_rl.json` so future runs inherit the
-optimised settings.
+optimised settings. When `method` is set to `protein` or `carbs`, ensure the
+`.[rl]` extras are installed so Pyro (for Gaussian-process scoring) and CARBS
+are available; the CLI will surface a clear runtime error if either dependency
+is missing.
 
 ### Asynchronous Trainer
 

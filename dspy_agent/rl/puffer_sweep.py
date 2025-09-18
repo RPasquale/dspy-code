@@ -20,16 +20,27 @@ from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Opti
 
 import numpy as np
 
-try:  # Optional dependency; fallback implementation keeps sweeps usable without PufferLib.
-    import pufferlib  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - exercised when extras are absent
-    pufferlib = None  # type: ignore[assignment]
+# PufferLib is optional - we'll import it only when needed
+pufferlib = None  # type: ignore[assignment]
+
+
+def _ensure_pufferlib():
+    """Ensure PufferLib is available, import it if needed."""
+    global pufferlib
+    if pufferlib is None:
+        try:
+            import pufferlib  # type: ignore
+        except ImportError:
+            raise ImportError("PufferLib not available. Install with: pip install pufferlib>=3.0.0")
 
 
 def _unroll_nested_dict(mapping: Mapping[str, object], prefix: Tuple[str, ...] = ()) -> Iterator[Tuple[str, object]]:
-    if pufferlib is not None:  # Delegate to PufferLib when available for parity with upstream behavior.
+    try:
+        _ensure_pufferlib()
         yield from pufferlib.unroll_nested_dict(mapping)  # type: ignore[attr-defined]
         return
+    except ImportError:
+        pass  # Fall back to manual implementation
     for key, value in mapping.items():
         key_str = str(key)
         path = prefix + (key_str,)
@@ -469,7 +480,10 @@ class Protein:
             self.success_observations.append(new_observation)
 
 
-def _carbs_params_from_puffer_sweep(sweep_config: Mapping[str, Mapping[str, object]]):
+def _carbs_params_from_puffer_sweep(
+    sweep_config: Mapping[str, Mapping[str, object]],
+    prefix: Tuple[str, ...] = (),
+):
     from carbs import Param, LinearSpace, LogSpace, LogitSpace  # type: ignore
     param_spaces = {}
     for name, param in sweep_config.items():
@@ -477,8 +491,9 @@ def _carbs_params_from_puffer_sweep(sweep_config: Mapping[str, Mapping[str, obje
             continue
         if not isinstance(param, Mapping):
             continue
+        path = prefix + (str(name),)
         if any(isinstance(param[k], Mapping) for k in param):
-            param_spaces[name] = _carbs_params_from_puffer_sweep(param)  # nested
+            param_spaces[name] = _carbs_params_from_puffer_sweep(param, path)  # nested
             continue
         distribution = param.get("distribution")
         kwargs = dict(min=float(param.get("min")), max=float(param.get("max")))
@@ -492,7 +507,8 @@ def _carbs_params_from_puffer_sweep(sweep_config: Mapping[str, Mapping[str, obje
             space = LogitSpace(**kwargs)
         else:
             raise ValueError(f"Invalid distribution: {distribution}")
-        param_spaces[name] = Param(name=name, space=space, search_center=param.get("mean"))
+        full_name = ".".join(path)
+        param_spaces[name] = Param(name=full_name, space=space, search_center=param.get("mean"))
     return param_spaces
 
 
@@ -505,11 +521,18 @@ class Carbs:
         resample_frequency: int = 5,
         num_random_samples: int = 10,
     ) -> None:
-        from carbs import CARBS, CARBSParams  # type: ignore
-        param_spaces = _carbs_params_from_puffer_sweep(sweep_config)
-        flat_spaces = [item[1] for item in _unroll_nested_dict(param_spaces)]
-        for param in flat_spaces:
-            print(param.name, param.space)
+        try:
+            from carbs import CARBS, CARBSParams  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("CARBS not available. Install 'carbs' or 'pufferlib[carbs]' to use this sweep strategy.") from exc
+
+        self.hyperparameters = Hyperparameters(sweep_config)
+        self._param_spaces = _carbs_params_from_puffer_sweep(sweep_config)
+        flat_items = list(_unroll_nested_dict(self._param_spaces))
+        flat_params = [item[1] for item in flat_items]
+        self._flat_keys = [item[0] for item in flat_items]
+        self._flat_names = [param.name for param in flat_params]
+
         carbs_params = CARBSParams(
             better_direction_sign=1,
             is_wandb_logging_enabled=False,
@@ -518,24 +541,67 @@ class Carbs:
             max_suggestion_cost=max_suggestion_cost,
             is_saved_on_every_observation=False,
         )
-        self.carbs = CARBS(carbs_params, flat_spaces)
-        self.suggestion = None
 
-    def suggest(self, args: MutableMapping[str, object]) -> None:
-        suggestion = self.carbs.suggest().suggestion
-        self.suggestion = suggestion
-        for k in ("train", "env"):
-            if k not in args or "sweep" not in args:
-                continue
-            for name, param in args["sweep"][k].items():
-                if name in suggestion:
-                    args[k][name] = suggestion[name]
+        self.carbs = CARBS(carbs_params, flat_params)
+        self._last_candidate: Optional[object] = None
+        self._last_input: Optional[Mapping[str, float]] = None
+
+    def suggest(self, fill: Optional[MutableMapping[str, object]] = None) -> Tuple[MutableMapping[str, object], Dict[str, object]]:
+        candidate = self.carbs.suggest()
+        raw = getattr(candidate, "suggestion", candidate)
+
+        if isinstance(raw, Mapping):
+            mapping = {str(key): raw[key] for key in raw}
+        else:
+            try:
+                values = list(raw)  # type: ignore[arg-type]
+            except TypeError as exc:
+                raise TypeError("CARBS suggestion payload is not iterable or mapping") from exc
+            if len(values) != len(self._flat_names):
+                raise ValueError("CARBS suggestion length does not match configured parameters")
+            mapping = {self._flat_names[idx]: float(values[idx]) for idx in range(len(values))}
+
+        normalized: List[float] = []
+        cleaned_mapping: Dict[str, float] = {}
+        for name, space in self.hyperparameters.flat_spaces.items():
+            if name not in mapping:
+                raise KeyError(f"CARBS suggestion missing hyperparameter '{name}'")
+            value = mapping[name]
+            try:
+                value_f = float(value)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(f"CARBS suggestion for '{name}' is not numeric: {value!r}") from exc
+            normalized.append(space.normalize(value_f))
+            cleaned_mapping[name] = value_f
+
+        suggestion_dict = self.hyperparameters.to_dict(normalized, fill)
+
+        self._last_candidate = candidate
+        self._last_input = cleaned_mapping
+
+        info: Dict[str, object] = {"method": "carbs", "raw_params": dict(cleaned_mapping)}
+        meta = getattr(candidate, "metadata", None)
+        if isinstance(meta, Mapping):
+            info.update(meta)
+        return suggestion_dict, info
 
     def observe(self, hypers: Mapping[str, object], score: float, cost: float, *, is_failure: bool = False) -> None:
-        from carbs import ObservationInParam  # type: ignore
-        if self.suggestion is None:
+        if self._last_input is None or self._last_candidate is None:
             return
-        self.carbs.observe(ObservationInParam(input=self.suggestion, output=score, cost=cost, is_failure=is_failure))
+        try:
+            from carbs import ObservationInParam  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("CARBS not available. Install 'carbs' or 'pufferlib[carbs]' to use this sweep strategy.") from exc
+
+        observation = ObservationInParam(
+            input=self._last_input,
+            output=float(score),
+            cost=float(cost),
+            is_failure=bool(is_failure),
+        )
+        self.carbs.observe(observation)
+        self._last_input = None
+        self._last_candidate = None
 
 
 def get_strategy(name: str):

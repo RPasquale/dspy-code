@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -9,7 +10,9 @@ import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from queue import Queue, Empty
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+
+from .feature_store import FeatureStore
 
 # -----------------
 # Config dataclasses
@@ -32,6 +35,8 @@ class KafkaConfig:
     zookeeper: Optional[str] = None
     group_id: str = "dspy-code"
     acks: str = "all"
+    vector_topic: str = "agent.rl.vectorized"
+    vector_topics: List[str] = field(default_factory=list)
     topics: List[KafkaTopic] = field(default_factory=list)
 
 
@@ -82,6 +87,7 @@ class StreamConfig:
             KafkaTopic(name="deploy.logs.lightweight"),
             KafkaTopic(name="deploy.events.lightweight"),
             KafkaTopic(name="code.fs.events"),
+            KafkaTopic(name="agent.rl.vectorized"),
         ]
         return StreamConfig(
             kafka=KafkaConfig(topics=topics),
@@ -100,6 +106,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> StreamConfig:
             zookeeper=data["kafka"].get("zookeeper"),
             group_id=data["kafka"].get("group_id", "dspy-code"),
             acks=data["kafka"].get("acks", "all"),
+            vector_topic=data["kafka"].get("vector_topic", "agent.rl.vectorized"),
+            vector_topics=data["kafka"].get("vector_topics", []),
             topics=[_kt(t) for t in data["kafka"].get("topics", [])],
         ),
         spark=SparkConfig(**data.get("spark", {})),
@@ -179,7 +187,7 @@ class LocalBus:
         # Determine if this is an important message to log
         important_topics = [
             'agent.results', 'agent.patches', 'agent.learning', 'agent.errors',
-            'agent.metrics', 'logs.ctx'
+            'agent.metrics', 'logs.ctx', 'agent.rl.vectorized'
         ]
         
         # Check if topic matches any important pattern
@@ -262,6 +270,57 @@ class LocalBus:
             return message
         except Exception:
             return None
+
+    def vector_metrics(self) -> Dict[str, Any]:
+        orchestrator = getattr(self, 'vector_orchestrator', None)
+        if orchestrator and hasattr(orchestrator, 'metrics'):
+            try:
+                metrics = orchestrator.metrics()
+                if isinstance(metrics, dict):
+                    return metrics
+            except Exception:
+                pass
+        return {}
+
+    def kafka_health(self) -> Dict[str, Any]:
+        inspector = getattr(self, 'kafka_inspector', None)
+        if inspector and hasattr(inspector, 'probe'):
+            try:
+                snapshot = inspector.probe()
+                return asdict(snapshot)
+            except Exception:
+                pass
+        return {'available': False, 'reason': 'unavailable'}
+
+    def spark_health(self) -> Dict[str, Any]:
+        monitor = getattr(self, 'spark_monitor', None)
+        if monitor and hasattr(monitor, 'snapshot'):
+            try:
+                status = monitor.snapshot()
+                return asdict(status)
+            except Exception:
+                pass
+        return {'active': False, 'reason': 'unavailable'}
+
+    def feature_snapshot(self) -> Optional[Dict[str, Any]]:
+        store = getattr(self, 'feature_store', None)
+        if store and hasattr(store, 'snapshot'):
+            try:
+                snap = store.snapshot()
+                if snap is None:
+                    return None
+                return {
+                    'timestamp': snap.timestamp,
+                    'count': snap.count,
+                    'means': list(snap.means),
+                    'variances': list(snap.variances),
+                    'min': list(snap.min_values),
+                    'max': list(snap.max_values),
+                    'feature_names': list(snap.feature_names),
+                }
+            except Exception:
+                pass
+        return None
 
 
 @dataclass
@@ -570,6 +629,9 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
     docker_containers = [c.strip() for c in os.getenv('DSPY_DOCKER_CONTAINERS', '').split(',') if c.strip()]
     chosen = {d.container: d.log_file for d in autodiscover_logs(root)}
     active = set()
+    kafka_cfg = getattr(cfg, 'kafka', None)
+    vector_topics: Set[str] = set()
+    feature_store: Optional[FeatureStore] = None
     for ct in cfg.containers:
         container = getattr(ct, 'container'); log_file = chosen.get(container)
         if not log_file or not log_file.exists():
@@ -578,6 +640,7 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
         t1 = FileTailer(log_file, bus, raw_topic); t2 = Aggregator(bus, raw_topic, ctx_topic, window_sec=5.0); t3 = Worker(container, root, bus, ctx_topic, results_topic)
         t1.start(); t2.start(); t3.start(); threads.extend([t1, t2, t3])
         active.add(container)
+        vector_topics.update({ctx_topic, results_topic})
     for dc in docker_containers:
         if dc in active:
             continue
@@ -589,6 +652,56 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
         worker = Worker(dc, root, bus, ctx_topic, results_topic)
         tailer.start(); aggregator.start(); worker.start()
         threads.extend([tailer, aggregator, worker])
+        vector_topics.update({ctx_topic, results_topic})
+
+    # Configure vectorized streaming pipeline (optional)
+    out_topic = getattr(kafka_cfg, 'vector_topic', 'agent.rl.vectorized') or 'agent.rl.vectorized'
+    vector_topics.discard(out_topic)
+    vector_topics.discard('')
+    extra_topics = [t.strip() for t in os.getenv('DSPY_VECTOR_TOPICS', '').split(',') if t.strip()]
+    vector_topics.update(extra_topics)
+    vector_topics.update(getattr(kafka_cfg, 'vector_topics', []) if kafka_cfg else [])
+    vector_topics.discard(out_topic)
+    if vector_topics:
+        try:
+            from .vectorized_pipeline import RLVectorizer, VectorizedStreamOrchestrator
+            vectorizer = RLVectorizer(root)
+            feature_store = FeatureStore()
+            orchestrator = VectorizedStreamOrchestrator(
+                bus=bus,
+                topics=sorted(vector_topics),
+                vectorizer=vectorizer,
+                out_topic=out_topic,
+                feature_store=feature_store,
+            )
+            orchestrator.start(); threads.append(orchestrator)
+            setattr(bus, 'vectorizer', vectorizer)
+            setattr(bus, 'vector_orchestrator', orchestrator)
+            setattr(bus, 'feature_store', feature_store)
+        except Exception as exc:
+            print(f"Warning: vectorization pipeline unavailable: {exc}")
+
+    # Attach streaming health monitors for Kafka and Spark when available
+    try:
+        from .vectorized_pipeline import KafkaStreamInspector, SparkCheckpointMonitor
+        kafka_cfg = getattr(cfg, 'kafka', None)
+        topics_cfg = getattr(kafka_cfg, 'topics', None) or []
+        kafka_topics = {out_topic}
+        for topic_cfg in topics_cfg:
+            name = getattr(topic_cfg, 'name', None)
+            if name:
+                kafka_topics.add(name)
+        bootstrap = getattr(kafka_cfg, 'bootstrap_servers', 'localhost:9092')
+        setattr(bus, 'kafka_inspector', KafkaStreamInspector(bootstrap, sorted(kafka_topics)))
+        checkpoint_path = Path(getattr(getattr(cfg, 'spark', None), 'checkpoint_dir', '.dspy_checkpoints'))
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = root / checkpoint_path
+        setattr(bus, 'spark_monitor', SparkCheckpointMonitor(checkpoint_path))
+        if feature_store is not None and feature_store.snapshot() is not None:
+            setattr(bus, 'feature_store', feature_store)
+    except Exception:
+        pass
+
     return threads, bus
 
 
@@ -762,6 +875,8 @@ class Trainer(threading.Thread):
         containers: List[str],
         min_batch: int = 3,
         interval_sec: float = 60.0,
+        vector_topic: Optional[str] = None,
+        window_sec: float = 5.0,
         rl_actions: Optional[Iterable[str]] = None,
         tfidf_weights: Optional[Mapping[str, float]] = None,
         settings_path: Optional[Path] = None,
@@ -772,8 +887,19 @@ class Trainer(threading.Thread):
         self.containers = containers
         self.min_batch = min_batch
         self.interval_sec = interval_sec
+        default_vector_topic = vector_topic if vector_topic is not None else os.getenv('RL_VECTOR_TOPIC', 'agent.rl.vectorized')
+        self.vector_topic = (default_vector_topic.strip() or None) if isinstance(default_vector_topic, str) else None
+        self.window_sec = float(window_sec)
         self._stop = threading.Event()
         self._contexts: List[Dict[str, Any]] = []
+        self._vector_records: List[Any] = []
+        self._feature_store = getattr(bus, 'feature_store', None)
+        vectorizer = getattr(bus, 'vectorizer', None)
+        try:
+            self._vector_feature_template = vectorizer.feature_names if vectorizer else []
+        except Exception:
+            self._vector_feature_template = []
+        self._latest_vector_feature_names: List[str] = []
         self._last_train = time.time()
         default_settings = TRAINER_SETTINGS_PATH
         if not default_settings.is_absolute():
@@ -791,6 +917,15 @@ class Trainer(threading.Thread):
             self.group_size = max(1, int(cfg_flags.get('group_size', 2)))
         except Exception:
             self.group_size = 2
+        try:
+            base_shell_timeout = int(cfg_flags.get('shell_timeout', 60))
+        except Exception:
+            base_shell_timeout = 60
+        try:
+            self.shell_timeout = int(os.getenv('RL_SHELL_TIMEOUT', str(base_shell_timeout)))
+        except Exception:
+            self.shell_timeout = base_shell_timeout
+        self.shell_actions = self._resolve_shell_actions()
         # Configure LM for RL patch action when available
         try:
             from ..llm import configure_lm
@@ -833,6 +968,11 @@ class Trainer(threading.Thread):
                         s = str(item).strip()
                         if s:
                             candidates.append(s)
+        shell_cfg = self._trainer_cfg.get('shell_actions') if isinstance(self._trainer_cfg, Mapping) else None
+        if isinstance(shell_cfg, Mapping):
+            for name in shell_cfg.keys():
+                if isinstance(name, str) and name.strip():
+                    candidates.append(name.strip())
         if not candidates:
             return None
         canonical: List[str] = []
@@ -893,6 +1033,122 @@ class Trainer(threading.Thread):
         if explicit:
             apply(explicit)
         return weights
+
+    def _resolve_shell_actions(self) -> Dict[str, Dict[str, Any]]:
+        defaults: Dict[str, Dict[str, Any]] = {
+            'shell_ls': {'cmd': 'ls -lah'},
+            'shell_pwd': {'cmd': 'pwd'},
+            'shell_cat': {'path': 'README.md'},
+            'shell_cd': {'path': '.'},
+            'shell_run': {'cmd': 'echo $PWD'},
+        }
+        cfg_shell = self._trainer_cfg.get('shell_actions') if isinstance(self._trainer_cfg, Mapping) else {}
+        result: Dict[str, Dict[str, Any]] = {}
+        for name, base in defaults.items():
+            data: Dict[str, Any] = dict(base)
+            cfg_val = cfg_shell.get(name) if isinstance(cfg_shell, Mapping) else None
+            if isinstance(cfg_val, Mapping):
+                for key, value in cfg_val.items():
+                    if key in {'cmd', 'path', 'timeout'}:
+                        data[key] = value
+            elif isinstance(cfg_val, str):
+                if name in {'shell_cat', 'shell_cd'}:
+                    data['path'] = cfg_val
+                else:
+                    data['cmd'] = cfg_val
+            env_override = os.getenv(f'RL_{name.upper()}')
+            if env_override:
+                if name in {'shell_cat', 'shell_cd'}:
+                    data['path'] = env_override
+                else:
+                    data['cmd'] = env_override
+            env_timeout = os.getenv(f'RL_{name.upper()}_TIMEOUT')
+            if env_timeout:
+                try:
+                    data['timeout'] = int(env_timeout)
+                except Exception:
+                    pass
+            if name != 'shell_cd':
+                data.setdefault('timeout', self.shell_timeout)
+            cleaned = {key: value for key, value in data.items() if value not in (None, '')}
+            if name == 'shell_run' and not cleaned.get('cmd'):
+                cleaned['cmd'] = 'echo $PWD'
+            result[name] = cleaned
+        return result
+
+    def _extract_vector_features(self, record: Any) -> Tuple[Optional[List[float]], Optional[List[str]]]:
+        if record is None:
+            return None, None
+        features_obj: Any = None
+        names_obj: Any = None
+        if hasattr(record, 'features'):
+            features_obj = getattr(record, 'features', None)
+            names_obj = getattr(record, 'feature_names', None)
+        elif isinstance(record, Mapping):
+            features_obj = record.get('features') or record.get('vector')
+            names_obj = record.get('feature_names') or record.get('names')
+        if features_obj is None:
+            return None, None
+        try:
+            features = [float(x) for x in features_obj]
+        except Exception:
+            return None, None
+        names: Optional[List[str]] = None
+        if names_obj:
+            try:
+                names = [str(n) for n in names_obj]
+            except Exception:
+                names = None
+        return features, names
+
+    def _aggregate_vector_records(self) -> Optional[Dict[str, Any]]:
+        store = getattr(self, '_feature_store', None)
+        if store is not None and hasattr(store, 'snapshot'):
+            try:
+                snap = store.snapshot()
+            except Exception:
+                snap = None
+            if snap is not None:
+                return {
+                    'features': list(snap.means),
+                    'variances': list(snap.variances),
+                    'names': list(snap.feature_names),
+                    'count': snap.count,
+                }
+        if not self._vector_records:
+            return None
+        vectors: List[List[float]] = []
+        names: Optional[List[str]] = None
+        for record in list(self._vector_records):
+            feats, feat_names = self._extract_vector_features(record)
+            if feats is None:
+                continue
+            vectors.append(feats)
+            if names is None and feat_names:
+                names = feat_names
+        if not vectors:
+            return None
+        feature_count = len(vectors[0])
+        accum = [0.0] * feature_count
+        for vec in vectors:
+            if len(vec) != feature_count:
+                continue
+            for idx, value in enumerate(vec):
+                accum[idx] += float(value)
+        count = max(len(vectors), 1)
+        averaged = [value / count for value in accum]
+        if names is None or len(names) != feature_count:
+            if self._vector_feature_template and len(self._vector_feature_template) == feature_count:
+                names = list(self._vector_feature_template)
+            else:
+                names = [f'vector_{i}' for i in range(feature_count)]
+        self._latest_vector_feature_names = list(names)
+        return {
+            'features': averaged,
+            'names': list(names),
+            'variances': [0.0 for _ in averaged],
+            'count': len(vectors),
+        }
 
     def _action_enabled(self, name: str) -> bool:
         if self._action_name_set is None:
@@ -994,6 +1250,16 @@ class Trainer(threading.Thread):
             if isinstance(quality_cfg, Mapping):
                 patch_args['quality_checks'] = {str(k): str(v) for k, v in quality_cfg.items() if str(v).strip()}
             action_args['patch'] = patch_args
+        for name, params in self.shell_actions.items():
+            if not self._action_enabled(name):
+                continue
+            entry = dict(params)
+            if name != 'shell_cd':
+                try:
+                    entry['timeout'] = int(entry.get('timeout', self.shell_timeout))
+                except Exception:
+                    entry['timeout'] = self.shell_timeout
+            action_args[name] = entry
         return action_args
 
     def stop(self):
@@ -1016,7 +1282,15 @@ class Trainer(threading.Thread):
                             })
                     except Exception:
                         pass
-                
+                if self.vector_topic:
+                    try:
+                        vec_item = self.bus.get_latest(self.vector_topic, timeout=0.01)
+                        if vec_item:
+                            if self._feature_store is None:
+                                self._vector_records.append(vec_item)
+                    except Exception:
+                        pass
+
                 # Train if we have enough data and enough time has passed
                 now = time.time()
                 if (len(self._contexts) >= self.min_batch and 
@@ -1034,6 +1308,7 @@ class Trainer(threading.Thread):
     
     def _train_on_contexts(self):
         """Train the model on collected contexts."""
+        vector_summary = self._aggregate_vector_records()
         try:
             from ..db import get_enhanced_data_manager, TrainingMetrics, Environment, create_log_entry
             import uuid
@@ -1064,28 +1339,46 @@ class Trainer(threading.Thread):
                 hyperparameters={
                     "window_sec": self.window_sec,
                     "min_batch": self.min_batch,
-                    "interval_sec": self.interval_sec
+                    "interval_sec": self.interval_sec,
+                    "vector_topic": self.vector_topic,
                 },
                 convergence_metrics={
                     "contexts_processed": len(self._contexts),
-                    "containers": len(self.containers)
+                    "containers": len(self.containers),
+                    "vector_batches": vector_summary.get('count', 0) if vector_summary else 0,
+                    "vector_feature_count": len(vector_summary['features']) if vector_summary else 0,
                 }
             )
             
             data_manager.store_training_metrics(training_metrics)
             
             # Log training completion
+            log_context = {
+                "session_id": session_id,
+                "training_accuracy": training_accuracy,
+                "validation_accuracy": validation_accuracy,
+                "loss": loss,
+                "contexts_count": len(self._contexts),
+            }
+            if vector_summary:
+                try:
+                    log_context["vector_batches"] = vector_summary.get('count', 0)
+                    log_context["vector_features"] = {
+                        name: round(value, 4)
+                        for name, value in zip(vector_summary['names'], vector_summary['features'])
+                    }
+                    if vector_summary.get('variances'):
+                        log_context["vector_variances"] = {
+                            name: round(var, 6)
+                            for name, var in zip(vector_summary['names'], vector_summary.get('variances', []))
+                        }
+                except Exception:
+                    pass
             training_log = create_log_entry(
                 level="INFO",
                 source="streaming_trainer",
                 message=f"Training completed on {len(self._contexts)} contexts",
-                context={
-                    "session_id": session_id,
-                    "training_accuracy": training_accuracy,
-                    "validation_accuracy": validation_accuracy,
-                    "loss": loss,
-                    "contexts_count": len(self._contexts)
-                },
+                context=log_context,
                 environment=Environment.DEVELOPMENT
             )
             data_manager.log(training_log)
@@ -1142,6 +1435,14 @@ class Trainer(threading.Thread):
                 min(float(hist_stats.get('recent_failure_rate', 0.0)), 1.0),
                 min(float(hist_stats.get('avg_pass_rate', 0.0)), 1.0),
             ])
+            if vector_summary:
+                try:
+                    ctx_vec.extend(vector_summary['features'])
+                    variances = vector_summary.get('variances')
+                    if isinstance(variances, list):
+                        ctx_vec.extend([math.sqrt(v) if v > 0 else 0.0 for v in variances])
+                except Exception:
+                    pass
             # Add TF-IDF similarity features when index is available
             try:
                 from ..embedding.indexer import load_index, semantic_search, vectorize_query, cosine
@@ -1355,6 +1656,7 @@ class Trainer(threading.Thread):
                 print(f"[stream-rl] interactive bandit update failed: {e}")
         except Exception as e:
             print(f"[stream-rl] Training error: {e}")
+        self._vector_records.clear()
 
 
 def _tcp_check(bootstrap: str, timeout: float = 0.2) -> bool:

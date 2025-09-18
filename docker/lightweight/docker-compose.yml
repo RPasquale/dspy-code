@@ -28,6 +28,7 @@ services:
         - ./entrypoints:/entrypoints:ro
       ports:
         - "127.0.0.1:8765:8765"
+        - "127.0.0.1:18081:8081"
       restart: unless-stopped
       deploy:
         resources:

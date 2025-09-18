@@ -20,8 +20,8 @@ def run_puffer_ppo(make_env: Callable[[], object], n_envs: int = 8, total_steps:
         import pufferlib.emulation as emulation  # type: ignore
         import pufferlib.vector as pvector  # type: ignore
         import pufferlib.pufferl as ppo  # type: ignore
-    except Exception as e:
-        raise RuntimeError("PufferLib not available. Install with 'pip install pufferlib --no-build-isolation' or '.[rl]'") from e
+    except ImportError:
+        raise ImportError("PufferLib not available. Install with: pip install pufferlib>=3.0.0")
 
     # Vectorized env from our Gymnasium-compatible env
     def creator():

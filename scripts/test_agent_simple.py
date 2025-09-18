@@ -80,7 +80,7 @@ def test_simple_commands():
     try:
         from dspy_agent.code_tools.code_search import search_text
         # Test with a simple pattern
-        results = search_text("def test", str(project_root))
+        results = search_text(project_root, "def test")
         print(f"✅ Code search works: found {len(results)} results")
     except Exception as e:
         print(f"❌ Code search failed: {e}")

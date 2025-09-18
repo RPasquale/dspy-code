@@ -16,6 +16,7 @@ import urllib.request
 import urllib.error
 import random
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # Import RedDB data model
 from dspy_agent.db import (
@@ -25,58 +26,62 @@ from dspy_agent.db import (
     create_log_entry, create_action_record
 )
 
+REPO_ROOT = Path(__file__).resolve().parent
+REACT_DIST_DIR = REPO_ROOT / 'frontend' / 'react-dashboard' / 'dist'
+STATIC_DIRECTORY = REACT_DIST_DIR if REACT_DIST_DIR.exists() else REPO_ROOT
+
 class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         # Initialize data manager before calling super().__init__
         self.data_manager = get_enhanced_data_manager()
-        super().__init__(*args, directory="/Users/robbiepasquale/dspy_stuff", **kwargs)
+        self.react_available = REACT_DIST_DIR.exists()
+        super().__init__(*args, directory=str(STATIC_DIRECTORY), **kwargs)
 
     def do_GET(self):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
-        
-        # Serve dashboards
-        if path == '/' or path == '/dashboard':
-            self.serve_advanced_dashboard()
-        elif path == '/simple':
-            self.serve_simple_dashboard()
-        elif path == '/system' or path == '/architecture':
-            self.serve_system_visualization()
-        
-        # API endpoints
-        elif path == '/api/status':
-            self.serve_status()
-        elif path == '/api/logs':
-            self.serve_logs()
-        elif path == '/api/metrics':
-            self.serve_metrics()
-        elif path == '/api/signatures':
-            self.serve_signatures()
-        elif path == '/api/verifiers':
-            self.serve_verifiers()
-        elif path == '/api/learning-metrics':
-            self.serve_learning_metrics()
-        elif path == '/api/performance-history':
-            self.serve_performance_history()
-        elif path == '/api/containers':
-            self.serve_containers()
-        elif path == '/api/kafka-topics':
-            self.serve_kafka_topics()
-        elif path == '/api/spark-workers':
-            self.serve_spark_workers()
-        elif path == '/api/rl-metrics':
-            self.serve_rl_metrics()
-        elif path == '/api/system-topology':
-            self.serve_system_topology()
-        elif path == '/api/stream-metrics':
-            self.serve_stream_metrics()
-        else:
-            super().do_GET()
+
+        api_routes = {
+            '/api/status': self.serve_status,
+            '/api/logs': self.serve_logs,
+            '/api/metrics': self.serve_metrics,
+            '/api/signatures': self.serve_signatures,
+            '/api/verifiers': self.serve_verifiers,
+            '/api/learning-metrics': self.serve_learning_metrics,
+            '/api/performance-history': self.serve_performance_history,
+            '/api/containers': self.serve_containers,
+            '/api/kafka-topics': self.serve_kafka_topics,
+            '/api/spark-workers': self.serve_spark_workers,
+            '/api/rl-metrics': self.serve_rl_metrics,
+            '/api/system-topology': self.serve_system_topology,
+            '/api/stream-metrics': self.serve_stream_metrics
+        }
+
+        handler = api_routes.get(path)
+        if handler:
+            handler()
+            return
+
+        if path in ('/', '/dashboard', '/simple', '/system', '/architecture'):
+            if self.react_available:
+                self.serve_react_index()
+            else:
+                self.serve_legacy_placeholder(path)
+            return
+
+        if self.react_available:
+            if self.try_serve_react_asset(path):
+                return
+            self.serve_react_index()
+            return
+
+        super().do_GET()
+
 
     def do_POST(self):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
-        
+
         if path == '/api/chat':
             self.handle_chat()
         elif path == '/api/command':
@@ -90,47 +95,74 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def serve_advanced_dashboard(self):
-        """Serve the advanced dashboard HTML"""
+    def serve_react_index(self):
+        index_path = REACT_DIST_DIR / 'index.html'
+        if index_path.exists():
+            try:
+                with open(index_path, 'rb') as handle:
+                    content = handle.read()
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(content)
+            except OSError as exc:
+                self.send_error(500, f"Error serving React app: {exc}")
+        else:
+            self.serve_legacy_placeholder('/')
+
+    def try_serve_react_asset(self, path: str) -> bool:
+        if not self.react_available or path in ('', '/'):
+            return False
+        candidate = (REACT_DIST_DIR / path.lstrip('/')).resolve()
         try:
-            with open('/Users/robbiepasquale/dspy_stuff/advanced_dashboard.html', 'r') as f:
-                content = f.read()
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(content.encode())
-        except Exception as e:
-            self.send_error(500, f"Error serving dashboard: {e}")
+            candidate.relative_to(REACT_DIST_DIR)
+        except (ValueError, FileNotFoundError):
+            return False
+        if candidate.is_dir() or not candidate.exists():
+            return False
+        original_path = self.path
+        try:
+            self.path = path
+            super().do_GET()
+        finally:
+            self.path = original_path
+        return True
+
+    def serve_legacy_placeholder(self, path: str):
+        message = (
+            "<html><head><title>DSPy Dashboard</title></head><body>"
+            "<h2>React dashboard build not found.</h2>"
+            "<p>Run <code>npm install</code> and <code>npm run build</code> inside frontend/react-dashboard, then restart the server.</p>"
+            "</body></html>"
+        )
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(message.encode())
+
+    def serve_advanced_dashboard(self):
+        """Serve the advanced dashboard (React entry)"""
+        if self.react_available:
+            self.serve_react_index()
+        else:
+            self.serve_legacy_placeholder('/dashboard')
 
     def serve_simple_dashboard(self):
-        """Serve the simple dashboard HTML"""
-        try:
-            with open('/Users/robbiepasquale/dspy_stuff/static_dashboard.html', 'r') as f:
-                content = f.read()
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(content.encode())
-        except Exception as e:
-            self.send_error(500, f"Error serving simple dashboard: {e}")
+        """Serve the simple dashboard (React entry)"""
+        if self.react_available:
+            self.serve_react_index()
+        else:
+            self.serve_legacy_placeholder('/simple')
 
     def serve_system_visualization(self):
-        """Serve the system architecture visualization HTML"""
-        try:
-            with open('/Users/robbiepasquale/dspy_stuff/system_visualization.html', 'r') as f:
-                content = f.read()
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(content.encode())
-        except Exception as e:
-            self.send_error(500, f"Error serving system visualization: {e}")
+        """Serve the system visualization (React entry)"""
+        if self.react_available:
+            self.serve_react_index()
+        else:
+            self.serve_legacy_placeholder('/system')
 
     def serve_signatures(self):
         """Get signature performance data from RedDB"""
@@ -1158,7 +1190,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
-    # Include all the existing methods from simple_dashboard_server.py
+    # Include legacy simple dashboard behaviour for compatibility
     def serve_status(self):
         """Check status of all services"""
         status = {
@@ -1218,7 +1250,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         }
         self.send_json_response(metrics)
 
-    # Copy other existing methods from simple_dashboard_server.py
+    # Legacy compatibility methods retained from previous simple dashboard implementation
     def check_agent_status(self):
         """Check if agent is responding"""
         try:
@@ -1389,34 +1421,33 @@ def start_enhanced_dashboard_server(port=8080):
     
     try:
         with socketserver.TCPServer(("", port), handler) as httpd:
-            print(f"🚀 Enhanced DSPy Agent Dashboard Server running at:")
-            print(f"   http://localhost:{port}/dashboard     - Advanced Dashboard")
-            print(f"   http://localhost:{port}/system        - System Architecture")
-            print(f"   http://localhost:{port}/simple        - Simple Dashboard")
-            print(f"   http://127.0.0.1:{port}/dashboard")
-            print("\n📊 Enhanced API endpoints:")
-            print(f"   GET  /api/signatures      - Signature performance data")
-            print(f"   GET  /api/verifiers       - Verifier accuracy metrics")
-            print(f"   GET  /api/learning-metrics - Learning performance analytics")
+            print("🚀 Enhanced DSPy Agent Dashboard Server running at:")
+            print(f"   http://localhost:{port}/")
+            print(f"   http://127.0.0.1:{port}/")
+            if REACT_DIST_DIR.exists():
+                print()
+                print(f"🎨 Serving React build from {REACT_DIST_DIR}")
+            else:
+                print()
+                print("⚠️  React build not detected. Run `npm install` and `npm run build` in frontend/react-dashboard.")
+            print("\n📊 API endpoints:")
+            print(f"   GET  /api/status            - Service status")
+            print(f"   GET  /api/logs              - Recent agent logs")
+            print(f"   GET  /api/metrics           - System metrics")
+            print(f"   GET  /api/signatures        - Signature performance data")
+            print(f"   GET  /api/verifiers         - Verifier accuracy metrics")
+            print(f"   GET  /api/learning-metrics  - Learning performance analytics")
             print(f"   GET  /api/performance-history - Historical performance data")
-            print(f"   GET  /api/kafka-topics    - Kafka topic monitoring")
-            print(f"   GET  /api/spark-workers   - Spark cluster status")
-            print(f"   GET  /api/rl-metrics      - RL environment metrics")
-            print(f"   GET  /api/system-topology - System architecture data")
-            print(f"   GET  /api/stream-metrics  - Real-time streaming metrics")
-            print(f"   POST /api/chat            - Chat with DSPy agent")
+            print(f"   GET  /api/kafka-topics      - Kafka topic monitoring")
+            print(f"   GET  /api/spark-workers     - Spark cluster status")
+            print(f"   GET  /api/rl-metrics        - RL environment metrics")
+            print(f"   GET  /api/system-topology   - System architecture data")
+            print(f"   GET  /api/stream-metrics    - Real-time streaming metrics")
+            print(f"   POST /api/chat              - Chat with DSPy agent")
             print(f"   POST /api/signature/optimize - Optimize specific signatures")
-            print(f"   POST /api/config          - Update configuration")
-            print(f"\n🎯 Features:")
-            print(f"   📈 Real-time learning metrics and performance graphs")
-            print(f"   💬 Interactive chat interface with the agent")
-            print(f"   🔧 Signature and verifier management")
-            print(f"   ⚙️ Live configuration updates")
-            print(f"   📊 Advanced analytics and insights")
-            print(f"   🌐 System architecture visualization")
-            print(f"   📡 Real-time Kafka topic monitoring")
-            print(f"   ⚡ Spark cluster and worker visualization")
-            print(f"   🧠 RL environment and training metrics")
+            print(f"   POST /api/config            - Update configuration")
+            print(f"   POST /api/command           - Execute agent command")
+            print(f"   POST /api/restart           - Restart agent")
             print(f"\n🔄 Press Ctrl+C to stop the server")
             
             httpd.serve_forever()

@@ -96,6 +96,27 @@ def test_trainer_uses_prompt_registry(tmp_path: Path):
     assert weights.get('coverage_delta') == 0.4
 
 
+def test_trainer_shell_actions(tmp_path: Path):
+    settings = {
+        'actions': ['shell_ls', 'shell_run'],
+        'shell_actions': {
+            'shell_run': {'cmd': 'echo hello world'},
+            'shell_cat': 'CHANGELOG.md',
+        },
+        'shell_timeout': 45,
+    }
+    (tmp_path / 'CHANGELOG.md').write_text('demo\n')
+    (tmp_path / TRAINER_SETTINGS_PATH.name).write_text(json.dumps(settings, indent=2))
+
+    trainer = Trainer(tmp_path, LocalBus(), containers=['app'], min_batch=1, interval_sec=60.0)
+    assert trainer.shell_timeout == 45
+
+    action_args = trainer._build_action_args('')
+    assert 'shell_ls' in action_args
+    assert action_args['shell_ls']['timeout'] == 45
+    assert action_args['shell_run']['cmd'] == 'echo hello world'
+
+
 def test_auto_training_loop_status_file(tmp_path: Path):
     console = Console(file=io.StringIO())
     loop = AutoTrainingLoop(tmp_path, None, console=console, modules=['code'], interval_sec=1, initial_delay_sec=0, ollama=False)

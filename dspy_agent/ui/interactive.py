@@ -8,6 +8,7 @@ options with sensible defaults.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import time
 from dataclasses import dataclass
@@ -269,7 +270,23 @@ class InteractiveShell:
             sweep_cfg = load_sweep_config(DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.exists() else None)
         except Exception:
             sweep_cfg = {}
+        sweep_cfg = dict(sweep_cfg or {})
         sweep_cfg['iterations'] = iterations_int
+        sweep_cfg.setdefault('metric', 'reward')
+        sweep_cfg.setdefault('goal', 'maximize')
+        method_default = str(sweep_cfg.get('method', 'pareto')).lower() or 'pareto'
+        method_choice = Prompt.ask(
+            "Sweep method",
+            choices=["pareto", "random", "protein", "carbs"],
+            default=method_default,
+        )
+        if method_choice == "protein" and importlib.util.find_spec("pyro") is None:
+            self.console.print(Panel("Protein sweep requires pyro-ppl (install extras via `pip install .[rl]`).", title="Dependency missing", border_style="yellow"))
+            return
+        if method_choice == "carbs" and importlib.util.find_spec("carbs") is None:
+            self.console.print(Panel("Carbs sweep requires the `carbs` package (install extras via `pip install .[rl]`).", title="Dependency missing", border_style="yellow"))
+            return
+        sweep_cfg['method'] = method_choice
         self.console.print(Panel(f"Running sweep ({iterations_int} iterations)...", border_style="magenta"))
         base_cfg = self._load_rl_config()
         outcome = run_sweep(self.workspace, sweep_cfg, base_config=base_cfg)

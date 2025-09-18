@@ -92,3 +92,6 @@ docker/lightweight/.env
 # UV lockfile - not needed in containerized environment
 uv.lock
 
+
+# Local React frontend (not shared)
+frontend/

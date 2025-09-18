@@ -32,6 +32,60 @@ from ..rl.puffer_sweep import Hyperparameters, get_strategy
 from ..rl import hparam_guide
 
 
+_DEFAULT_SWEEP_CONFIG: Dict[str, Any] = {
+    "name": "default",
+    "method": "pareto",
+    "metric": "reward",
+    "goal": "maximize",
+    "puffer": True,
+    "epsilon": {
+        "distribution": "logit_normal",
+        "min": 0.05,
+        "max": 0.6,
+        "mean": 0.1,
+    },
+    "ucb_c": {
+        "distribution": "log_normal",
+        "min": 0.5,
+        "max": 6.0,
+        "mean": 2.0,
+    },
+    "temperature": {
+        "distribution": "uniform",
+        "min": 0.6,
+        "max": 1.2,
+        "mean": 0.85,
+    },
+    "target_entropy": {
+        "distribution": "uniform",
+        "min": 0.25,
+        "max": 0.4,
+        "mean": 0.3,
+    },
+    "clip_higher": {
+        "distribution": "uniform",
+        "min": 1.0,
+        "max": 1.3,
+        "mean": 1.1,
+    },
+    "timeout_sec": {
+        "distribution": "int_uniform",
+        "min": 120,
+        "max": 480,
+        "mean": 240,
+    },
+    "weights": {
+        "pass_rate": {"distribution": "uniform", "min": 0.6, "max": 1.2, "mean": 0.9},
+        "blast_radius": {"distribution": "logit_normal", "min": 0.01, "max": 0.3, "mean": 0.08},
+        "retrieval_precision": {"distribution": "uniform", "min": 0.1, "max": 0.6, "mean": 0.3},
+    },
+    "trainer": {
+        "steps": {"distribution": "int_uniform", "min": 100, "max": 600, "mean": 300},
+        "n_envs": {"distribution": "int_uniform", "min": 1, "max": 6, "mean": 2},
+    },
+}
+
+
 @dataclass
 class SweepSettings:
     method: str = "pareto"
@@ -67,19 +121,21 @@ DEFAULT_PERSIST_PATH = Path('.dspy') / 'rl' / 'best.json'
 
 
 def load_sweep_config(path: Optional[Path] = None) -> Dict[str, Any]:
-    candidate_paths: Iterable[Path] = []
+    candidates: List[Path] = []
     if path:
-        candidate_paths = (path,)
-    else:
-        candidate_paths = (DEFAULT_CONFIG_PATH,)
-    for candidate in candidate_paths:
+        candidates.append(path)
+    candidates.append(DEFAULT_CONFIG_PATH)
+    for candidate in candidates:
+        if not candidate or not candidate.exists():
+            continue
         try:
             data = json.loads(candidate.read_text())
             if isinstance(data, dict):
                 return data
         except Exception:
             continue
-    raise FileNotFoundError(f"Sweep configuration not found (looked at {list(candidate_paths)})")
+    # Fallback to baked-in defaults (deep copy)
+    return json.loads(json.dumps(_DEFAULT_SWEEP_CONFIG))
 
 
 def describe_default_hparams() -> List[Mapping[str, object]]:

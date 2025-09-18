@@ -2432,7 +2432,9 @@ def up(
             cfg = None
         containers = [getattr(ct, 'container') for ct in getattr(cfg, 'containers', [])] if cfg else [d.container for d in autodiscover_logs(workspace)]
         from .streaming.streaming_runtime import Trainer
-        trainer = Trainer(workspace, bus, containers, min_batch=3, interval_sec=60.0)
+        kafka_cfg = getattr(cfg, 'kafka', None)
+        vector_topic = getattr(kafka_cfg, 'vector_topic', 'agent.rl.vectorized') if kafka_cfg else 'agent.rl.vectorized'
+        trainer = Trainer(workspace, bus, containers, min_batch=3, interval_sec=60.0, vector_topic=vector_topic)
         trainer.start(); threads.append(trainer)
     if auto_train and _auto_train_enabled():
         try:
@@ -5701,16 +5703,44 @@ def sg(
 start = start_command
 
 
-def code_entry() -> None:
-    """Entry point for the `dspy-code` console script (interactive defaults)."""
+def _launch_interactive(ws: Path, logs: Optional[Path]) -> bool:
+    """Run the richer interactive shell when available; return True on success."""
     try:
-        _print_banner(console)
-        ws = Path.cwd()
-        logs = ws / 'logs'
         from .ui.interactive import run_interactive_shell
-        run_interactive_shell(ws, logs if logs.exists() else None)
+    except Exception:
+        return False
+    try:
+        run_interactive_shell(ws, logs)
     except SystemExit:
         pass
+    except Exception as exc:
+        console.print(Panel(str(exc), title="interactive shell failed", border_style="red"))
+        return False
+    return True
+
+
+def code_entry() -> None:
+    """Entry point for the `dspy-code` console script (interactive defaults)."""
+    _print_banner(console)
+    ws = Path.cwd()
+    logs = ws / 'logs'
+    logs_arg = logs if logs.exists() else None
+
+    if _launch_interactive(ws, logs_arg):
+        return
+
+    # Legacy fallback matches historical behaviour if the interactive shell is unavailable.
+    start_command(
+        workspace=ws,
+        logs=logs_arg,
+        ollama=True,
+        model="qwen3:1.7b",
+        base_url=None,
+        api_key=None,
+        force_json=False,
+        structured=False,
+        approval=None,
+    )
 
 
 @app.command()

@@ -33,15 +33,18 @@ RedDB = "https://github.com/redbco/redb-open.git"
 
 [project.optional-dependencies]
 rl = [
-    "pufferlib>=3.0.0",
+    "pufferlib>=3.0.0; platform_machine == \"x86_64\"",
     "gymnasium>=0.27",
     "torch>=2.0.0",
     "verifiers @ git+https://github.com/willccbb/verifiers.git",
     "pyro-ppl>=1.9.0",
+    "carbs>=0.2.0",
 ]
 
 [tool.uv]
-dev-dependencies = []
+dev-dependencies = [
+    "pytest>=8.4.2",
+]
 package = true
 
 [tool.setuptools.packages.find]

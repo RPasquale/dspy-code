@@ -155,7 +155,7 @@ Two cooperating paths:
 - Observations include Kafka-derived context if available (`logs.ctx.*`), otherwise local logs.
 
 ```bash
-# Optional extras for neural RL
+# Optional extras for neural RL (on ARM/Apple Silicon this installs everything except pufferlib)
 pip install '.[rl]'
 
 # Config stub

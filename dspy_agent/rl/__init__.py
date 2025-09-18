@@ -8,7 +8,18 @@ exposed as modules.
 from .rlkit import *  # type: ignore[F401]  # re-export primary API
 from .rlkit import __all__ as _rl_all
 
-from . import puffer_sweep  # noqa: F401
-from . import hparam_guide  # noqa: F401
+__all__ = list(_rl_all)
 
-__all__ = list(_rl_all) + ["puffer_sweep", "hparam_guide"]
+try:  # optional PufferLib integration
+    from . import puffer_sweep  # noqa: F401
+except ImportError:  # pragma: no cover - optional dependency
+    puffer_sweep = None  # type: ignore
+else:
+    __all__.append("puffer_sweep")
+
+try:
+    from . import hparam_guide  # noqa: F401
+except ImportError:  # pragma: no cover - defensive
+    hparam_guide = None  # type: ignore
+else:
+    __all__.append("hparam_guide")
