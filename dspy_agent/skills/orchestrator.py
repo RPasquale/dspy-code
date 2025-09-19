@@ -52,7 +52,7 @@ class ChainSummary:
 
 
 class SessionMemory:
-    """Persistent memory for agent sessions"""
+    """Persistent memory for agent sessions with expert-level learning"""
     
     def __init__(self, workspace: Path, max_history: int = 50):
         self.workspace = workspace
@@ -62,6 +62,14 @@ class SessionMemory:
         self.chain_history: deque = deque(maxlen=max_history)
         self.tool_cache: Dict[str, ToolResult] = {}
         self.query_cache: Dict[str, str] = {}
+        
+        # Expert-level learning components
+        self.expert_patterns: Dict[str, List[Dict]] = {}  # Learned patterns by context
+        self.tool_effectiveness: Dict[str, float] = {}    # Tool success rates
+        self.context_insights: Dict[str, str] = {}        # Codebase insights
+        self.prompt_optimizations: Dict[str, str] = {}    # Optimized prompts by context
+        self.action_policies: Dict[str, List[str]] = {}   # Reliable action sequences
+        
         self._load_memory()
     
     def _load_memory(self):
@@ -73,6 +81,13 @@ class SessionMemory:
                     self.chain_history = deque(data.get('chain_history', []), maxlen=self.max_history)
                     self.tool_cache = data.get('tool_cache', {})
                     self.query_cache = data.get('query_cache', {})
+                    
+                    # Load expert-level learning data
+                    self.expert_patterns = data.get('expert_patterns', {})
+                    self.tool_effectiveness = data.get('tool_effectiveness', {})
+                    self.context_insights = data.get('context_insights', {})
+                    self.prompt_optimizations = data.get('prompt_optimizations', {})
+                    self.action_policies = data.get('action_policies', {})
             except Exception:
                 pass  # Start fresh if corrupted
     
@@ -83,6 +98,11 @@ class SessionMemory:
                 'chain_history': list(self.chain_history),
                 'tool_cache': self.tool_cache,
                 'query_cache': self.query_cache,
+                'expert_patterns': self.expert_patterns,
+                'tool_effectiveness': self.tool_effectiveness,
+                'context_insights': self.context_insights,
+                'prompt_optimizations': self.prompt_optimizations,
+                'action_policies': self.action_policies,
                 'last_updated': time.time()
             }
             with open(self.memory_file, 'w') as f:
@@ -145,6 +165,110 @@ class SessionMemory:
         self._save_memory()
         
         return summary
+    
+    def learn_expert_pattern(self, context: str, tool_sequence: List[str], success: bool, reward: float):
+        """Learn expert patterns from successful tool sequences"""
+        if context not in self.expert_patterns:
+            self.expert_patterns[context] = []
+        
+        pattern = {
+            "tool_sequence": tool_sequence,
+            "success": success,
+            "reward": reward,
+            "timestamp": time.time(),
+            "frequency": 1
+        }
+        
+        # Check if similar pattern exists
+        for existing in self.expert_patterns[context]:
+            if existing["tool_sequence"] == tool_sequence:
+                existing["frequency"] += 1
+                existing["reward"] = (existing["reward"] + reward) / 2
+                existing["success"] = success if success else existing["success"]
+                return
+        
+        self.expert_patterns[context].append(pattern)
+        self._save_memory()
+    
+    def update_tool_effectiveness(self, tool: str, success: bool):
+        """Update tool effectiveness based on usage"""
+        if tool not in self.tool_effectiveness:
+            self.tool_effectiveness[tool] = 0.5  # Start with neutral
+        
+        # Simple moving average
+        current = self.tool_effectiveness[tool]
+        new_value = 1.0 if success else 0.0
+        self.tool_effectiveness[tool] = (current * 0.9) + (new_value * 0.1)
+        self._save_memory()
+    
+    def get_best_tool_sequence(self, context: str) -> List[str]:
+        """Get the best tool sequence for a given context"""
+        if context not in self.expert_patterns:
+            return []
+        
+        # Find the pattern with highest reward and frequency
+        best_pattern = None
+        best_score = 0.0
+        
+        for pattern in self.expert_patterns[context]:
+            if pattern["success"]:
+                score = pattern["reward"] * pattern["frequency"]
+                if score > best_score:
+                    best_score = score
+                    best_pattern = pattern
+        
+        return best_pattern["tool_sequence"] if best_pattern else []
+    
+    def get_most_effective_tools(self, limit: int = 5) -> List[Tuple[str, float]]:
+        """Get the most effective tools based on success rate"""
+        return sorted(self.tool_effectiveness.items(), key=lambda x: x[1], reverse=True)[:limit]
+    
+    def add_context_insight(self, context: str, insight: str):
+        """Add codebase insight for a context"""
+        self.context_insights[context] = insight
+        self._save_memory()
+    
+    def get_context_insight(self, context: str) -> Optional[str]:
+        """Get codebase insight for a context"""
+        return self.context_insights.get(context)
+    
+    def optimize_prompt(self, context: str, original_prompt: str, success: bool) -> str:
+        """Optimize prompt based on success/failure"""
+        if context not in self.prompt_optimizations:
+            self.prompt_optimizations[context] = original_prompt
+        
+        if not success:
+            # Enhance prompt for better performance
+            enhanced = f"Focus on accuracy and thoroughness. {original_prompt}"
+            self.prompt_optimizations[context] = enhanced
+        else:
+            # Refine successful prompt
+            refined = f"Execute efficiently. {original_prompt}"
+            self.prompt_optimizations[context] = refined
+        
+        self._save_memory()
+        return self.prompt_optimizations[context]
+    
+    def get_optimized_prompt(self, context: str, fallback: str) -> str:
+        """Get optimized prompt for context"""
+        return self.prompt_optimizations.get(context, fallback)
+    
+    def learn_action_policy(self, context: str, actions: List[str], success: bool):
+        """Learn reliable action policies"""
+        if context not in self.action_policies:
+            self.action_policies[context] = []
+        
+        if success and actions not in self.action_policies[context]:
+            self.action_policies[context].append(actions)
+            self._save_memory()
+    
+    def get_reliable_actions(self, context: str) -> List[str]:
+        """Get reliable actions for a context"""
+        policies = self.action_policies.get(context, [])
+        if policies:
+            # Return the most frequently successful policy
+            return policies[0]  # Simplified - could be more sophisticated
+        return []
     
     def _get_cache_key(self, tool: str, args: Dict[str, Any]) -> str:
         """Generate cache key for tool+args combination"""
@@ -426,6 +550,31 @@ class Orchestrator(dspy.Module):
         
         confidence = 0.9 if success else 0.5
         
+        # Expert-level learning: Update tool effectiveness and learn patterns
+        if active_memory:
+            # Update tool effectiveness
+            active_memory.update_tool_effectiveness(tool, success)
+            
+            # Learn from successful patterns
+            if success and not cache_hit:
+                context = self._extract_context_from_query(query)
+                tool_sequence = [tool]  # Could be extended to track sequences
+                reward = 0.8 if success else 0.3
+                active_memory.learn_expert_pattern(context, tool_sequence, success, reward)
+                
+                # Learn action policy
+                actions = [tool]
+                active_memory.learn_action_policy(context, actions, success)
+                
+                # Optimize prompts based on performance
+                original_prompt = f"Select the best tool for: {query}"
+                optimized_prompt = active_memory.optimize_prompt(context, original_prompt, success)
+                
+                # Add context insights
+                if success:
+                    insight = f"Tool '{tool}' works well for queries like: {query[:50]}..."
+                    active_memory.add_context_insight(context, insight)
+        
         # Record the orchestration action
         final_state = {
             "tool": tool,
@@ -477,6 +626,27 @@ class Orchestrator(dspy.Module):
             self.data_manager.log(success_log)
 
         return pred
+    
+    def _extract_context_from_query(self, query: str) -> str:
+        """Extract context type from query for expert learning"""
+        query_lower = query.lower()
+        
+        if any(word in query_lower for word in ['test', 'testing', 'pytest', 'unittest']):
+            return 'testing'
+        elif any(word in query_lower for word in ['build', 'compile', 'make', 'install']):
+            return 'building'
+        elif any(word in query_lower for word in ['debug', 'error', 'fix', 'bug']):
+            return 'debugging'
+        elif any(word in query_lower for word in ['refactor', 'clean', 'improve', 'optimize']):
+            return 'refactoring'
+        elif any(word in query_lower for word in ['implement', 'add', 'create', 'feature']):
+            return 'implementation'
+        elif any(word in query_lower for word in ['search', 'find', 'grep', 'look']):
+            return 'search'
+        elif any(word in query_lower for word in ['analyze', 'understand', 'explain', 'review']):
+            return 'analysis'
+        else:
+            return 'general'
     
     def _get_cache_key(self, query: str, state: str) -> str:
         """Generate cache key for prediction"""

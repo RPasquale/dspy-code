@@ -95,3 +95,16 @@ uv.lock
 
 # Local React frontend (not shared)
 frontend/
+
+# PyPI Publishing - SENSITIVE FILES (DO NOT COMMIT)
+PYPI_CREDENTIALS_SETUP.md
+scripts/secure_publish.sh
+scripts/publish_package.sh
+~/.config/uv/uv.toml
+.env
+.env.local
+.env.production
+.env.test
+
+# Generated files during development
+transformer.py

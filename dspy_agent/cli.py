@@ -7,6 +7,7 @@ import shlex
 import time
 import hashlib
 import shutil
+import subprocess
 from datetime import datetime
 from dataclasses import asdict
 from typing import Optional, List, Iterable, Tuple, Dict, Any, Literal, Mapping
@@ -81,10 +82,13 @@ from .training.deploy import DeploymentLogger
 from .status_http import start_status_server
 from .streaming.streaming_kafka import WorkerLoop, KafkaParams
 from .agents.knowledge import build_code_graph, summarize_code_graph
-from .templates.lightweight import (
-    render_dockerfile as _render_lightweight_dockerfile,
-    render_compose as _render_lightweight_compose,
-    extra_lightweight_assets,
+# Legacy helpers rely on template assets internally
+from .stack import (
+    DEFAULT_STACK_DIR,
+    compose_command as stack_compose_command,
+    docker_available as stack_docker_available,
+    ensure_dir as stack_ensure_dir,
+    prepare_stack,
 )
 import threading
 import json
@@ -118,6 +122,7 @@ from .rl.rlkit import (
 rl_app = typer.Typer(no_args_is_help=True, help="Reinforcement Learning commands")
 rl_config_app = typer.Typer(no_args_is_help=True, help="RL config helpers")
 rl_app.add_typer(rl_config_app, name="config")
+stack_app = typer.Typer(no_args_is_help=True, help="Docker stack helper commands")
 
 
 def _rl_build_make_env(
@@ -1324,6 +1329,7 @@ LIGHTWEIGHT_DIR = Path('docker/lightweight')
 
 # Register RL subcommands under main app
 app.add_typer(rl_app, name="rl")
+app.add_typer(stack_app, name="stack")
 
 
 @app.callback(invoke_without_command=True)
@@ -1338,18 +1344,24 @@ def main(
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs"),
     structured: bool = typer.Option(False, '--structured', help="Prefer structured outputs"),
     approval: Optional[str] = typer.Option(None, '--approval', help='Tool approval mode: auto|manual'),
+    coding_mode: bool = typer.Option(False, '--coding-mode', help="Enhanced coding assistant mode with build/test integration"),
 ):
-    """DSPy Agent - Trainable Coding Agent
+    """Blampert - Coding Assistant
     
     Start an interactive session to work with your codebase.
-    All functionality is available from within the session.
+    Enhanced with build/test capabilities and real-time learning.
     """
     if ctx.invoked_subcommand is None:
         # No subcommand provided, start interactive session
         ws = Path(workspace) if workspace else Path.cwd()
         logs_path = Path(logs) if logs else (ws / 'logs')
         
-        console.print("[green]Starting enhanced interactive session with memory and performance optimizations...[/green]")
+        if coding_mode:
+            console.print("[bold green]🚀 Starting Blampert - Claude Code-Style Coding Assistant...[/bold green]")
+            console.print("[cyan]Enhanced with build/test integration and real-time learning![/cyan]")
+        else:
+            console.print("[green]Starting Blampert enhanced interactive session with memory and performance optimizations...[/green]")
+        
         # Disable auto-training by default to avoid threading issues
         os.environ.setdefault('DSPY_AUTO_TRAIN', 'false')
         _start_interactive_session(
@@ -1361,7 +1373,8 @@ def main(
             api_key=api_key,
             force_json=force_json,
             structured=structured,
-            approval=approval
+            approval=approval,
+            coding_mode=coding_mode
         )
 
 
@@ -1375,6 +1388,7 @@ def _start_interactive_session(
     force_json: bool = False,
     structured: bool = False,
     approval: Optional[str] = None,
+    coding_mode: bool = False,
 ):
     """Start the interactive session - this is the main entry point."""
     # Call the start command function
@@ -1387,7 +1401,8 @@ def _start_interactive_session(
         api_key=api_key,
         force_json=force_json,
         structured=structured,
-        approval=approval
+        approval=approval,
+        coding_mode=coding_mode
     )
 
 
@@ -2469,44 +2484,168 @@ def up(
 # Lightweight Containers (Local)
 # -----------------------------
 
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+
+def _stack_compose_path(root: Path) -> Path:
+    return root / 'docker-compose.yml'
 
 
-def _validate_paths(ws: Path, logs: Optional[Path]) -> list[str]:
-    errs: list[str] = []
-    # Ensure workspace directory exists
-    if not ws.exists():
-        try:
-            ws.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            errs.append(f"failed to create workspace: {ws} ({e})")
-    elif not ws.is_dir():
-        errs.append(f"workspace is not a directory: {ws}")
+@stack_app.command("init")
+def stack_init(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=False, help="Project directory to mount"),
+    logs: Optional[Path] = typer.Option(None, '--logs', dir_okay=True, file_okay=False, exists=False, help="Optional logs directory to mount read-only"),
+    out_dir: Path = typer.Option(DEFAULT_STACK_DIR, '--out-dir', help="Where generated Docker assets will live"),
+    db: str = typer.Option("auto", '--db', help="Storage backend: auto|none|reddb"),
+    install_source: str = typer.Option('pip', '--install-source', case_sensitive=False, help="Install dspy-code inside containers via pip or from local source"),
+    pip_spec: Optional[str] = typer.Option(None, '--pip-spec', help="Override pip spec when --install-source pip (e.g. dspy-code==0.1.0)"),
+    start: bool = typer.Option(True, '--start/--no-start', help="Run docker compose up -d after generating assets"),
+    build: bool = typer.Option(True, '--build/--no-build', help="Build images on first start"),
+):
+    try:
+        bundle = prepare_stack(
+            workspace=workspace,
+            logs=logs,
+            out_dir=out_dir,
+            db=db,
+            install_source=install_source,
+            pip_spec=pip_spec,
+        )
+    except Exception as exc:
+        console.print(Panel(escape(str(exc)), title='stack init failed', border_style='red'))
+        raise typer.Exit(1)
 
-    # Ensure logs directory exists if provided
-    if logs:
-        if not logs.exists():
-            try:
-                logs.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                errs.append(f"failed to create logs dir: {logs} ({e})")
-        elif not logs.is_dir():
-            errs.append(f"logs path is not a directory: {logs}")
-    return errs
+    rel_compose = bundle.compose
+    rel_dockerfile = bundle.dockerfile
+    try:
+        rel_compose = rel_compose.relative_to(Path.cwd())
+    except ValueError:
+        pass
+    try:
+        rel_dockerfile = rel_dockerfile.relative_to(Path.cwd())
+    except ValueError:
+        pass
+
+    message_lines = [
+        f"Dockerfile: {rel_dockerfile}",
+        f"Compose: {rel_compose}",
+    ]
+    if bundle.warnings:
+        console.print(Panel('\n'.join(f'- {w}' for w in bundle.warnings), title='adjustments', border_style='yellow'))
+    console.print(Panel('\n'.join(message_lines), title='stack init', border_style='green'))
+
+    if not start:
+        console.print(Panel("Run 'dspy-code stack up' when you are ready.", title='next step', border_style='cyan'))
+        raise typer.Exit(0)
+
+    if not stack_docker_available():
+        console.print('[yellow]Docker is not available. Install Docker Desktop or CLI, then run `dspy-code stack up`.[/yellow]')
+        raise typer.Exit(1)
+
+    compose_path = bundle.compose
+    try:
+        if build:
+            stack_compose_command(compose_path, ['build'])
+        stack_compose_command(compose_path, ['up', '-d'])
+    except RuntimeError as exc:
+        console.print(Panel(escape(str(exc)), title='docker compose', border_style='red'))
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError as exc:
+        console.print(Panel(f"docker compose exited with code {exc.returncode}", title='docker compose', border_style='red'))
+        raise typer.Exit(exc.returncode)
+
+    console.print(Panel("Stack is running! Visit http://localhost:8081 to access the dashboard once containers are ready.", title='stack up', border_style='green'))
+
+
+def _stack_require_compose(stack_dir: Path) -> Path:
+    compose = _stack_compose_path(stack_dir)
+    if not compose.exists():
+        console.print(Panel(f"Compose file not found at {compose}. Run 'dspy-code stack init' first.", title='stack', border_style='red'))
+        raise typer.Exit(1)
+    return compose
+
+
+@stack_app.command("up")
+def stack_up(
+    stack_dir: Path = typer.Option(DEFAULT_STACK_DIR, '--dir', help="Directory containing docker-compose.yml"),
+    build: bool = typer.Option(False, '--build', help="Perform docker compose build before up"),
+):
+    if not stack_docker_available():
+        console.print('[yellow]Docker is not available on PATH. Install Docker and retry.[/yellow]')
+        raise typer.Exit(1)
+    compose = _stack_require_compose(stack_dir)
+    try:
+        if build:
+            stack_compose_command(compose, ['build'])
+        stack_compose_command(compose, ['up', '-d'])
+    except RuntimeError as exc:
+        console.print(Panel(escape(str(exc)), title='docker compose', border_style='red'))
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError as exc:
+        console.print(Panel(f"docker compose exited with code {exc.returncode}", title='docker compose', border_style='red'))
+        raise typer.Exit(exc.returncode)
+    console.print('[green]Stack is running.[/green]')
+
+
+@stack_app.command("down")
+def stack_down(
+    stack_dir: Path = typer.Option(DEFAULT_STACK_DIR, '--dir', help="Directory containing docker-compose.yml"),
+):
+    if not stack_docker_available():
+        console.print('[yellow]Docker is not available on PATH. Install Docker and retry.[/yellow]')
+        raise typer.Exit(1)
+    compose = _stack_require_compose(stack_dir)
+    try:
+        stack_compose_command(compose, ['down'])
+    except RuntimeError as exc:
+        console.print(Panel(escape(str(exc)), title='docker compose', border_style='red'))
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError as exc:
+        console.print(Panel(f"docker compose exited with code {exc.returncode}", title='docker compose', border_style='red'))
+        raise typer.Exit(exc.returncode)
+    console.print('[green]Stack stopped.[/green]')
+
+
+@stack_app.command("status")
+def stack_status(
+    stack_dir: Path = typer.Option(DEFAULT_STACK_DIR, '--dir', help="Directory containing docker-compose.yml"),
+):
+    if not stack_docker_available():
+        console.print('[yellow]Docker is not available on PATH. Install Docker and retry.[/yellow]')
+        raise typer.Exit(1)
+    compose = _stack_require_compose(stack_dir)
+    try:
+        stack_compose_command(compose, ['ps'], check=False)
+    except RuntimeError as exc:
+        console.print(Panel(escape(str(exc)), title='docker compose', border_style='red'))
+        raise typer.Exit(1)
+
+
+@stack_app.command("logs")
+def stack_logs(
+    stack_dir: Path = typer.Option(DEFAULT_STACK_DIR, '--dir', help="Directory containing docker-compose.yml"),
+    follow: bool = typer.Option(True, '--follow/--no-follow', help="Stream logs"),
+    service: Optional[str] = typer.Option(None, '--service', help="Optional service name to filter"),
+):
+    if not stack_docker_available():
+        console.print('[yellow]Docker is not available on PATH. Install Docker and retry.[/yellow]')
+        raise typer.Exit(1)
+    compose = _stack_require_compose(stack_dir)
+    args = ['logs']
+    if follow:
+        args.append('-f')
+    if service:
+        args.append(service)
+    try:
+        stack_compose_command(compose, args, check=False)
+    except RuntimeError as exc:
+        console.print(Panel(escape(str(exc)), title='docker compose', border_style='red'))
+        raise typer.Exit(1)
+
+def _ensure_dir(path: Path) -> None:
+    stack_ensure_dir(path)
 
 
 def _docker_available() -> bool:
-    import shutil
-    return shutil.which('docker') is not None
-
-
-def _compose_yaml(image: str, host_ws: Path, host_logs: Optional[Path], db_backend: str) -> str:
-    return _render_lightweight_compose(image=image, host_ws=host_ws, host_logs=host_logs, db_backend=db_backend)
-
-
-def _dockerfile(install_source: str = "pip", pip_spec: Optional[str] = None) -> str:
-    return _render_lightweight_dockerfile(install_source=install_source, pip_spec=pip_spec)
+    return stack_docker_available()
 
 
 
@@ -2526,75 +2665,21 @@ def lightweight_init(
         None, '--pip-spec', help="Override pip spec when --install-source pip (e.g. dspy-code==0.1.0).",
     ),
 ):
-    _ensure_dir(out_dir)
-
-    install_mode = install_source.lower()
-    warns: list[str] = []
-
-    ws = workspace
-    lg = logs
     try:
-        if not ws.exists():
-            ws.mkdir(parents=True, exist_ok=True)
-        if not ws.is_dir():
-            raise RuntimeError('not a directory')
-    except Exception as e:
-        fallback = Path.cwd()
-        warns.append(f"workspace not usable: {ws} ({e}); falling back to {fallback}")
-        ws = fallback
-    if lg is not None:
-        try:
-            if not lg.exists():
-                lg.mkdir(parents=True, exist_ok=True)
-            if not lg.is_dir():
-                raise RuntimeError('not a directory')
-        except Exception as e:
-            warns.append(f"logs not usable: {lg} ({e}); disabling logs mount")
-            lg = None
-
-    pip_spec_value = pip_spec.strip() if pip_spec else None
-    if install_mode != 'pip' and pip_spec_value:
-        warns.append('--pip-spec is ignored when --install-source local')
-        pip_spec_value = None
-
-    for asset in extra_lightweight_assets():
-        target = out_dir / asset.relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(asset.content)
-        if asset.executable:
-            try:
-                target.chmod(0o755)
-            except Exception:
-                warns.append(f'could not mark {target} as executable')
-
-    if install_mode == 'local':
-        src_root = Path(__file__).resolve().parent.parent
-        pkg_src = src_root / 'dspy_agent'
-        dest_pkg = out_dir / 'dspy_agent'
-        if pkg_src.exists():
-            if dest_pkg.exists():
-                shutil.rmtree(dest_pkg)
-            shutil.copytree(pkg_src, dest_pkg)
-        else:
-            warns.append(f'could not find source package at {pkg_src}; docker build may fail')
-        for name in ('pyproject.toml', 'README.md'):
-            src_path = src_root / name
-            if src_path.exists():
-                shutil.copy2(src_path, out_dir / name)
-            else:
-                warns.append(f'could not find {name} at {src_path}; docker build may fail')
-
-    df = out_dir / 'Dockerfile'
-    dc = out_dir / 'docker-compose.yml'
-    try:
-        df.write_text(_dockerfile(install_source=install_mode, pip_spec=pip_spec_value))
-        dc.write_text(_compose_yaml(image='dspy-lightweight:latest', host_ws=ws, host_logs=lg, db_backend=db))
-    except Exception as e:
-        console.print(Panel(escape(str(e)), title='write failed', border_style='red'))
+        bundle = prepare_stack(
+            workspace=workspace,
+            logs=logs,
+            out_dir=out_dir,
+            db=db,
+            install_source=install_source,
+            pip_spec=pip_spec,
+        )
+    except Exception as exc:
+        console.print(Panel(escape(str(exc)), title='write failed', border_style='red'))
         raise typer.Exit(1)
 
-    if warns:
-        console.print(Panel('\n'.join(f'- {w}' for w in warns), title='adjustments', border_style='yellow'))
+    if bundle.warnings:
+        console.print(Panel('\n'.join(f'- {w}' for w in bundle.warnings), title='adjustments', border_style='yellow'))
 
     def _display_path(path: Path) -> str:
         try:
@@ -2603,10 +2688,10 @@ def lightweight_init(
             return str(path)
 
     console.print(Panel.fit(
-        f"Wrote:\n- {_display_path(df)}\n- {_display_path(dc)}", title='lightweight init', border_style='green'
+        f"Wrote:\n- {_display_path(bundle.dockerfile)}\n- {_display_path(bundle.compose)}", title='lightweight init', border_style='green'
     ))
 
-    compose_path_str = _display_path(dc)
+    compose_path_str = _display_path(bundle.compose)
     next_steps = [
         f"1) Review {compose_path_str} and adjust env as needed (REDDB_URL, OPENAI_BASE_URL, etc.)",
         f"2) Build the image: docker compose -f {compose_path_str} build",
@@ -2949,8 +3034,45 @@ def chat(
                 result_metrics=tool_metrics or None,
                 result_info=tool_info or None,
             ); piece=f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
+            
+            # Create and record tool result for memory
+            if memory:
+                # Determine success based on tool metrics and outcome
+                success = False
+                if tool_metrics and "applied" in tool_metrics:
+                    success = tool_metrics["applied"]
+                elif outcome.score >= 1.0:  # High score indicates success
+                    success = True
+                elif tool_metrics and "blast_radius" in tool_metrics:
+                    success = tool_metrics["blast_radius"] > 0  # Any changes made
+                
+                tool_result = ToolResult(
+                    tool=tool,
+                    args=dict(args),
+                    result=piece,
+                    success=success,
+                    timestamp=time.time(),
+                    execution_time=0.1,  # Approximate
+                    score=outcome.score,
+                    feedback=outcome.evidence
+                )
+                memory.add_tool_result(tool_result)
+                
         except Exception:
             piece=f"{tool}: done"
+            # Still record the tool result even if evaluation failed
+            if memory:
+                tool_result = ToolResult(
+                    tool=tool,
+                    args=dict(args),
+                    result=piece,
+                    success=False,
+                    timestamp=time.time(),
+                    execution_time=0.1,
+                    score=0.0,
+                    feedback="Tool execution completed but evaluation failed"
+                )
+                memory.add_tool_result(tool_result)
         history_summary = (history_summary + " | " + piece).strip()
         if step >= 2 and ("score=" in piece and float(piece.split("score=")[1].split(";")[0]) >= 1.2):
             break
@@ -4159,6 +4281,7 @@ def start_command(
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
     structured: bool = typer.Option(False, '--structured', help="Prefer structured-outputs when available (overrides --force-json)"),
     approval: Optional[str] = typer.Option(None, '--approval', help='Tool approval mode: auto|manual'),
+    coding_mode: bool = typer.Option(False, '--coding-mode', help="Enhanced coding assistant mode with build/test integration"),
 ):
     """Interactive session to pick workspace/logs and run tasks."""
     ws = Path(workspace) if workspace else Path.cwd()
@@ -4246,7 +4369,7 @@ def start_command(
 
     console.print(Panel.fit(
         f"Workspace: {ws}\nLogs: {logs_path}\nLLM: {llm_label}\nApproval: {approval_mode}\nTip: Type natural instructions — the agent will choose tools.",
-        title="dspy-coder session",
+        title="blampert session",
         border_style="cyan"
     ))
 
@@ -4269,7 +4392,72 @@ def start_command(
             console.print(Panel(f"auto-training unavailable: {e}", title="auto-train", border_style="yellow"))
 
     def show_help():
-        console.print(Panel.fit(
+        if coding_mode:
+            console.print(Panel.fit(
+                "🚀  Coding Assistant Commands:\n\n"
+                "📁 Workspace & Navigation:\n"
+                "  help                Show this help\n"
+                "  ws                  Show workspace\n"
+                "  cd <PATH>           Change workspace\n"
+                "  ls [PATH]           List files (relative to workspace)\n"
+                "  tree [PATH] [-d N] [--hidden]  Show directory tree (default depth 2)\n"
+                "  open <PATH>         Open a file in $EDITOR / OS default\n\n"
+                "🔍 Code Analysis & Search:\n"
+                "  grep <PATTERN>      Search (flags: -f fixed, -c N, -g GLOB, -x GLOB, -F FILE)\n"
+                "  extract --file F [--symbol NAME | --re REGEX --before N --after N]\n"
+                "  sg [-p PATTERN] [-l LANG] [-r RULE.yaml] [--json] Run ast-grep\n"
+                "  codectx [PATH]      Summarize code file/dir\n"
+                "  index               Build code index for semantic search\n"
+                "  esearch <QUERY>     Semantic search over index\n"
+                "  emb-index [-m MODEL] Build embedding index (requires embeddings provider)\n"
+                "  emb-search <QUERY> [-m MODEL] Embedding search\n\n"
+                "🛠️  Coding & Development:\n"
+                "  edit <TASK> [--apply]  Propose patch (and optionally apply)\n"
+                "  build [--clean]     Build the project (auto-detects build system)\n"
+                "  test [--coverage]   Run tests with optional coverage\n"
+                "  lint [--fix]        Run linter with optional auto-fix\n"
+                "  run <COMMAND>       Execute shell command safely\n"
+                "  patch <PATCHFILE>   Apply unified diff patch\n"
+                "  diff <FILE>         Diff last extract against FILE\n"
+                "  write <PATH>        Save last extract to file\n\n"
+                "🚀 Development Workflow:\n"
+                "  dev quick [msg]     Quick dev cycle (format, test, commit, push)\n"
+                "  dev build           Build package\n"
+                "  dev test            Run tests\n"
+                "  dev lint            Run linter\n"
+                "  dev format          Format code\n"
+                "  dev status          Show git status\n"
+                "  dev version         Show current version\n"
+                "  release [type]      Full release workflow (patch/minor/major)\n"
+                "  publish [--test]    Publish to PyPI (or Test PyPI)\n\n"
+                "📊 Planning & Context:\n"
+                "  plan <TASK>         Propose plan + commands\n"
+                "  ctx                 Show context from logs\n"
+                "  logs [PATH]         Show or set logs path\n"
+                "  watch [-n SECS] [-t LINES]  Tail + refresh key events\n\n"
+                "🤖 Agent & Learning:\n"
+                "  stats               Show agent stats and rewards\n"
+                "  auto [status|enable|disable|restart] Manage auto-training loop\n"
+                "  learn <TASK>        Learn from successful coding patterns\n"
+                "  feedback <SCORE>    Provide feedback on last action (0-10)\n\n"
+                "🎓 Expert-Level Features:\n"
+                "  expert-patterns     Show learned expert patterns\n"
+                "  expert-tools        Show most effective tools\n"
+                "  expert-insights     Show codebase insights\n"
+                "  expert-optimize     Optimize prompts and policies\n"
+                "  expert-status       Show expert-level status\n\n"
+                "📝 Git & Version Control:\n"
+                "  gstatus             Git status (short)\n"
+                "  gadd <PATHS...>     Git add files\n"
+                "  gcommit -m MSG      Git commit with message\n\n"
+                "⚙️  Configuration:\n"
+                "  ollama on|off       Toggle Ollama provider\n"
+                "  model <NAME>        Set model name\n"
+                "  coding-mode on|off  Toggle enhanced coding mode\n",
+                title="🚀 Blampert Code Assistant", border_style="green"
+            ))
+        else:
+            console.print(Panel.fit(
             "Commands:\n"
             "  help                Show this help\n"
             "  ws                  Show workspace\n"
@@ -4300,9 +4488,8 @@ def start_command(
             "  gcommit -m MSG      Git commit with message\n"
             "  ollama on|off       Toggle Ollama provider\n"
             "  model <NAME>        Set model name\n"
-            "  exit|quit           Leave session",
-            title="help",
-            border_style="magenta"
+                "  coding-mode on|off  Toggle enhanced coding mode\n",
+                title="DSPy Agent Commands", border_style="cyan"
         ))
 
     def build_state() -> str:
@@ -4522,6 +4709,30 @@ def start_command(
             try:
                 outcome = evaluate_tool_choice(tool, args, workspace=ws, logs_path=logs_path, targets=targets)
                 piece = f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
+                
+                # Create and record tool result for memory
+                if memory:
+                    # Determine success based on tool metrics and outcome
+                    success = False
+                    if tool_metrics and "applied" in tool_metrics:
+                        success = tool_metrics["applied"]
+                    elif outcome.score >= 1.0:  # High score indicates success
+                        success = True
+                    elif tool_metrics and "blast_radius" in tool_metrics:
+                        success = tool_metrics["blast_radius"] > 0  # Any changes made
+                    
+                    tool_result = ToolResult(
+                        tool=tool,
+                        args=dict(args),
+                        result=piece,
+                        success=success,
+                        timestamp=time.time(),
+                        execution_time=0.1,  # Approximate
+                        score=outcome.score,
+                        feedback=outcome.evidence
+                    )
+                    memory.add_tool_result(tool_result)
+                
                 # Update RL bandit with a clipped reward in [0,1]
                 try:
                     r = float(outcome.score)
@@ -4584,6 +4795,29 @@ def start_command(
                 )
                 forced_evidence = forced_outcome.evidence
                 piece = f"edit: score={forced_outcome.score:.2f}; {forced_evidence}"
+                
+                # Create and record tool result for memory
+                if memory:
+                    # Determine success based on tool metrics and outcome
+                    success = False
+                    if tool_metrics and "applied" in tool_metrics:
+                        success = tool_metrics["applied"]
+                    elif forced_outcome.score >= 1.0:  # High score indicates success
+                        success = True
+                    elif tool_metrics and "blast_radius" in tool_metrics:
+                        success = tool_metrics["blast_radius"] > 0  # Any changes made
+                    
+                    tool_result = ToolResult(
+                        tool="edit",
+                        args=dict(forced_args),
+                        result=piece,
+                        success=success,
+                        timestamp=time.time(),
+                        execution_time=0.1,  # Approximate
+                        score=forced_outcome.score,
+                        feedback=forced_evidence
+                    )
+                    memory.add_tool_result(tool_result)
             except Exception as e:
                 forced_evidence = str(e)
                 piece = f"edit: forced patch failed ({e})"
@@ -5050,7 +5284,7 @@ def start_command(
     show_help()
     while True:
         try:
-            line = input("dspy-coder> ").strip()
+            line = input("blampert> ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]bye[/dim]")
             break
@@ -5576,6 +5810,100 @@ def start_command(
                         console.print("[yellow]Invalid tail lines[/yellow]")
                 i += 1
             _watch_logs(logs_path, tail_lines=tail_lines, interval=interval)
+        # Enhanced coding commands
+        elif cmd == "coding-mode":
+            if len(args) >= 1 and args[0] in ["on", "off"]:
+                coding_mode = args[0] == "on"
+                console.print(f"[green]Coding mode: {'enabled' if coding_mode else 'disabled'}[/green]")
+            else:
+                console.print(f"[cyan]Coding mode: {'enabled' if coding_mode else 'disabled'}[/cyan]")
+        
+        elif cmd == "build":
+            if coding_mode:
+                _handle_build_command(args, ws)
+            else:
+                console.print("[yellow]Build command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "test":
+            if coding_mode:
+                _handle_test_command(args, ws)
+            else:
+                console.print("[yellow]Test command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "lint":
+            if coding_mode:
+                _handle_lint_command(args, ws)
+            else:
+                console.print("[yellow]Lint command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "run":
+            if coding_mode:
+                _handle_run_command(args, ws)
+            else:
+                console.print("[yellow]Run command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "learn":
+            if coding_mode:
+                _handle_learn_command(args, ws, lm)
+            else:
+                console.print("[yellow]Learn command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "feedback":
+            if coding_mode:
+                _handle_feedback_command(args, ws)
+            else:
+                console.print("[yellow]Feedback command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        # Development workflow commands
+        elif cmd == "dev":
+            if coding_mode:
+                _handle_dev_command(args, ws)
+            else:
+                console.print("[yellow]Dev command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "release":
+            if coding_mode:
+                _handle_release_command(args, ws)
+            else:
+                console.print("[yellow]Release command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "publish":
+            if coding_mode:
+                _handle_publish_command(args, ws)
+            else:
+                console.print("[yellow]Publish command requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        # Expert-level feature commands
+        elif cmd == "expert-patterns":
+            if coding_mode:
+                _handle_expert_patterns_command(args, ws)
+            else:
+                console.print("[yellow]Expert patterns requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "expert-tools":
+            if coding_mode:
+                _handle_expert_tools_command(args, ws)
+            else:
+                console.print("[yellow]Expert tools requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "expert-insights":
+            if coding_mode:
+                _handle_expert_insights_command(args, ws)
+            else:
+                console.print("[yellow]Expert insights requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "expert-optimize":
+            if coding_mode:
+                _handle_expert_optimize_command(args, ws)
+            else:
+                console.print("[yellow]Expert optimize requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
+        elif cmd == "expert-status":
+            if coding_mode:
+                _handle_expert_status_command(args, ws)
+            else:
+                console.print("[yellow]Expert status requires coding mode. Use 'coding-mode on' to enable.[/yellow]")
+        
         elif cmd in {"exit", "quit"}:
             break
         else:
@@ -5584,6 +5912,595 @@ def start_command(
 
     if auto_runner:
         auto_runner.stop()
+
+
+def _handle_build_command(args: List[str], ws: Path):
+    """Handle build command with auto-detection of build system"""
+    clean = "--clean" in args
+    
+    # Auto-detect build system
+    build_commands = []
+    
+    if (ws / "package.json").exists():
+        build_commands.append(("npm run build", "Node.js/npm"))
+    elif (ws / "yarn.lock").exists():
+        build_commands.append(("yarn build", "Node.js/yarn"))
+    elif (ws / "pyproject.toml").exists():
+        build_commands.append(("uv build", "Python/uv"))
+    elif (ws / "setup.py").exists() or (ws / "requirements.txt").exists():
+        build_commands.append(("python -m build", "Python/setuptools"))
+    elif (ws / "Cargo.toml").exists():
+        build_commands.append(("cargo build", "Rust/Cargo"))
+    elif (ws / "go.mod").exists():
+        build_commands.append(("go build", "Go"))
+    elif (ws / "Makefile").exists():
+        build_commands.append(("make", "Make"))
+    elif (ws / "CMakeLists.txt").exists():
+        build_commands.append(("cmake --build .", "CMake"))
+    
+    if not build_commands:
+        console.print("[yellow]No build system detected. Available build files:[/yellow]")
+        for build_file in ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", "Makefile", "CMakeLists.txt"]:
+            if (ws / build_file).exists():
+                console.print(f"  ✓ {build_file}")
+        return
+    
+    for cmd, system in build_commands:
+        console.print(f"[cyan]Building with {system}...[/cyan]")
+        if clean and "clean" in cmd.lower():
+            clean_cmd = cmd.replace("build", "clean")
+            console.print(f"[dim]Running: {clean_cmd}[/dim]")
+            result = os.system(f"cd {ws} && {clean_cmd}")
+            if result != 0:
+                console.print(f"[yellow]Clean command failed (exit code: {result})[/yellow]")
+        
+        console.print(f"[dim]Running: {cmd}[/dim]")
+        result = os.system(f"cd {ws} && {cmd}")
+        
+        if result == 0:
+            console.print(f"[green]✅ Build successful with {system}![/green]")
+        else:
+            console.print(f"[red]❌ Build failed with {system} (exit code: {result})[/red]")
+
+
+def _handle_test_command(args: List[str], ws: Path):
+    """Handle test command with auto-detection of test framework"""
+    coverage = "--coverage" in args
+    
+    # Auto-detect test framework
+    test_commands = []
+    
+    if (ws / "package.json").exists():
+        test_cmd = "npm test"
+        if coverage:
+            test_cmd = "npm run test:coverage" if "test:coverage" in (ws / "package.json").read_text() else "npm test -- --coverage"
+        test_commands.append((test_cmd, "Node.js/npm"))
+    elif (ws / "yarn.lock").exists():
+        test_cmd = "yarn test"
+        if coverage:
+            test_cmd = "yarn test:coverage" if "test:coverage" in (ws / "package.json").read_text() else "yarn test --coverage"
+        test_commands.append((test_cmd, "Node.js/yarn"))
+    elif (ws / "pyproject.toml").exists():
+        test_cmd = "uv run pytest"
+        if coverage:
+            test_cmd = "uv run pytest --cov"
+        test_commands.append((test_cmd, "Python/pytest"))
+    elif (ws / "pytest.ini").exists() or (ws / "setup.cfg").exists():
+        test_cmd = "pytest"
+        if coverage:
+            test_cmd = "pytest --cov"
+        test_commands.append((test_cmd, "Python/pytest"))
+    elif (ws / "Cargo.toml").exists():
+        test_commands.append(("cargo test", "Rust/Cargo"))
+    elif (ws / "go.mod").exists():
+        test_cmd = "go test ./..."
+        if coverage:
+            test_cmd = "go test -cover ./..."
+        test_commands.append((test_cmd, "Go"))
+    elif (ws / "Makefile").exists():
+        test_commands.append(("make test", "Make"))
+    
+    if not test_commands:
+        console.print("[yellow]No test framework detected. Looking for test files...[/yellow]")
+        test_files = list(ws.glob("**/test_*.py")) + list(ws.glob("**/*_test.py")) + list(ws.glob("**/*.test.js"))
+        if test_files:
+            console.print(f"Found {len(test_files)} test files. Try running tests manually.")
+        return
+    
+    for cmd, system in test_commands:
+        console.print(f"[cyan]Running tests with {system}...[/cyan]")
+        console.print(f"[dim]Running: {cmd}[/dim]")
+        result = os.system(f"cd {ws} && {cmd}")
+        
+        if result == 0:
+            console.print(f"[green]✅ All tests passed with {system}![/green]")
+        else:
+            console.print(f"[red]❌ Tests failed with {system} (exit code: {result})[/red]")
+
+
+def _handle_lint_command(args: List[str], ws: Path):
+    """Handle lint command with auto-detection of linter"""
+    fix = "--fix" in args
+    
+    # Auto-detect linter
+    lint_commands = []
+    
+    if (ws / "package.json").exists():
+        if "eslint" in (ws / "package.json").read_text():
+            cmd = "npx eslint ."
+            if fix:
+                cmd += " --fix"
+            lint_commands.append((cmd, "ESLint"))
+        if "prettier" in (ws / "package.json").read_text():
+            cmd = "npx prettier --check ."
+            if fix:
+                cmd = "npx prettier --write ."
+            lint_commands.append((cmd, "Prettier"))
+    elif (ws / "pyproject.toml").exists():
+        if "ruff" in (ws / "pyproject.toml").read_text():
+            cmd = "uv run ruff check ."
+            if fix:
+                cmd += " --fix"
+            lint_commands.append((cmd, "Ruff"))
+        if "black" in (ws / "pyproject.toml").read_text():
+            cmd = "uv run black --check ."
+            if fix:
+                cmd = "uv run black ."
+            lint_commands.append((cmd, "Black"))
+    elif (ws / "Cargo.toml").exists():
+        lint_commands.append(("cargo clippy", "Clippy"))
+    elif (ws / "go.mod").exists():
+        lint_commands.append(("go vet ./...", "Go vet"))
+        lint_commands.append(("gofmt -l .", "Go fmt"))
+    
+    if not lint_commands:
+        console.print("[yellow]No linter detected. Available linters:[/yellow]")
+        console.print("  • ESLint/Prettier (Node.js)")
+        console.print("  • Ruff/Black (Python)")
+        console.print("  • Clippy (Rust)")
+        console.print("  • go vet/gofmt (Go)")
+        return
+    
+    for cmd, linter in lint_commands:
+        console.print(f"[cyan]Running {linter}...[/cyan]")
+        console.print(f"[dim]Running: {cmd}[/dim]")
+        result = os.system(f"cd {ws} && {cmd}")
+        
+        if result == 0:
+            console.print(f"[green]✅ {linter} passed![/green]")
+        else:
+            console.print(f"[yellow]⚠️  {linter} found issues (exit code: {result})[/yellow]")
+
+
+def _handle_run_command(args: List[str], ws: Path):
+    """Handle run command for safe shell execution"""
+    if not args:
+        console.print("[yellow]Usage: run <COMMAND>[/yellow]")
+        return
+    
+    command = " ".join(args)
+    console.print(f"[cyan]Running: {command}[/cyan]")
+    console.print(f"[dim]Working directory: {ws}[/dim]")
+    
+    result = os.system(f"cd {ws} && {command}")
+    
+    if result == 0:
+        console.print(f"[green]✅ Command completed successfully![/green]")
+    else:
+        console.print(f"[red]❌ Command failed (exit code: {result})[/red]")
+
+
+def _handle_learn_command(args: List[str], ws: Path, lm):
+    """Handle learn command to learn from successful coding patterns"""
+    if not args:
+        console.print("[yellow]Usage: learn <TASK_DESCRIPTION>[/yellow]")
+        return
+    
+    task = " ".join(args)
+    console.print(f"[cyan]Learning from: {task}[/cyan]")
+    
+    # Record successful coding pattern
+    from dspy_agent.db import get_enhanced_data_manager, create_action_record, ActionType, Environment
+    
+    dm = get_enhanced_data_manager()
+    
+    action_record = create_action_record(
+        action_type=ActionType.CODE_ANALYSIS,
+        state_before={"task": task, "status": "learning"},
+        state_after={"task": task, "status": "learned"},
+        parameters={"task": task, "workspace": str(ws)},
+        result={"success": True, "message": f"Learned from successful coding pattern: {task}"},
+        reward=0.9,  # High reward for learning
+        confidence=0.8,
+        execution_time=0.1,
+        environment=Environment.DEVELOPMENT
+    )
+    
+    dm.record_action(action_record)
+    console.print(f"[green]✅ Learned from coding pattern: {task}[/green]")
+
+
+def _handle_feedback_command(args: List[str], ws: Path):
+    """Handle feedback command to provide feedback on last action"""
+    if not args:
+        console.print("[yellow]Usage: feedback <SCORE> (0-10)[/yellow]")
+        return
+    
+    try:
+        score = float(args[0])
+        if not 0 <= score <= 10:
+            console.print("[red]Score must be between 0 and 10[/red]")
+            return
+    except ValueError:
+        console.print("[red]Invalid score. Must be a number between 0 and 10[/red]")
+        return
+    
+    # Record feedback
+    from dspy_agent.db import get_enhanced_data_manager, create_action_record, ActionType, Environment
+    
+    dm = get_enhanced_data_manager()
+    
+    action_record = create_action_record(
+        action_type=ActionType.CODE_ANALYSIS,
+        state_before={"feedback": "pending"},
+        state_after={"feedback": "recorded"},
+        parameters={"score": score, "workspace": str(ws)},
+        result={"success": True, "message": f"Feedback recorded: {score}/10"},
+        reward=score / 10.0,  # Normalize to 0-1
+        confidence=1.0,
+        execution_time=0.1,
+        environment=Environment.DEVELOPMENT
+    )
+    
+    dm.record_action(action_record)
+    console.print(f"[green]✅ Feedback recorded: {score}/10[/green]")
+
+
+def _handle_expert_patterns_command(args: List[str], ws: Path):
+    """Handle expert patterns command"""
+    console.print("[cyan]🎓 Expert Learning Patterns[/cyan]")
+    
+    # Load memory from workspace
+    memory_file = ws / '.dspy_session_memory.json'
+    if not memory_file.exists():
+        console.print("[yellow]No expert patterns found. Start using the agent to build patterns![/yellow]")
+        return
+    
+    try:
+        with open(memory_file, 'r') as f:
+            data = json.load(f)
+        
+        expert_patterns = data.get('expert_patterns', {})
+        if not expert_patterns:
+            console.print("[yellow]No expert patterns learned yet. Keep using the agent![/yellow]")
+            return
+        
+        for context, patterns in expert_patterns.items():
+            console.print(f"\n[bold]{context.title()} Context:[/bold]")
+            for i, pattern in enumerate(patterns[:3], 1):  # Show top 3 patterns
+                success_rate = "✅" if pattern.get('success', False) else "❌"
+                reward = pattern.get('reward', 0)
+                frequency = pattern.get('frequency', 1)
+                tools = pattern.get('tool_sequence', [])
+                
+                console.print(f"  {i}. {success_rate} Tools: {', '.join(tools)}")
+                console.print(f"     Reward: {reward:.2f}, Frequency: {frequency}")
+    
+    except Exception as e:
+        console.print(f"[red]Error loading expert patterns: {e}[/red]")
+
+
+def _handle_expert_tools_command(args: List[str], ws: Path):
+    """Handle expert tools command"""
+    console.print("[cyan]🔧 Most Effective Tools[/cyan]")
+    
+    # Load memory from workspace
+    memory_file = ws / '.dspy_session_memory.json'
+    if not memory_file.exists():
+        console.print("[yellow]No tool effectiveness data found. Start using tools to build data![/yellow]")
+        return
+    
+    try:
+        with open(memory_file, 'r') as f:
+            data = json.load(f)
+        
+        tool_effectiveness = data.get('tool_effectiveness', {})
+        if not tool_effectiveness:
+            console.print("[yellow]No tool effectiveness data yet. Keep using tools![/yellow]")
+            return
+        
+        # Sort tools by effectiveness
+        sorted_tools = sorted(tool_effectiveness.items(), key=lambda x: x[1], reverse=True)
+        
+        console.print("\n[bold]Tool Effectiveness Rankings:[/bold]")
+        for i, (tool, effectiveness) in enumerate(sorted_tools[:10], 1):
+            effectiveness_pct = effectiveness * 100
+            if effectiveness_pct >= 80:
+                color = "green"
+                emoji = "🟢"
+            elif effectiveness_pct >= 60:
+                color = "yellow"
+                emoji = "🟡"
+            else:
+                color = "red"
+                emoji = "🔴"
+            
+            console.print(f"  {i:2d}. {emoji} [bold]{tool}[/bold] - [{color}]{effectiveness_pct:.1f}%[/{color}]")
+    
+    except Exception as e:
+        console.print(f"[red]Error loading tool effectiveness: {e}[/red]")
+
+
+def _handle_expert_insights_command(args: List[str], ws: Path):
+    """Handle expert insights command"""
+    console.print("[cyan]💡 Codebase Insights[/cyan]")
+    
+    # Load memory from workspace
+    memory_file = ws / '.dspy_session_memory.json'
+    if not memory_file.exists():
+        console.print("[yellow]No insights found. Start analyzing the codebase![/yellow]")
+        return
+    
+    try:
+        with open(memory_file, 'r') as f:
+            data = json.load(f)
+        
+        context_insights = data.get('context_insights', {})
+        if not context_insights:
+            console.print("[yellow]No codebase insights yet. Keep analyzing![/yellow]")
+            return
+        
+        console.print("\n[bold]Learned Insights:[/bold]")
+        for context, insight in context_insights.items():
+            console.print(f"\n[bold]{context.title()}:[/bold]")
+            console.print(f"  💡 {insight}")
+    
+    except Exception as e:
+        console.print(f"[red]Error loading insights: {e}[/red]")
+
+
+def _handle_expert_optimize_command(args: List[str], ws: Path):
+    """Handle expert optimize command"""
+    console.print("[cyan]🎯 Optimizing Expert Performance...[/cyan]")
+    
+    # Load memory from workspace
+    memory_file = ws / '.dspy_session_memory.json'
+    if not memory_file.exists():
+        console.print("[yellow]No optimization data found. Start using the agent![/yellow]")
+        return
+    
+    try:
+        with open(memory_file, 'r') as f:
+            data = json.load(f)
+        
+        # Show current optimizations
+        prompt_optimizations = data.get('prompt_optimizations', {})
+        action_policies = data.get('action_policies', {})
+        
+        console.print(f"\n[bold]Current Optimizations:[/bold]")
+        console.print(f"  📝 Optimized prompts: {len(prompt_optimizations)}")
+        console.print(f"  🎯 Action policies: {len(action_policies)}")
+        
+        if prompt_optimizations:
+            console.print("\n[bold]Prompt Optimizations:[/bold]")
+            for context, prompt in list(prompt_optimizations.items())[:3]:
+                console.print(f"  • {context}: {prompt[:60]}...")
+        
+        if action_policies:
+            console.print("\n[bold]Action Policies:[/bold]")
+            for context, policies in list(action_policies.items())[:3]:
+                console.print(f"  • {context}: {len(policies)} policies")
+        
+        console.print("\n[green]✅ Optimization complete! The agent is learning and improving.[/green]")
+    
+    except Exception as e:
+        console.print(f"[red]Error during optimization: {e}[/red]")
+
+
+def _handle_expert_status_command(args: List[str], ws: Path):
+    """Handle expert status command"""
+    console.print("[cyan]🎓 Expert Status Report[/cyan]")
+    
+    # Load memory from workspace
+    memory_file = ws / '.dspy_session_memory.json'
+    if not memory_file.exists():
+        console.print("[yellow]No expert data found. Start using the agent to build expertise![/yellow]")
+        return
+    
+    try:
+        with open(memory_file, 'r') as f:
+            data = json.load(f)
+        
+        # Calculate expert level
+        expert_patterns = len(data.get('expert_patterns', {}))
+        tool_effectiveness = len(data.get('tool_effectiveness', {}))
+        context_insights = len(data.get('context_insights', {}))
+        prompt_optimizations = len(data.get('prompt_optimizations', {}))
+        action_policies = len(data.get('action_policies', {}))
+        
+        # Calculate expert score
+        expert_score = (
+            expert_patterns * 0.3 +
+            tool_effectiveness * 0.2 +
+            context_insights * 0.2 +
+            prompt_optimizations * 0.15 +
+            action_policies * 0.15
+        )
+        
+        # Determine expert level
+        if expert_score >= 20:
+            level = "Expert"
+            color = "green"
+            emoji = "🎓"
+        elif expert_score >= 10:
+            level = "Advanced"
+            color = "blue"
+            emoji = "🚀"
+        elif expert_score >= 5:
+            level = "Intermediate"
+            color = "yellow"
+            emoji = "📚"
+        else:
+            level = "Beginner"
+            color = "red"
+            emoji = "🌱"
+        
+        console.print(f"\n[bold]{emoji} Expert Level: [{color}]{level}[/{color}][/bold]")
+        console.print(f"📊 Expert Score: {expert_score:.1f}/25")
+        
+        console.print(f"\n[bold]Learning Progress:[/bold]")
+        console.print(f"  🧠 Expert patterns: {expert_patterns}")
+        console.print(f"  🔧 Tool effectiveness: {tool_effectiveness}")
+        console.print(f"  💡 Context insights: {context_insights}")
+        console.print(f"  📝 Prompt optimizations: {prompt_optimizations}")
+        console.print(f"  🎯 Action policies: {action_policies}")
+        
+        # Show recent activity
+        chain_history = data.get('chain_history', [])
+        if chain_history:
+            recent_activity = len(chain_history)
+            console.print(f"\n[bold]Recent Activity:[/bold]")
+            console.print(f"  📈 Total sessions: {recent_activity}")
+            
+            # Show most recent successful patterns
+            successful_sessions = [s for s in chain_history if s.get('success', False)]
+            if successful_sessions:
+                console.print(f"  ✅ Successful sessions: {len(successful_sessions)}")
+                success_rate = len(successful_sessions) / len(chain_history) * 100
+                console.print(f"  📊 Success rate: {success_rate:.1f}%")
+    
+    except Exception as e:
+        console.print(f"[red]Error loading expert status: {e}[/red]")
+
+
+def _handle_dev_command(args: List[str], ws: Path):
+    """Handle dev workflow commands"""
+    if not args:
+        console.print("[yellow]Usage: dev <command> [options][/yellow]")
+        console.print("[cyan]Available commands:[/cyan]")
+        console.print("  dev quick [message]  - Quick dev cycle (format, test, commit, push)")
+        console.print("  dev build           - Build package")
+        console.print("  dev test            - Run tests")
+        console.print("  dev lint            - Run linter")
+        console.print("  dev format          - Format code")
+        console.print("  dev status          - Show git status")
+        console.print("  dev version         - Show current version")
+        return
+    
+    subcommand = args[0]
+    
+    if subcommand == "quick":
+        message = " ".join(args[1:]) if len(args) > 1 else f"Quick dev update: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        console.print(f"[cyan]Starting quick dev cycle: {message}[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh quick '{message}'")
+        if result == 0:
+            console.print("[green]✅ Quick dev cycle completed![/green]")
+        else:
+            console.print("[red]❌ Quick dev cycle failed![/red]")
+    
+    elif subcommand == "build":
+        console.print("[cyan]Building package...[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh build")
+        if result == 0:
+            console.print("[green]✅ Package built successfully![/green]")
+        else:
+            console.print("[red]❌ Package build failed![/red]")
+    
+    elif subcommand == "test":
+        console.print("[cyan]Running tests...[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh test")
+        if result == 0:
+            console.print("[green]✅ Tests passed![/green]")
+        else:
+            console.print("[red]❌ Tests failed![/red]")
+    
+    elif subcommand == "lint":
+        console.print("[cyan]Running linter...[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh lint")
+        if result == 0:
+            console.print("[green]✅ Linting passed![/green]")
+        else:
+            console.print("[red]❌ Linting failed![/red]")
+    
+    elif subcommand == "format":
+        console.print("[cyan]Formatting code...[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh format")
+        if result == 0:
+            console.print("[green]✅ Code formatted![/green]")
+        else:
+            console.print("[red]❌ Code formatting failed![/red]")
+    
+    elif subcommand == "status":
+        console.print("[cyan]Git status:[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh status")
+    
+    elif subcommand == "version":
+        console.print("[cyan]Current version:[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh version")
+    
+    else:
+        console.print(f"[red]Unknown dev command: {subcommand}[/red]")
+
+
+def _handle_release_command(args: List[str], ws: Path):
+    """Handle release workflow commands"""
+    version_type = args[0] if args else "patch"
+    
+    if version_type not in ["major", "minor", "patch"]:
+        console.print("[red]Version type must be 'major', 'minor', or 'patch'[/red]")
+        return
+    
+    console.print(f"[cyan]Starting release workflow ({version_type})...[/cyan]")
+    console.print("[yellow]This will:[/yellow]")
+    console.print("  1. Run tests and linting")
+    console.print("  2. Bump version")
+    console.print("  3. Build package")
+    console.print("  4. Commit and push to GitHub")
+    console.print("  5. Create GitHub release")
+    console.print("  6. Publish to PyPI")
+    
+    # Record the release action for learning
+    from dspy_agent.db import get_enhanced_data_manager, create_action_record, ActionType, Environment
+    
+    dm = get_enhanced_data_manager()
+    
+    action_record = create_action_record(
+        action_type=ActionType.CODE_ANALYSIS,
+        state_before={"version_type": version_type, "status": "starting"},
+        state_after={"version_type": version_type, "status": "releasing"},
+        parameters={"version_type": version_type, "workspace": str(ws)},
+        result={"success": True, "message": f"Starting release workflow: {version_type}"},
+        reward=0.8,
+        confidence=0.9,
+        execution_time=0.1,
+        environment=Environment.DEVELOPMENT
+    )
+    
+    dm.record_action(action_record)
+    
+    result = os.system(f"cd {ws} && ./scripts/dev.sh release {version_type}")
+    if result == 0:
+        console.print("[green]✅ Release completed successfully![/green]")
+    else:
+        console.print("[red]❌ Release failed![/red]")
+
+
+def _handle_publish_command(args: List[str], ws: Path):
+    """Handle publish commands"""
+    test_pypi = "--test" in args or "test" in args
+    
+    if test_pypi:
+        console.print("[cyan]Publishing to Test PyPI...[/cyan]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh publish-test")
+    else:
+        console.print("[cyan]Publishing to PyPI...[/cyan]")
+        console.print("[yellow]This will publish the package to PyPI![/yellow]")
+        result = os.system(f"cd {ws} && ./scripts/dev.sh publish")
+    
+    if result == 0:
+        console.print("[green]✅ Published successfully![/green]")
+    else:
+        console.print("[red]❌ Publish failed![/red]")
 
 
 @app.command()

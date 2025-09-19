@@ -190,10 +190,10 @@ def test_trainer_group_advantage_updates(tmp_path: Path):
     orig = os.environ.get('RL_BACKGROUND_STEPS')
     os.environ['RL_BACKGROUND_STEPS'] = '2'
     try:
-        with patch('dspy_agent.streaming.streamkit.RLToolEnv', DummyEnv), \
-             patch('dspy_agent.streaming.streamkit.ToolchainExecutor'), \
-             patch('dspy_agent.streaming.streamkit.detect_toolchain'), \
-             patch('dspy_agent.streaming.streamkit._make_bandit', return_value=bandit):
+        with patch('dspy_agent.rl.rlkit.RLToolEnv', DummyEnv), \
+             patch('dspy_agent.rl.rlkit.ToolchainExecutor'), \
+             patch('dspy_agent.rl.rlkit.detect_toolchain'), \
+             patch('dspy_agent.rl.rlkit.make_bandit', return_value=bandit):
             trainer._train_on_contexts()
     finally:
         if orig is None:
@@ -238,13 +238,13 @@ def test_toolchain_executor_quality_checks(tmp_path: Path):
             return False, 'lint fail', 0.01
         return True, '', 0.01
 
-    with patch('dspy_agent.rl.rlkit.FileLocator', lambda: DummyLocator()), \
-         patch('dspy_agent.rl.rlkit.CodeEdit', lambda use_cot=True: DummyEdit()), \
-         patch('dspy_agent.rl.rlkit.PatchVerifier', lambda **kwargs: DummyVerifier()), \
-         patch('dspy_agent.rl.rlkit.TestPlanner', lambda *a, **k: DummyPlanner()), \
-         patch('dspy_agent.rl.rlkit.apply_unified_patch', lambda patch, ws: (True, 'applied')), \
-         patch('dspy_agent.rl.rlkit.revert_unified_patch', lambda patch, ws: (True, 'reverted')), \
-         patch('dspy_agent.rl.rlkit.summarize_patch', lambda patch: {'files': 1, 'added_lines': 1, 'removed_lines': 0}), \
+    with patch('dspy_agent.skills.file_locator.FileLocator', lambda: DummyLocator()), \
+         patch('dspy_agent.skills.code_edit.CodeEdit', lambda use_cot=True: DummyEdit()), \
+         patch('dspy_agent.skills.patch_verifier.PatchVerifier', lambda **kwargs: DummyVerifier()), \
+         patch('dspy_agent.skills.test_planner.TestPlanner', lambda *a, **k: DummyPlanner()), \
+         patch('dspy_agent.code_tools.patcher.apply_unified_patch', lambda patch, ws: (True, 'applied')), \
+         patch('dspy_agent.code_tools.patcher.revert_unified_patch', lambda patch, ws: (True, 'reverted')), \
+         patch('dspy_agent.code_tools.patcher.summarize_patch', lambda patch: {'files': 1, 'added_lines': 1, 'removed_lines': 0}), \
          patch('dspy_agent.rl.rlkit._run', fake_run):
         result = executor(ToolAction.PATCH, {
             'task': 'Fix issue',

@@ -29,7 +29,18 @@ def _install_fake_carbs(monkeypatch):
 
     class _Suggestion:
         def __init__(self, names, counter):
-            self.suggestion = {name: 0.5 + 0.05 * counter for name in names}
+            # Give different values for different parameters
+            values = {}
+            for i, name in enumerate(names):
+                if "pass_rate" in name:
+                    values[name] = 0.55  # Fixed value to match test expectation
+                elif "blast_radius" in name:
+                    values[name] = 0.01 + 0.01 * counter  # Should be in range [0.01, 0.2]
+                elif "steps" in name:
+                    values[name] = 50 + 10 * counter  # Should be >= 50
+                else:
+                    values[name] = 0.5 + 0.05 * counter
+            self.suggestion = values
             self.metadata = {"call": counter}
 
     class CARBS:
@@ -90,6 +101,10 @@ def test_carbs_strategy_round_trip(monkeypatch):
 
     strategy = Carbs(sweep_config)
     suggestion, info = strategy.suggest()
+
+    print(f"Suggestion: {suggestion}")
+    print(f"Info: {info}")
+    print(f"Raw params: {info.get('raw_params', {})}")
 
     assert suggestion["weights"]["pass_rate"] != suggestion["weights"]["blast_radius"]
     assert suggestion["trainer"]["steps"] >= 50

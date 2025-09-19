@@ -31,6 +31,8 @@ def test_vectorized_orchestrator_streams(tmp_path):
         out_topic="agent.rl.vectorized",
         idle_sleep=0.01,
     )
+    # Attach orchestrator to bus so vector_metrics() can find it
+    bus.vector_orchestrator = orchestrator
     out_queue = bus.subscribe("agent.rl.vectorized")
     orchestrator.start()
     try:
@@ -43,6 +45,8 @@ def test_vectorized_orchestrator_streams(tmp_path):
     assert emitted["topic"] == "logs.ctx.backend"
     assert len(emitted["features"]) == vectorizer.feature_size
     metrics = bus.vector_metrics()
+    print(f"Vector metrics: {metrics}")
+    print(f"Processed count: {metrics.get('processed', 0)}")
     assert metrics.get("processed", 0) >= 1
 
 

@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "dspy-code"
+name = "blampert"
 version = "0.1.0"
-description = "Simple local coding agent using DSPy that reads logs and proposes plans/commands."
+description = "Blampert - A powerful coding assistant that learns and improves through reinforcement learning."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
@@ -20,10 +24,9 @@ dependencies = [
 ]
 
 [project.scripts]
-dspy-agent = "dspy_agent.cli:app"
-dspy-coder = "dspy_agent.cli:app"
-dspy_coder = "dspy_agent.cli:app"
-dspy-code = "dspy_agent.cli:code_entry"
+blampert = "dspy_agent.cli:app"
+blampert-agent = "dspy_agent.cli:app"
+blampert-coder = "dspy_agent.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/RPasquale/dspy_stuff"

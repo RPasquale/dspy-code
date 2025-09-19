@@ -18,6 +18,37 @@ from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, asdict
 
+# Rich imports with fallback
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.live import Live
+    from rich.layout import Layout
+    from rich.text import Text
+    from rich.align import Align
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    # Create dummy classes for when rich is not available
+    class Console:
+        def print(self, *args, **kwargs): print(*args)
+    class Panel:
+        def __init__(self, *args, **kwargs): pass
+    class Table:
+        def __init__(self, *args, **kwargs): pass
+    class Live:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def update(self, *args): pass
+    class Layout:
+        def __init__(self, *args, **kwargs): pass
+    class Text:
+        def __init__(self, *args, **kwargs): pass
+    class Align:
+        def __init__(self, *args, **kwargs): pass
+
 # Add the project root to Python path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -307,15 +338,7 @@ class CLIMonitor:
     
     def setup_display(self):
         """Set up the display components"""
-        try:
-            from rich.console import Console
-            from rich.panel import Panel
-            from rich.table import Table
-            from rich.live import Live
-            from rich.layout import Layout
-            from rich.text import Text
-            from rich.align import Align
-            
+        if RICH_AVAILABLE:
             self.console = Console()
             self.layout = Layout()
             
@@ -340,8 +363,7 @@ class CLIMonitor:
                 Layout(name="stats", ratio=1),
                 Layout(name="learning", ratio=1)
             )
-            
-        except ImportError:
+        else:
             print("⚠️  Rich library not available. Install with: pip install rich")
             self.console = None
             self.layout = None
@@ -353,9 +375,6 @@ class CLIMonitor:
         header_text = f"🤖 DSPy Agent Real-Time Monitor | Events: {metrics.total_events} | Success: {metrics.success_rate:.1%} | Trend: {metrics.learning_trend}"
         
         if self.console and self.layout:
-            from rich.panel import Panel
-            from rich.align import Align
-            from rich.text import Text
             return Panel(
                 Align.center(Text(header_text, style="bold blue")),
                 style="blue"
@@ -386,7 +405,6 @@ class CLIMonitor:
                 content.append(f"{timestamp} {tool} ({reward:.2f})\n", style=style)
         
         if self.console and self.layout:
-            from rich.panel import Panel
             return Panel(
                 content,
                 title="Recent Actions",

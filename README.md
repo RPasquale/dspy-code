@@ -1,17 +1,27 @@
-# DSPy Code Agent
+# Blampert - AI Coding Assistant
 
 ## Quick Start
 
 ### Option 1: Install and Use Anywhere
 ```bash
 # Install the agent
-pipx install dspy-code            # or: pip install dspy-code
+pipx install blampert             # or: pip install blampert
+# or: uv tool install blampert    # installs with Astral's uv
 
 # Install a local LLM (recommended)
 ollama pull qwen3:1.7b            # pick any Ollama model you like
 
-# Start the agent in your project
-dspy-agent --workspace $(pwd)
+# Launch from any directory (creates ./logs if needed)
+blampert
+
+# Target another project without cd-ing
+blampert --workspace /path/to/project
+
+# Need the dashboard too?
+blampert --open-dashboard
+
+# (Optional) Bootstrap the Docker stack (Kafka/Spark/RedDB)
+blampert stack init
 ```
 
 ### Option 2: From Source
@@ -29,8 +39,27 @@ uv sync
 ./scripts/quick-start.sh
 
 # Or start manually
-uv run dspy-agent --workspace $(pwd)
+uv run blampert --workspace $(pwd)
 ```
+
+### Option 3: One-Command Bootstrap (Windows/macOS/Linux)
+```bash
+python scripts/run_agent.py
+```
+- Handles virtualenv creation, `uv sync`, and sensible defaults.
+- Pass `--workspace /path/to/your/project` to run the agent against another repo.
+- Need a dashboard too? `python scripts/run_agent.py --open-dashboard` launches CLI + UI together.
+- Want a dry run? `python scripts/run_agent.py --check-only` verifies prerequisites and exits.
+- Prefer a packaged binary? `dspy-run` is an alias for `dspy-code` (both installed via pip/pipx).
+
+## Spin Up the Full Stack
+```bash
+# After installing the package
+dspy-code stack init
+```
+- Generates a ready-to-use Docker Compose bundle under `~/.dspy/stack` by default.
+- Automatically builds and starts Kafka, Spark, Ollama, and the agent (use `--no-start` to skip).
+- Manage the services later with `dspy-code stack up`, `stack down`, `stack status`, and `stack logs`.
 
 ### React Monitoring Dashboard
 ```bash
@@ -49,7 +78,7 @@ The React UI consolidates the legacy HTML dashboards (status, monitoring, advanc
 
 ### Need the dashboard too?
 ```bash
-dspy-agent code --open-dashboard   # launches web UI + CLI together
+blampert code --open-dashboard   # launches web UI + CLI together
 ```
 
 ## Use It In A Session
@@ -68,7 +97,7 @@ Everything is logged under `.dspy_rl_state.json` and `.dspy_rl_events.jsonl` so 
 ## Optional: Full Docker Stack
 Want Kafka + Spark streaming plus the agent?
 ```bash
-dspy-agent lightweight_init --workspace $(pwd) --logs ./logs --out-dir docker/lightweight
+blampert lightweight_init --workspace $(pwd) --logs ./logs --out-dir docker/lightweight
 cd docker/lightweight
 DOCKER_BUILDKIT=1 docker compose up -d
 ```
@@ -113,12 +142,19 @@ uv run pytest tests/test_rl_tooling.py  # RL unit tests
 ./scripts/deploy-prod.sh           # Production deployment
 ```
 
+### Publish to PyPI
+```bash
+./scripts/publish_package.sh --dry-run      # build artifacts only
+UV_PUBLISH_TOKEN=your-token ./scripts/publish_package.sh
+```
+Use `--skip-tests` or `--allow-dirty` if needed when iterating locally.
+
 ### Manual Development
 ```bash
 uv venv                           # create virtual environment
 uv sync                           # install dependencies
 uv pip install -e .              # install editable copy
-uv run dspy-agent --workspace $(pwd)  # start agent
+uv run blampert --workspace $(pwd)  # start agent
 ```
 
 Entry points live in `dspy_agent/cli.py`. Most tools are in `dspy_agent/skills` and `dspy_agent/code_tools`.
