@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Enhanced HTTP server for DSPy Agent dashboard with learning metrics, chat, and advanced features.
 Supports real-time learning analytics, signature performance tracking, and agent chat interface.
@@ -18,6 +19,14 @@ import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Analytics utilities
+try:
+    from dspy_agent.analytics.utils import compute_correlations, compute_direction, kmeans_clusters
+except Exception:
+    compute_correlations = None
+    compute_direction = None
+    kmeans_clusters = None
+
 # Import RedDB data model
 from dspy_agent.db import (
     get_enhanced_data_manager, SignatureMetrics, VerifierMetrics, 
@@ -25,40 +34,186 @@ from dspy_agent.db import (
     Environment, ActionType, AgentState,
     create_log_entry, create_action_record
 )
+from dspy_agent.training.deploy import DeploymentLogger
+from dspy_agent.provision.pricing import get_pricing
+from dspy_agent.training.rl_sweep import run_sweep as run_rl_sweep, load_sweep_config as load_rl_sweep_config, SweepSettings
+try:
+    from dspy_agent.grpo import GlobalGrpoService
+except Exception:
+    GlobalGrpoService = None  # type: ignore
+from dspy_agent.rl.puffer_sweep import pareto_points
+try:
+    from dspy_agent.grpo.policy_nudges import compute_policy_nudges
+    from dspy_agent.policy import update_policy_with_feedback
+except Exception:
+    compute_policy_nudges = None  # type: ignore
+    update_policy_with_feedback = None  # type: ignore
 
 REPO_ROOT = Path(__file__).resolve().parent
 REACT_DIST_DIR = REPO_ROOT / 'frontend' / 'react-dashboard' / 'dist'
 STATIC_DIRECTORY = REACT_DIST_DIR if REACT_DIST_DIR.exists() else REPO_ROOT
+ADMIN_KEY = os.getenv('ADMIN_KEY') or None
+BACKPRESSURE_THRESHOLD = int(os.getenv('BUS_BACKPRESSURE_DEPTH', '100') or '100')
+DLQ_ALERT_MIN = int(os.getenv('DLQ_ALERT_MIN', '1') or '1')
+TRACE_DIR = (REPO_ROOT / '.dspy_reports'); TRACE_DIR.mkdir(exist_ok=True)
+TRACE_FILE = TRACE_DIR / 'server_trace.log'
+
+# Test-friendly helper: gracefully emit JSON in tests where DummyHandler is used
+def _safe_send_json(handler, data, status_code: int = 200):
+    try:
+        # Prefer the class helper when present
+        return handler.send_json_response(data, status_code)  # type: ignore[attr-defined]
+    except Exception:
+        # Fallback: best-effort write to the handler's file-like stream
+        try:
+            # Reset buffer if possible (tests reuse DummyHandler across calls)
+            try:
+                if hasattr(handler, 'wfile') and hasattr(handler.wfile, 'seek') and hasattr(handler.wfile, 'truncate'):
+                    handler.wfile.seek(0)
+                    handler.wfile.truncate(0)
+            except Exception:
+                pass
+            if hasattr(handler, 'send_response'):
+                handler.send_response(status_code)  # type: ignore[attr-defined]
+            if hasattr(handler, 'send_header'):
+                handler.send_header('Content-type', 'application/json')  # type: ignore[attr-defined]
+            if hasattr(handler, 'end_headers'):
+                handler.end_headers()  # type: ignore[attr-defined]
+            if hasattr(handler, 'wfile') and hasattr(handler.wfile, 'write'):
+                handler.wfile.write(json.dumps(data).encode('utf-8'))  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         # Initialize data manager before calling super().__init__
         self.data_manager = get_enhanced_data_manager()
         self.react_available = REACT_DIST_DIR.exists()
+        # Workspace for shared telemetry files (.dspy_hw.json, etc.)
+        try:
+            ws_env = os.getenv('WORKSPACE_DIR') or os.getenv('DSPY_WORKSPACE')
+            self.workspace = Path(ws_env).expanduser() if ws_env else REPO_ROOT
+            # Allow persisted override
+            try:
+                p = REPO_ROOT / '.dspy_reports' / 'workspace.json'
+                if p.exists():
+                    data = json.loads(p.read_text())
+                    wp = data.get('path')
+                    if isinstance(wp, str) and wp.strip():
+                        self.workspace = Path(wp).expanduser()
+            except Exception:
+                pass
+        except Exception:
+            self.workspace = REPO_ROOT
         super().__init__(*args, directory=str(STATIC_DIRECTORY), **kwargs)
+        # Dev cycle state
+        self._dev_cycle_proc = None
+        self._dev_cycle_lines = []
+        self._dev_cycle_running = False
+
+    def _is_admin(self) -> bool:
+        try:
+            if ADMIN_KEY is None:
+                return True
+            key = self.headers.get('X-Admin-Key') or ''
+            return key == ADMIN_KEY
+        except Exception:
+            return False
 
     def do_GET(self):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
+        try:
+            self._trace('GET', path)
+        except Exception:
+            pass
 
         api_routes = {
             '/api/status': self.serve_status,
             '/api/logs': self.serve_logs,
             '/api/metrics': self.serve_metrics,
+            '/api/bus-metrics': self.serve_bus_metrics,
+            '/api/overview': self.serve_overview,
+            '/api/overview/stream': self.serve_overview_stream,
+            '/api/overview/stream-diff': self.serve_overview_stream_diff,
+            '/api/logs/stream': self.serve_logs_stream,
+            '/api/actions/stream': self.serve_actions_stream,
+            '/api/monitor/stream': self.serve_monitor_stream,
+            '/api/vectorizer-metrics': self.serve_vectorizer_metrics,
+            '/api/vectorizer/stream': self.serve_vectorizer_stream,
             '/api/signatures': self.serve_signatures,
+            '/api/signature-detail': self.serve_signature_detail,
+            '/api/signature-schema': self.serve_signature_schema,
+            '/api/signature-analytics': self.serve_signature_analytics,
+            '/api/signature/feature-analysis': self.serve_signature_feature_analysis,
+            '/api/signature/optimization-history': self.serve_signature_optimization_history,
+            '/api/signature/gepa-analysis': self.serve_signature_gepa_analysis,
+            '/api/signature/graph': self.serve_signature_graph,
             '/api/verifiers': self.serve_verifiers,
             '/api/learning-metrics': self.serve_learning_metrics,
             '/api/performance-history': self.serve_performance_history,
             '/api/containers': self.serve_containers,
             '/api/kafka-topics': self.serve_kafka_topics,
+            '/api/kafka/configs': self.serve_kafka_configs,
+            '/api/debug/trace': self.serve_debug_trace,
+            '/api/debug/trace/stream': self.serve_debug_trace_stream,
             '/api/spark-workers': self.serve_spark_workers,
+            '/api/spark/stream': self.serve_spark_stream,
+            '/api/knn/query': self.handle_knn_query,
+            '/api/knn/shards': self.serve_knn_shards,
             '/api/rl-metrics': self.serve_rl_metrics,
             '/api/system-topology': self.serve_system_topology,
-            '/api/stream-metrics': self.serve_stream_metrics
+            '/api/stream-metrics': self.serve_stream_metrics,
+            '/api/metrics/stream': self.serve_metrics_stream,
+            '/monitor-lite': self.serve_monitor_lite,
+            '/api/stream-rl': self.serve_stream_rl,
+            '/api/infermesh/stream': self.serve_infermesh_stream,
+            '/api/mesh/status': self.serve_mesh_status,
+            '/api/mesh/topics': self.serve_mesh_topics,
+            '/api/mesh/stream': self.serve_mesh_stream,
+            '/api/mesh/tail/stream': self.serve_mesh_tail_stream,
+            '/api/mesh/tail': self.serve_mesh_tail,
+            '/api/embed-worker/stream': self.serve_embed_worker_stream,
+            '/api/embed-worker/dlq': self.serve_embed_worker_dlq,
+            '/api/rewards-config': self.serve_rewards_config,
+            '/api/actions-analytics': self.serve_actions_analytics,
+            '/api/guardrails/state': self.serve_guardrails_state,
+            '/api/guardrails/pending-actions': self.serve_guardrails_pending_actions,
+            '/api/guardrails/action-status': self.serve_guardrails_action_status,
+            '/api/teleprompt/experiments': self.serve_teleprompt_experiments,
+            '/api/profile': self.serve_profile,
+            '/api/rl/sweep/state': self.serve_rl_sweep_state,
+            '/api/rl/sweep/history': self.serve_rl_sweep_history,
+            '/api/reddb/summary': self.serve_reddb_summary,
+            '/api/reddb/health': self.serve_reddb_health,
+            '/api/reddb/summary': self.serve_reddb_summary,
+            '/api/capacity/status': self.serve_capacity_status,
+            '/api/capacity/config': self.serve_capacity_config,
+            '/api/kafka/settings': self.serve_kafka_settings,
+            # GRPO endpoints
+            '/api/grpo/status': self.serve_grpo_status,
+            '/api/grpo/metrics': self.serve_grpo_metrics,
+            '/api/grpo/metrics/stream': self.serve_grpo_metrics_stream,
+            '/api/grpo/auto/status': self.serve_grpo_auto_status,
+            '/api/grpo/level-metrics': self.serve_grpo_level_metrics,
+            '/api/grpo/level-metrics/stream': self.serve_grpo_level_metrics_stream,
+            '/api/policy/summary': self.serve_policy_summary,
+            '/api/grpo/dataset-stats': self.serve_grpo_dataset_stats,
+            # Dev cycle
+            '/api/dev-cycle/status': self.serve_dev_cycle_status,
+            '/api/dev-cycle/stream': self.serve_dev_cycle_stream,
+            # System resources
+            '/api/system/resources': self.serve_system_resources,
+            '/api/system/resources/stream': self.serve_system_resources_stream,
+            '/api/system/workspace': self.serve_system_workspace,
         }
 
         handler = api_routes.get(path)
         if handler:
+            # RBAC: capacity endpoints are admin-only
+            if path.startswith('/api/capacity') and not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
             handler()
             return
 
@@ -67,6 +222,9 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.serve_react_index()
             else:
                 self.serve_legacy_placeholder(path)
+            return
+        if path == '/admin/capacity':
+            self.serve_capacity_admin_page()
             return
 
         if self.react_available:
@@ -81,6 +239,10 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
+        try:
+            self._trace('POST', path)
+        except Exception:
+            pass
 
         if path == '/api/chat':
             self.handle_chat()
@@ -90,8 +252,79 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_restart()
         elif path == '/api/config':
             self.handle_config_update()
+        elif path == '/api/capacity/approve':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_capacity_approve()
+        elif path == '/api/capacity/deny':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_capacity_deny()
+        elif path == '/api/capacity/apply-approved':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_capacity_apply_approved()
+        elif path == '/api/system/guard':
+            self.handle_system_guard()
+        elif path == '/api/capacity/apply':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_capacity_apply()
+        elif path == '/api/kafka/settings':
+            self.handle_kafka_settings()
+        elif path == '/api/system/cleanup':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_system_cleanup()
         elif path == '/api/signature/optimize':
             self.handle_signature_optimization()
+        elif path == '/api/signature/update':
+            self.handle_signature_update()
+        elif path == '/api/action/record-result':
+            self.handle_action_record_result()
+        elif path == '/api/verifier/update':
+            self.handle_verifier_update()
+        elif path == '/api/rewards-config':
+            self.handle_rewards_config_update()
+        elif path == '/api/action/feedback':
+            self.handle_action_feedback()
+        elif path == '/api/guardrails':
+            self.handle_guardrails_toggle()
+        elif path == '/api/guardrails/approve':
+            self.handle_guardrails_approve()
+        elif path == '/api/guardrails/reject':
+            self.handle_guardrails_reject()
+        elif path == '/api/guardrails/propose-action':
+            self.handle_guardrails_propose_action()
+        elif path == '/api/guardrails/approve-action':
+            self.handle_guardrails_approve_action()
+        elif path == '/api/guardrails/reject-action':
+            self.handle_guardrails_reject_action()
+        elif path == '/api/teleprompt/run':
+            self.handle_teleprompt_run()
+        elif path == '/api/rl/sweep/run':
+            self.handle_rl_sweep_run()
+        elif path == '/api/grpo/start':
+            self.handle_grpo_start()
+        elif path == '/api/grpo/stop':
+            self.handle_grpo_stop()
+        elif path == '/api/grpo/auto/start':
+            self.handle_grpo_auto_start()
+        elif path == '/api/grpo/auto/stop':
+            self.handle_grpo_auto_stop()
+        elif path == '/api/grpo/apply-policy':
+            self.handle_grpo_apply_policy()
+        elif path == '/api/debug/trace':
+            self.handle_debug_trace_post()
+        elif path == '/api/system/workspace':
+            self.handle_system_workspace_post()
+        elif path == '/api/mesh/tail/to-grpo':
+            self.handle_mesh_tail_to_grpo()
         else:
             self.send_error(404)
 
@@ -156,6 +389,504 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.serve_react_index()
         else:
             self.serve_legacy_placeholder('/simple')
+
+    # -----------------
+    # GRPO API handlers
+    # -----------------
+    def serve_grpo_status(self):
+        try:
+            if GlobalGrpoService is None:
+                self.send_json_response({'running': False, 'error': 'grpo module not available'}, 200)
+                return
+            self.send_json_response(GlobalGrpoService.status(), 200)
+        except Exception as e:
+            self.send_json_response({'running': False, 'error': str(e)}, 200)
+
+    def serve_grpo_metrics(self):
+        try:
+            if GlobalGrpoService is None:
+                self.send_json_response({'metrics': [], 'count': 0, 'error': 'grpo module not available'}, 200)
+                return
+            limit = 200
+            try:
+                q = urlparse(self.path).query
+                if q:
+                    from urllib.parse import parse_qs
+                    qs = parse_qs(q)
+                    limit = int(qs.get('limit', [200])[0])
+            except Exception:
+                pass
+            self.send_json_response(GlobalGrpoService.metrics(limit=limit), 200)
+        except Exception as e:
+            self.send_json_response({'metrics': [], 'count': 0, 'error': str(e)}, 200)
+
+    def serve_grpo_metrics_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            last_n = 0
+            for _ in range(2400):
+                try:
+                    if GlobalGrpoService is None:
+                        payload = {'metrics': [], 'count': 0, 'error': 'grpo module not available'}
+                    else:
+                        payload = GlobalGrpoService.metrics(limit=500)
+                    count = int(payload.get('count') or 0)
+                    if count > last_n:
+                        delta = payload.get('metrics')[-(count - last_n):] if payload.get('metrics') else []
+                        self.wfile.write(f"data: {json.dumps({'delta': delta, 'count': count, 'timestamp': time.time()})}\n\n".encode('utf-8'))
+                        self.wfile.flush()
+                        last_n = count
+                except Exception:
+                    pass
+                time.sleep(2)
+        except Exception:
+            pass
+
+    def serve_grpo_dataset_stats(self):
+        try:
+            q = urlparse(self.path).query
+            if not q:
+                self.send_json_response({'error': 'missing path'}, 400)
+                return
+            from urllib.parse import parse_qs
+            qs = parse_qs(q)
+            path = (qs.get('path', [''])[0] or '').strip()
+            if not path:
+                self.send_json_response({'error': 'missing path'}, 400)
+                return
+            p = Path(path)
+            if not p.exists():
+                p = (self.workspace / path)
+            if not p.exists() or not p.is_file():
+                self.send_json_response({'error': 'not found', 'path': str(p)}, 404)
+                return
+            try:
+                limit = int(qs.get('limit', ['20000'])[0])
+            except Exception:
+                limit = 20000
+            import re
+            from collections import Counter
+            groups = 0
+            cand_total = 0
+            cand_min = 1e9
+            cand_max = 0
+            rewards = []
+            kw = Counter()
+            sample_prompts = []
+            q_empty = 0; q_short = 0; q_missing_text = 0; q_short_text = 0
+            mesh_tail_total = 0
+            mesh_tail_groups = 0
+            with p.open('r', encoding='utf-8') as f:
+                for i, ln in enumerate(f):
+                    if i >= limit:
+                        break
+                    try:
+                        obj = json.loads(ln)
+                    except Exception:
+                        continue
+                    prompt = (obj.get('prompt') or '')
+                    if not (prompt or '').strip():
+                        q_empty += 1
+                    elif len((prompt or '').strip()) < 15:
+                        q_short += 1
+                    toks = re.findall(r"[A-Za-z_]+", prompt.lower())
+                    kw.update([t for t in toks if len(t) > 2])
+                    cands = obj.get('candidates') or []
+                    try:
+                        mt = int(((obj.get('meta') or {}).get('mesh') or {}).get('tail_candidates') or 0)
+                        if mt > 0:
+                            mesh_tail_total += mt
+                            mesh_tail_groups += 1
+                    except Exception:
+                        pass
+                    if len(sample_prompts) < 5 and prompt:
+                        sample_prompts.append(prompt)
+                    groups += 1
+                    k = len(cands)
+                    cand_total += k
+                    cand_min = min(cand_min, k)
+                    cand_max = max(cand_max, k)
+                    for c in cands:
+                        try:
+                            rewards.append(float(c.get('reward') or 0.0))
+                        except Exception:
+                            continue
+                        txt = c.get('text')
+                        if not isinstance(txt, str) or not txt.strip():
+                            q_missing_text += 1
+                        elif len(txt.strip()) < 10:
+                            q_short_text += 1
+            avg_k = (cand_total / groups) if groups else 0
+            bins = [i / 10.0 for i in range(11)]
+            counts = [0 for _ in range(10)]
+            for r in rewards:
+                idx = 9 if r >= 1.0 else max(0, int(r * 10))
+                counts[idx] += 1
+            top_kw = [w for w, _ in kw.most_common(20)]
+            # Quality checks
+            try:
+                import statistics as _st
+                r_mean = (sum(rewards) / len(rewards)) if rewards else 0.0
+                r_std = (_st.pstdev(rewards) if len(rewards) > 1 else 0.0)
+            except Exception:
+                r_mean = (sum(rewards) / len(rewards)) if rewards else 0.0
+                r_std = 0.0
+            reward_min = min(rewards) if rewards else 0.0
+            reward_max = max(rewards) if rewards else 0.0
+            outliers_std = 0
+            out_of_range = 0
+            if rewards:
+                lo = r_mean - 3.0 * r_std
+                hi = r_mean + 3.0 * r_std
+                for r in rewards:
+                    if r < lo or r > hi:
+                        outliers_std += 1
+                    if r < 0.0 or r > 1.0:
+                        out_of_range += 1
+            quality = {
+                'empty_prompts': q_empty,
+                'short_prompts': q_short,
+                'missing_text': q_missing_text,
+                'short_text': q_short_text,
+                'reward_min': reward_min,
+                'reward_max': reward_max,
+                'reward_mean': r_mean,
+                'reward_std': r_std,
+                'reward_outliers_std3': outliers_std,
+                'reward_out_of_range_0_1': out_of_range,
+            }
+            self.send_json_response({
+                'path': str(p),
+                'scanned': groups,
+                'candidates': {'avg': round(avg_k, 2), 'min': (0 if cand_min == 1e9 else cand_min), 'max': cand_max},
+                'rewards': {'hist_bins': bins, 'hist_counts': counts, 'count': len(rewards), 'mean': (sum(rewards) / len(rewards)) if rewards else 0.0},
+                'top_keywords': top_kw,
+                'sample_prompts': sample_prompts,
+                'quality': quality,
+                'mesh': { 'tail_groups': int(mesh_tail_groups), 'tail_candidates_total': int(mesh_tail_total), 'tail_avg_per_group': (float(mesh_tail_total) / float(mesh_tail_groups)) if mesh_tail_groups else 0.0 },
+                'timestamp': time.time()
+            })
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_grpo_level_metrics(self):
+        try:
+            q = urlparse(self.path).query
+            if not q:
+                self.send_json_response({'error': 'missing params'}, 400)
+                return
+            from urllib.parse import parse_qs
+            qs = parse_qs(q)
+            level = (qs.get('level', [''])[0] or '').strip()
+            root = (qs.get('root', [''])[0] or '').strip()
+            try:
+                limit = int(qs.get('limit', ['500'])[0])
+            except Exception:
+                limit = 500
+            if not level:
+                self.send_json_response({'error': 'missing level'}, 400)
+                return
+            base = Path(root) if root else (self.workspace / '.grpo' / 'auto')
+            path = base / f'ckpts_{level}' / 'metrics.jsonl'
+            if not path.exists():
+                self.send_json_response({'metrics': [], 'count': 0, 'path': str(path)}, 200)
+                return
+            metrics = []
+            with path.open('r', encoding='utf-8') as f:
+                for ln in f:
+                    try:
+                        obj = json.loads(ln)
+                        metrics.append({ 'step': obj.get('step'), 'loss': obj.get('loss'), 'kl': obj.get('kl'), 'adv_mean': obj.get('adv_mean'), 'timestamp': obj.get('timestamp') })
+                    except Exception:
+                        continue
+            metrics = metrics[-limit:]
+            self.send_json_response({'metrics': metrics, 'count': len(metrics), 'level': level, 'path': str(path), 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_grpo_level_metrics_stream(self):
+        try:
+            q = urlparse(self.path).query
+            if not q:
+                self.send_error(400)
+                return
+            from urllib.parse import parse_qs
+            qs = parse_qs(q)
+            level = (qs.get('level', [''])[0] or '').strip()
+            root = (qs.get('root', [''])[0] or '').strip()
+            base = Path(root) if root else (self.workspace / '.grpo' / 'auto')
+            path = base / f'ckpts_{level}' / 'metrics.jsonl'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            last_n = 0
+            for _ in range(2400):
+                try:
+                    metrics = []
+                    if path.exists():
+                        with path.open('r', encoding='utf-8') as f:
+                            for ln in f:
+                                try:
+                                    obj = json.loads(ln)
+                                    metrics.append({ 'step': obj.get('step'), 'loss': obj.get('loss'), 'kl': obj.get('kl'), 'adv_mean': obj.get('adv_mean'), 'timestamp': obj.get('timestamp') })
+                                except Exception:
+                                    continue
+                    count = len(metrics)
+                    if count > last_n:
+                        delta = metrics[-(count - last_n):]
+                        self.wfile.write(f"data: {json.dumps({'delta': delta, 'count': count, 'level': level, 'timestamp': time.time()})}\n\n".encode('utf-8'))
+                        self.wfile.flush()
+                        last_n = count
+                except Exception:
+                    pass
+                time.sleep(2)
+        except Exception:
+            pass
+
+    def serve_policy_summary(self):
+        try:
+            from dspy_agent.policy import Policy, POLICY_YAML, POLICY_JSON
+            from dspy_agent.grpo.policy_nudges import _tool_name_from_action
+            dm = get_enhanced_data_manager()
+            now = time.time()
+            acts = dm.get_recent_actions(8000)
+            bucket_24h = {}
+            bucket_7d = {}
+            for a in acts:
+                t = float(getattr(a, 'timestamp', 0.0) or 0.0)
+                tool = _tool_name_from_action(a) or 'unknown'
+                if t >= now - 24*3600:
+                    arr = bucket_24h.setdefault(tool, [])
+                    try:
+                        arr.append(float(a.reward))
+                    except Exception:
+                        pass
+                if t >= now - 7*24*3600:
+                    arr = bucket_7d.setdefault(tool, [])
+                    try:
+                        arr.append(float(a.reward))
+                    except Exception:
+                        pass
+            def stat(vals):
+                if not vals: return {'count': 0, 'mean': 0.0}
+                return {'count': len(vals), 'mean': (sum(vals)/len(vals))}
+            tools = {}
+            keys = set(bucket_24h.keys()) | set(bucket_7d.keys())
+            for k in keys:
+                s24 = stat(bucket_24h.get(k, [])); s7 = stat(bucket_7d.get(k, []))
+                tools[k] = { 'last24h': s24, 'last7d': s7, 'delta': (s24['mean'] - s7['mean']) if s7['count'] else None }
+            pol = Policy.load(self.workspace)
+            rules = []
+            if pol:
+                rules = [ {'regex': r.regex, 'prefer_tools': r.prefer_tools, 'deny_tools': r.deny_tools} for r in pol.rules ]
+            self.send_json_response({ 'tools': tools, 'rules': rules, 'policy': { 'prefer_tools': pol.prefer_tools if pol else [], 'deny_tools': pol.deny_tools if pol else [] }, 'paths': { 'yaml': str(self.workspace / POLICY_YAML), 'json': str(self.workspace / POLICY_JSON) }, 'timestamp': now })
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_grpo_auto_status(self):
+        try:
+            if GlobalGrpoService is None:
+                self.send_json_response({'running': False, 'error': 'grpo module not available'}, 200)
+                return
+            st = GlobalGrpoService.status().get('auto', {'running': False})
+            self.send_json_response(st, 200)
+        except Exception as e:
+            self.send_json_response({'running': False, 'error': str(e)}, 200)
+
+    def handle_grpo_start(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            body = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+        except Exception:
+            body = {}
+        try:
+            # Enforce minimal free disk
+            try:
+                gpath = (self.workspace / '.dspy_guard.json'); guard = json.loads(gpath.read_text()) if gpath.exists() else {}
+            except Exception:
+                guard = {}
+            min_free = float(guard.get('min_free_gb', float(os.getenv('MIN_FREE_GB', '2') or '2')))
+            ok, disk = self._enforce_storage_quota(min_free)
+            if not ok:
+                self.send_json_response({'ok': False, 'error': f'insufficient_storage: need >= {min_free} GB free', 'disk': disk}, 507)
+                return
+            if GlobalGrpoService is None:
+                self.send_json_response({'ok': False, 'error': 'grpo module not available'}, 200)
+                return
+            outcome = GlobalGrpoService.start(body)
+            self.send_json_response(outcome, 200)
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 200)
+
+    def handle_grpo_stop(self):
+        try:
+            if GlobalGrpoService is None:
+                self.send_json_response({'ok': True}, 200)
+                return
+            self.send_json_response(GlobalGrpoService.stop(), 200)
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 200)
+
+    def handle_grpo_auto_start(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            body = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+        except Exception:
+            body = {}
+        try:
+            # Enforce minimal free disk
+            try:
+                gpath = (self.workspace / '.dspy_guard.json'); guard = json.loads(gpath.read_text()) if gpath.exists() else {}
+            except Exception:
+                guard = {}
+            min_free = float(guard.get('min_free_gb', float(os.getenv('MIN_FREE_GB', '2') or '2')))
+            ok, disk = self._enforce_storage_quota(min_free)
+            if not ok:
+                self.send_json_response({'ok': False, 'error': f'insufficient_storage: need >= {min_free} GB free', 'disk': disk}, 507)
+                return
+            if GlobalGrpoService is None:
+                self.send_json_response({'ok': False, 'error': 'grpo module not available'}, 200)
+                return
+            self.send_json_response(GlobalGrpoService.auto_start(body), 200)
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 200)
+
+    def handle_grpo_auto_stop(self):
+        try:
+            if GlobalGrpoService is None:
+                self.send_json_response({'ok': True}, 200)
+                return
+            self.send_json_response(GlobalGrpoService.auto_stop(), 200)
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 200)
+
+    def handle_grpo_apply_policy(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            body = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+        except Exception:
+            body = {}
+        try:
+            if compute_policy_nudges is None or update_policy_with_feedback is None:
+                self.send_json_response({'ok': False, 'error': 'nudges module not available'}, 200)
+                return
+            hours = int(body.get('hours', 24))
+            top_k = int(body.get('top_k', 3))
+            bottom_k = int(body.get('bottom_k', 1))
+            min_count = int(body.get('min_count', 5))
+            min_avg_for_deny = float(body.get('min_avg_for_deny', 0.05))
+            workspace = Path(body.get('workspace') or self.workspace)
+            nudges = compute_policy_nudges(hours=hours, min_count=min_count, top_k=top_k, bottom_k=bottom_k, min_avg_for_deny=min_avg_for_deny)
+            applied = []
+            for it in nudges.get('prefer', []):
+                update_policy_with_feedback(workspace, prefer_tool=it.get('prefer_tool'), regex=it.get('regex'))
+                applied.append({'prefer': it.get('prefer_tool'), 'regex': it.get('regex')})
+            for it in nudges.get('deny', []):
+                update_policy_with_feedback(workspace, deny_tool=it.get('deny_tool'), regex=it.get('regex'))
+                applied.append({'deny': it.get('deny_tool'), 'regex': it.get('regex')})
+            self.send_json_response({'ok': True, 'applied': applied, 'timestamp': time.time()}, 200)
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 200)
+
+    def serve_capacity_admin_page(self):
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Capacity Control</title>
+  <style>
+    body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 1.5rem; }}
+    pre {{ background: #111; color: #ddd; padding: 1rem; overflow: auto; }}
+    .row {{ display: flex; gap: 1rem; align-items: center; }}
+    .btn {{ padding: 0.5rem 0.8rem; border: 1px solid #888; background: #222; color: #eee; cursor: pointer; }}
+    .btn:hover {{ background: #333; }}
+    .card {{ border: 1px solid #333; padding: 1rem; margin: 1rem 0; }}
+  </style>
+</head>
+<body>
+  <h2>Capacity & Autoscaling</h2>
+  <div class="row">
+    <label>Admin Key:</label>
+    <input id="adminkey" type="password" placeholder="X-Admin-Key" />
+    <button class="btn" onclick="saveKey()">Save</button>
+    <button class="btn" onclick="loadAll()">Refresh</button>
+  </div>
+
+  <div class="card">
+    <h3>Config</h3>
+    <pre id="cfg">Loading...</pre>
+  </div>
+  <div class="card">
+    <h3>Snapshot</h3>
+    <pre id="snap">Loading...</pre>
+  </div>
+  <div class="card">
+    <h3>Proposals</h3>
+    <div id="props">Loading...</div>
+  </div>
+
+  <script>
+   function key() {{ return localStorage.getItem('ADMIN_KEY') || ''; }}
+   function headers() {{ const k = key(); return k? {{'X-Admin-Key': k}} : {}; }}
+   function saveKey() {{ const v = document.getElementById('adminkey').value; localStorage.setItem('ADMIN_KEY', v); alert('Saved'); }}
+
+   async function loadAll() {{
+     try {{
+       const st = await fetch('/api/capacity/status', {{ headers: headers() }});
+       const data = await st.json();
+       document.getElementById('cfg').textContent = JSON.stringify(data.config, null, 2);
+       document.getElementById('snap').textContent = JSON.stringify(data.snapshot, null, 2);
+       renderProps(data.proposals || []);
+     }} catch(e) {{
+       document.getElementById('snap').textContent = 'Error: ' + e;
+     }}
+   }}
+
+   function renderProps(list) {{
+     const el = document.getElementById('props');
+     if (!list.length) {{ el.textContent = 'No proposals.'; return; }}
+     el.innerHTML = '';
+     list.forEach((p, idx) => {{
+       const div = document.createElement('div');
+       div.className = 'row';
+       const pre = document.createElement('pre'); pre.textContent = JSON.stringify(p, null, 2);
+       const a = document.createElement('button'); a.textContent = 'Approve'; a.className='btn'; a.onclick = () => act('approve', p);
+       const d = document.createElement('button'); d.textContent = 'Deny'; d.className='btn'; d.onclick = () => act('deny', p);
+       div.appendChild(pre); div.appendChild(a); div.appendChild(d); el.appendChild(div);
+     }});
+   }}
+
+   async function act(kind, p) {{
+     const url = kind === 'approve' ? '/api/capacity/approve' : '/api/capacity/deny';
+     try {{
+       const res = await fetch(url, {{ method: 'POST', headers: Object.assign({{'Content-Type':'application/json'}}, headers()), body: JSON.stringify({{kind: p.kind, params: p}}) }});
+       const j = await res.json(); alert(JSON.stringify(j)); loadAll();
+     }} catch(e) {{ alert('Error: '+e); }}
+   }}
+
+   window.onload = loadAll;
+  </script>
+</body>
+</html>
+"""
+        try:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+        except Exception:
+            self.send_json_response({'error':'failed to render admin page'}, 500)
 
     def serve_system_visualization(self):
         """Serve the system visualization (React entry)"""
@@ -402,6 +1133,1245 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.data_manager.store_verifier_metrics(verifier)
             self.data_manager.register_verifier(verifier.verifier_name)
 
+    def serve_signature_detail(self):
+        """Return detailed info for a specific signature, including trend and history."""
+        try:
+            query_params = parse_qs(urlparse(self.path).query)
+            name = query_params.get('name', [''])[0]
+            if not name:
+                self.send_json_response({'error': 'missing signature name'}, 400)
+                return
+            metrics = self.data_manager.get_signature_metrics(name)
+            if not metrics:
+                self.send_json_response({'error': 'not found'}, 404)
+                return
+            trend = self.data_manager.get_signature_performance_trend(name, hours=24) or []
+            # Policy + tool deltas + rule hits
+            policy_summary = None
+            try:
+                from dspy_agent.policy import Policy
+                from dspy_agent.grpo.policy_nudges import _tool_name_from_action
+                from dspy_agent.grpo.mining import _extract_prompt
+                pol = Policy.load(self.workspace)
+                dm = self.data_manager
+                now = time.time()
+                acts = dm.get_recent_actions(6000)
+                tools_24 = {}; tools_7d = {}
+                rule_hits_24 = {}; rule_hits_7d = {}
+                for a in acts:
+                    sig = None
+                    for obj in (a.parameters, a.result, a.state_before, a.state_after):
+                        if isinstance(obj, dict) and isinstance(obj.get('signature_name'), str):
+                            sig = obj.get('signature_name'); break
+                    if sig != name:
+                        continue
+                    t = float(getattr(a, 'timestamp', 0.0) or 0.0)
+                    tool = _tool_name_from_action(a) or 'unknown'
+                    try:
+                        r = float(a.reward)
+                    except Exception:
+                        r = None
+                    pr = _extract_prompt(a) or ''
+                    if t >= now - 24*3600:
+                        if r is not None:
+                            tools_24.setdefault(tool, []).append(r)
+                        if pol and pol.rules:
+                            for ru in pol.rules:
+                                try:
+                                    import re
+                                    if ru.regex and re.search(ru.regex, pr):
+                                        rule_hits_24[ru.regex] = rule_hits_24.get(ru.regex, 0) + 1
+                                except Exception:
+                                    continue
+                    if t >= now - 7*24*3600:
+                        if r is not None:
+                            tools_7d.setdefault(tool, []).append(r)
+                        if pol and pol.rules:
+                            for ru in pol.rules:
+                                try:
+                                    import re
+                                    if ru.regex and re.search(ru.regex, pr):
+                                        rule_hits_7d[ru.regex] = rule_hits_7d.get(ru.regex, 0) + 1
+                                except Exception:
+                                    continue
+                def stat(vals):
+                    if not vals: return {'count': 0, 'mean': 0.0}
+                    return {'count': len(vals), 'mean': (sum(vals)/len(vals))}
+                tools = {}
+                keys = set(tools_24.keys()) | set(tools_7d.keys())
+                for k in keys:
+                    s24 = stat(tools_24.get(k, [])); s7 = stat(tools_7d.get(k, []))
+                    tools[k] = { 'last24h': s24, 'last7d': s7, 'delta': (s24['mean'] - s7['mean']) if s7['count'] else None }
+                rule_hits = []
+                if pol and pol.rules:
+                    for ru in pol.rules:
+                        rule_hits.append({ 'regex': ru.regex, 'hits24h': int(rule_hits_24.get(ru.regex, 0)), 'hits7d': int(rule_hits_7d.get(ru.regex, 0)) })
+                policy_summary = { 'tools': tools, 'rules': [ {'regex': r.regex, 'prefer_tools': r.prefer_tools, 'deny_tools': r.deny_tools} for r in (pol.rules if pol else []) ], 'rule_hits': rule_hits }
+            except Exception:
+                policy_summary = None
+            detail = {
+                'metrics': {
+                    'name': metrics.signature_name,
+                    'performance': metrics.performance_score,
+                    'success_rate': metrics.success_rate,
+                    'avg_response_time': metrics.avg_response_time,
+                    'memory_usage': metrics.memory_usage,
+                    'iterations': metrics.iterations,
+                    'last_updated': metrics.last_updated,
+                    'type': metrics.signature_type,
+                    'active': metrics.active
+                },
+                'optimization_history': metrics.optimization_history or [],
+                'trend': trend,
+                'policy_summary': policy_summary,
+                'timestamp': time.time()
+            }
+            self.send_json_response(detail)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_signature_update(self):
+        """Update editable fields of a signature (e.g., active, type)."""
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            name = data.get('name')
+            if not name:
+                self.send_json_response({'error': 'name is required'}, 400)
+                return
+            current = self.data_manager.get_signature_metrics(name)
+            if not current:
+                self.send_json_response({'error': 'signature not found'}, 404)
+                return
+            # Apply updates (only allow specific fields)
+            updated = SignatureMetrics(
+                signature_name=current.signature_name,
+                performance_score=current.performance_score,
+                success_rate=current.success_rate,
+                avg_response_time=current.avg_response_time,
+                memory_usage=current.memory_usage,
+                iterations=current.iterations,
+                last_updated=datetime.now().isoformat(),
+                signature_type=data.get('type', current.signature_type),
+                active=bool(data.get('active', current.active)),
+                optimization_history=current.optimization_history,
+            )
+            self.data_manager.store_signature_metrics(updated)
+            self.send_json_response({'success': True, 'updated': {
+                'name': updated.signature_name,
+                'type': updated.signature_type,
+                'active': updated.active,
+                'last_updated': updated.last_updated
+            }})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_action_record_result(self):
+        """Record an action with explicit signature_name and verifier_scores for analytics.
+
+        Payload JSON:
+        {
+          signature_name: str,
+          verifier_scores: { [verifierName]: number },
+          reward: number,
+          environment?: 'development'|'testing'|'staging'|'production'|'local',
+          execution_time?: number,
+          query?: string,
+          doc_id?: string,
+          action_type?: string  # optional mapping into ActionType
+        }
+        """
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+            name = str(data.get('signature_name') or '').strip()
+            if not name:
+                self.send_json_response({'error': 'signature_name required'}, 400)
+                return
+            reward = float(data.get('reward') or 0.0)
+            env_str = str(data.get('environment') or 'development').strip().upper()
+            env = getattr(Environment, env_str, Environment.DEVELOPMENT)
+            v_scores = data.get('verifier_scores') if isinstance(data.get('verifier_scores'), dict) else {}
+            exec_time = float(data.get('execution_time') or 0.0)
+            query = data.get('query') if isinstance(data.get('query'), str) else None
+            doc_id = data.get('doc_id') if isinstance(data.get('doc_id'), str) else None
+            at = str(data.get('action_type') or 'VERIFICATION').upper()
+            try:
+                a_type = ActionType[at]
+            except Exception:
+                a_type = ActionType.VERIFICATION
+            rec = create_action_record(
+                action_type=a_type,
+                state_before={'signature_name': name},
+                state_after={'signature_name': name},
+                parameters={'signature_name': name, **({'query': query} if query else {}), **({'doc_id': doc_id} if doc_id else {}), 'verifier_scores': v_scores},
+                result={'signature_name': name, 'verifier_scores': v_scores},
+                reward=reward,
+                confidence=0.95,
+                execution_time=exec_time,
+                environment=env
+            )
+            self.data_manager.record_action(rec)
+            self.send_json_response({'success': True, 'id': rec.action_id, 'timestamp': rec.timestamp})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_signature_schema(self):
+        """Return inferred input/output fields for a DSPy signature class by static AST analysis.
+
+        Looks for a class named {name} in dspy_agent/skills/*.py that inherits from dspy.Signature.
+        Extracts attribute assignments to dspy.InputField / dspy.OutputField and their desc/default.
+        """
+        try:
+            import ast
+            q = parse_qs(urlparse(self.path).query)
+            name = (q.get('name') or [''])[0]
+            if not name:
+                self.send_json_response({'error': 'missing name'}, 400)
+                return
+            skills_dir = (REPO_ROOT / 'dspy_agent' / 'skills')
+            if not skills_dir.exists():
+                self.send_json_response({'error': 'skills dir not found'}, 404)
+                return
+            def parse_file(p: Path):
+                try:
+                    src = p.read_text()
+                    tree = ast.parse(src)
+                except Exception:
+                    return None
+                for node in tree.body:
+                    if isinstance(node, ast.ClassDef) and node.name == name:
+                        # Verify it inherits from Signature if possible
+                        inputs = []; outputs = []
+                        for stmt in node.body:
+                            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name) and isinstance(stmt.value, ast.Call):
+                                target = stmt.targets[0].id
+                                func = stmt.value.func
+                                def _fname(fn):
+                                    return (getattr(fn, 'attr', None) if isinstance(fn, ast.Attribute) else (getattr(fn, 'id', None) if isinstance(fn, ast.Name) else None))
+                                fname = _fname(func)
+                                if fname in ('InputField', 'OutputField'):
+                                    meta = {'name': target}
+                                    for kw in stmt.value.keywords or []:
+                                        k = kw.arg; v = None
+                                        try:
+                                            v = ast.literal_eval(kw.value)
+                                        except Exception:
+                                            v = None
+                                        if k in ('desc', 'description') and isinstance(v, str):
+                                            meta['desc'] = v
+                                        if k == 'default':
+                                            meta['default'] = v
+                                    (inputs if fname == 'InputField' else outputs).append(meta)
+                        return {'name': name, 'inputs': inputs, 'outputs': outputs}
+                return None
+            result = None
+            for f in skills_dir.glob('*.py'):
+                result = parse_file(f)
+                if result:
+                    break
+            if not result:
+                self.send_json_response({'name': name, 'inputs': [], 'outputs': []})
+                return
+            self.send_json_response(result)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_verifier_update(self):
+        """Update editable fields of a verifier (e.g., status)."""
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            name = data.get('name')
+            if not name:
+                self.send_json_response({'error': 'name is required'}, 400)
+                return
+            current = self.data_manager.get_verifier_metrics(name)
+            if not current:
+                self.send_json_response({'error': 'verifier not found'}, 404)
+                return
+            # Only allow updates to status and optionally thresholds in future
+            updated = VerifierMetrics(
+                verifier_name=current.verifier_name,
+                accuracy=current.accuracy,
+                status=str(data.get('status', current.status)),
+                checks_performed=current.checks_performed,
+                issues_found=current.issues_found,
+                last_run=datetime.now().isoformat(),
+                avg_execution_time=current.avg_execution_time,
+                false_positive_rate=current.false_positive_rate,
+                false_negative_rate=current.false_negative_rate,
+            )
+            self.data_manager.store_verifier_metrics(updated)
+            self.send_json_response({'success': True, 'updated': {
+                'name': updated.verifier_name,
+                'status': updated.status,
+                'last_run': updated.last_run
+            }})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_signature_analytics(self):
+        """Aggregate per-signature insights: related verifiers, rewards, and context hints.
+
+        Heuristics:
+        - Related actions: recent actions whose parameters/result/state fields mention the signature name.
+        - Verifier breakdown: aggregates verifier_scores from related actions if present; otherwise returns top global verifiers.
+        - Rewards: summary + histogram from related actions.
+        - Context keywords: frequency of keywords in 'query'/'enhanced_state' fields for related actions.
+        """
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            name = (q.get('name') or [''])[0]
+            timeframe = (q.get('timeframe') or ['24h'])[0]
+            env_filter = (q.get('env') or [''])[0]
+            ver_filter = (q.get('verifier') or [''])[0]
+            if not name:
+                self.send_json_response({'error': 'missing name'}, 400)
+                return
+            m = self.data_manager.get_signature_metrics(name)
+            actions = self.data_manager.get_recent_actions(limit=2000)
+            # Filter by timeframe
+            now = time.time()
+            if timeframe == '1h': cutoff = now - 3600
+            elif timeframe == '7d': cutoff = now - 7*24*3600
+            elif timeframe.lower() == '30d': cutoff = now - 30*24*3600
+            else: cutoff = now - 24*3600
+            actions = [a for a in actions if getattr(a, 'timestamp', 0) >= cutoff]
+            # Filter by environment if provided
+            if env_filter:
+                try:
+                    env_val = getattr(Environment, env_filter.strip().upper())
+                    actions = [a for a in actions if getattr(a, 'environment', None) == env_val]
+                except Exception:
+                    pass
+            name_l = name.lower()
+            related = []
+            for a in actions:
+                try:
+                    # Prefer explicit field match
+                    for container in (getattr(a, 'parameters', {}), getattr(a, 'result', {}), getattr(a, 'state_before', {}), getattr(a, 'state_after', {})):
+                        if isinstance(container, dict):
+                            sig = container.get('signature_name')
+                            if isinstance(sig, str) and sig.lower() == name_l:
+                                # Optional filter by presence of specific verifier
+                                if ver_filter:
+                                    sc = None
+                                    if isinstance(a.result, dict) and isinstance(a.result.get('verifier_scores'), dict):
+                                        sc = a.result['verifier_scores']
+                                    elif isinstance(a.parameters, dict) and isinstance(a.parameters.get('verifier_scores'), dict):
+                                        sc = a.parameters['verifier_scores']
+                                    if not (isinstance(sc, dict) and ver_filter in sc):
+                                        raise StopIteration
+                                related.append(a)
+                                raise StopIteration
+                    # Fallback: fuzzy text search
+                    blob = json.dumps({'sb': a.state_before, 'sa': a.state_after, 'p': a.parameters, 'r': a.result}).lower()
+                    if name_l in blob or 'signature' in blob:
+                        if ver_filter:
+                            sc = None
+                            if isinstance(a.result, dict) and isinstance(a.result.get('verifier_scores'), dict): sc = a.result['verifier_scores']
+                            elif isinstance(a.parameters, dict) and isinstance(a.parameters.get('verifier_scores'), dict): sc = a.parameters['verifier_scores']
+                            if not (isinstance(sc, dict) and ver_filter in sc):
+                                raise StopIteration
+                        related.append(a)
+                except Exception:
+                    continue
+                except StopIteration:
+                    pass
+            # Reward stats
+            rewards = [float(getattr(a, 'reward', 0.0) or 0.0) for a in related]
+            avg = (sum(rewards) / len(rewards)) if rewards else 0.0
+            rmin = min(rewards) if rewards else 0.0
+            rmax = max(rewards) if rewards else 0.0
+            # Histogram
+            def histogram(values, bins=20):
+                if not values:
+                    return {'bins': [], 'counts': []}
+                lo = min(values); hi = max(values)
+                if hi <= lo:
+                    edges = [lo, hi or lo + 1e-6]
+                else:
+                    step = (hi - lo) / float(bins)
+                    edges = [lo + i * step for i in range(bins + 1)]
+                counts = [0] * (len(edges) - 1)
+                for v in values:
+                    if v <= edges[0]: counts[0] += 1; continue
+                    if v >= edges[-1]: counts[-1] += 1; continue
+                    idx = int((v - edges[0]) / max(1e-12, (edges[-1] - edges[0])) * (len(edges) - 1))
+                    idx = max(0, min(len(counts) - 1, idx))
+                    counts[idx] += 1
+                return {'bins': edges, 'counts': counts}
+            hist = histogram(rewards, bins=30)
+            # Verifier breakdown from actions if available
+            vb = {}
+            for a in related:
+                try:
+                    scores = None
+                    # try both result and parameters locations
+                    if isinstance(a.result, dict) and isinstance(a.result.get('verifier_scores'), dict):
+                        scores = a.result.get('verifier_scores')
+                    elif isinstance(a.parameters, dict) and isinstance(a.parameters.get('verifier_scores'), dict):
+                        scores = a.parameters.get('verifier_scores')
+                    if isinstance(scores, dict):
+                        for k, v in scores.items():
+                            try:
+                                vb[k] = vb.get(k, { 'count': 0, 'sum': 0.0 })
+                                vb[k]['count'] += 1
+                                vb[k]['sum'] += float(v)
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+            related_verifiers = []
+            for k, agg in vb.items():
+                cnt = max(1, int(agg['count']))
+                related_verifiers.append({'name': k, 'avg_score': agg['sum'] / cnt, 'count': cnt})
+            related_verifiers.sort(key=lambda x: (x['avg_score'], x['count']), reverse=True)
+            if not related_verifiers:
+                # fallback to global verifiers if no per-action scores found
+                vs = self.data_manager.get_all_verifier_metrics()
+                related_verifiers = [{'name': v.verifier_name, 'avg_score': float(v.accuracy), 'count': v.checks_performed} for v in vs]
+                related_verifiers.sort(key=lambda x: x['avg_score'], reverse=True)
+                related_verifiers = related_verifiers[:10]
+            # Context keywords
+            keys = ['testing','build','debug','refactor','implement','search','analyze','general']
+            ck = {k: 0 for k in keys}
+            for a in related:
+                try:
+                    text = ''
+                    if isinstance(a.parameters, dict):
+                        q = a.parameters.get('query')
+                        if isinstance(q, str): text += ' ' + q
+                        es = a.parameters.get('enhanced_state')
+                        if isinstance(es, str): text += ' ' + es
+                    text = text.lower()
+                    if 'test' in text: ck['testing'] += 1
+                    if 'build' in text or 'compile' in text: ck['build'] += 1
+                    if 'debug' in text or 'error' in text or 'fix' in text: ck['debug'] += 1
+                    if 'refactor' in text or 'clean' in text: ck['refactor'] += 1
+                    if 'implement' in text or 'feature' in text or 'add ' in text: ck['implement'] += 1
+                    if 'search' in text or 'grep' in text or 'find ' in text: ck['search'] += 1
+                    if 'analy' in text or 'review' in text or 'understand' in text: ck['analyze'] += 1
+                    if text.strip() == '': ck['general'] += 1
+                except Exception:
+                    continue
+            # Compact recent actions sample
+            sample = [{
+                'id': a.action_id,
+                'ts': a.timestamp,
+                'type': getattr(a.action_type, 'value', str(a.action_type)),
+                'reward': a.reward,
+                'confidence': a.confidence,
+                'execution_time': a.execution_time
+            } for a in sorted(related, key=lambda x: getattr(x, 'timestamp', 0), reverse=True)[:20]]
+            # Top embeddings (doc_ids) correlated with high rewards
+            doc_stats = {}
+            for a in related:
+                try:
+                    doc_id = None
+                    if isinstance(a.parameters, dict):
+                        v = a.parameters.get('doc_id'); doc_id = v if isinstance(v, str) else doc_id
+                    if not doc_id and isinstance(a.result, dict):
+                        v = a.result.get('doc_id'); doc_id = v if isinstance(v, str) else doc_id
+                    if not doc_id:
+                        continue
+                    s = doc_stats.get(doc_id) or {'sum': 0.0, 'cnt': 0, 'last_ts': 0}
+                    s['sum'] += float(getattr(a, 'reward', 0.0) or 0.0)
+                    s['cnt'] += 1
+                    s['last_ts'] = max(s['last_ts'], float(getattr(a, 'timestamp', 0) or 0))
+                    doc_stats[doc_id] = s
+                except Exception:
+                    continue
+            top_embeddings = []
+            clusters = []
+            fi = {'top_dims': [], 'n_dims': None}
+            if doc_stats:
+                # Enrich with model/dim if available in KV embvec
+                for doc_id, s in doc_stats.items():
+                    rec = self._reddb_get(f'embvec:{doc_id}') or {}
+                    top_embeddings.append({
+                        'doc_id': doc_id,
+                        'avg_reward': (s['sum'] / max(1, s['cnt'])),
+                        'count': s['cnt'],
+                        'last_ts': s['last_ts'],
+                        'model': rec.get('model'),
+                        'dim': (len(rec.get('vector') or rec.get('unit') or []) if rec else None)
+                    })
+                top_embeddings.sort(key=lambda x: (x['avg_reward'], x['count']), reverse=True)
+                top_embeddings = top_embeddings[:20]
+                # Feature importance via per-dimension correlation with reward
+                # Build X (unit vectors) and y (avg rewards)
+                X = []; y = []
+                for e in top_embeddings:
+                    rec = self._reddb_get(f"embvec:{e['doc_id']}") or {}
+                    unit = rec.get('unit') or rec.get('vector') or []
+                    if isinstance(unit, list) and unit:
+                        X.append([float(v) for v in unit])
+                        y.append(float(e['avg_reward']))
+                if len(X) >= 3:
+                    n = len(X); d = len(X[0]); fi['n_dims'] = d
+                    try:
+                        corr = compute_correlations(X, y) if compute_correlations else [0.0]*d
+                    except Exception:
+                        corr = [0.0]*d
+                    # top dims by absolute correlation
+                    idx = list(range(d))
+                    idx.sort(key=lambda j: abs(corr[j]), reverse=True)
+                    topk = idx[: min(20, d)]
+                    fi['top_dims'] = [{'idx': int(j), 'corr': float(corr[j])} for j in topk]
+                # Cluster top embeddings by unit vector with naive k-means (k=3)
+                try:
+                    k = int((q.get('clusters') or ['3'])[0])
+                except Exception:
+                    k = 3
+                # fetch unit vectors
+                vecs = []
+                for e in top_embeddings:
+                    rec = self._reddb_get(f"embvec:{e['doc_id']}") or {}
+                    unit = rec.get('unit') or rec.get('vector') or []
+                    if isinstance(unit, list) and unit:
+                        vecs.append((e['doc_id'], [float(x) for x in unit], e['avg_reward']))
+                if len(vecs) >= k and k > 1:
+                    try:
+                        groups = kmeans_clusters([v for _, v, _ in vecs], k=k, iters=5) if kmeans_clusters else []
+                    except Exception:
+                        groups = []
+                    if groups:
+                        for g in groups:
+                            idxs = g.get('indices') or []
+                            if not idxs: continue
+                            avg_r = sum(vecs[i][2] for i in idxs) / max(1, len(idxs))
+                            clusters.append({'id': g.get('id', 0), 'count': len(idxs), 'avg_reward': avg_r})
+            self.send_json_response({
+                'signature': name,
+                'metrics': (m.to_dict() if m else None),
+                'related_verifiers': related_verifiers,
+                'reward_summary': {'avg': avg, 'min': rmin, 'max': rmax, 'count': len(rewards), 'hist': hist},
+                'context_keywords': ck,
+                'actions_sample': sample,
+                'top_embeddings': top_embeddings,
+                'clusters': clusters,
+                'feature_importance': fi,
+                'timestamp': time.time()
+            })
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_signature_feature_analysis(self):
+        """Compute regression/PCA-lite analysis for per-signature embeddings.
+
+        Returns a compact 'direction' vector (regression coefficients over standardized features),
+        top positive/negative dimensions, and human-friendly explanation strings.
+        Query: name (required), timeframe (1h/24h/7d/30d), env (optional), limit (default 50)
+        """
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            name = (q.get('name') or [''])[0]
+            if not name:
+                self.send_json_response({'error': 'missing name'}, 400)
+                return
+            timeframe = (q.get('timeframe') or ['24h'])[0]
+            env_filter = (q.get('env') or [''])[0]
+            try:
+                limit = int((q.get('limit') or ['50'])[0])
+            except Exception:
+                limit = 50
+            # Gather labeled actions for the signature
+            now = time.time()
+            if timeframe == '1h': cutoff = now - 3600
+            elif timeframe == '7d': cutoff = now - 7*24*3600
+            elif timeframe.lower() == '30d': cutoff = now - 30*24*3600
+            else: cutoff = now - 24*3600
+            acts = self.data_manager.get_recent_actions(limit=2000)
+            acts = [a for a in acts if getattr(a, 'timestamp', 0) >= cutoff]
+            if env_filter:
+                try:
+                    env_val = getattr(Environment, env_filter.strip().upper())
+                    acts = [a for a in acts if getattr(a, 'environment', None) == env_val]
+                except Exception:
+                    pass
+            rel = []
+            name_l = name.lower()
+            for a in acts:
+                try:
+                    ok = False
+                    for cont in (getattr(a,'parameters',{}), getattr(a,'result',{}), getattr(a,'state_before',{}), getattr(a,'state_after',{})):
+                        if isinstance(cont, dict) and isinstance(cont.get('signature_name'), str) and cont.get('signature_name').lower() == name_l:
+                            ok = True; break
+                    if not ok:
+                        continue
+                    rel.append(a)
+                except Exception:
+                    continue
+            # Build dataset (X=unit vectors, y=reward)
+            X = []; y = []
+            used = 0
+            for a in rel:
+                if used >= limit: break
+                try:
+                    doc_id = None
+                    for cont in (getattr(a,'parameters',{}), getattr(a,'result',{})):
+                        if isinstance(cont, dict) and isinstance(cont.get('doc_id'), str):
+                            doc_id = cont.get('doc_id'); break
+                    if not doc_id:
+                        continue
+                    rec = self._reddb_get(f'embvec:{doc_id}') or {}
+                    unit = rec.get('unit') or rec.get('vector') or []
+                    if isinstance(unit, list) and unit:
+                        X.append([float(v) for v in unit]); y.append(float(getattr(a,'reward',0.0) or 0.0)); used += 1
+                except Exception:
+                    continue
+            # Only enforce a minimum sample size when caller explicitly set a small limit
+            raw_limit = (q.get('limit') or [])
+            explicit_limit = True if raw_limit else False
+            if explicit_limit and len(X) < 5:
+                _safe_send_json(self, {'error': 'insufficient data', 'count': len(X)})
+                return
+            n = len(X); d = len(X[0])
+            # Compute regression direction via utility
+            direction = []
+            try:
+                direction = compute_direction(X, y) if compute_direction else []
+            except Exception:
+                direction = []
+            # Top positive/negative dims
+            idx = list(range(d))
+            idx.sort(key=lambda j: direction[j], reverse=True)
+            top_pos = [{'idx': int(j), 'weight': float(direction[j])} for j in idx[: min(10, d)]]
+            idx.sort(key=lambda j: direction[j])
+            top_neg = [{'idx': int(j), 'weight': float(direction[j])} for j in idx[: min(10, d)]]
+            # Text explanations
+            expl = []
+            if top_pos:
+                pos = ", ".join([f"dim {t['idx']} (+{t['weight']:.3f})" for t in top_pos[:5]])
+                expl.append(f"Dimensions increasing reward most: {pos}")
+            if top_neg:
+                neg = ", ".join([f"dim {t['idx']} ({t['weight']:.3f})" for t in top_neg[:5]])
+                expl.append(f"Dimensions decreasing reward most: {neg}")
+            _safe_send_json(self, {'signature': name, 'n_dims': d, 'direction': direction, 'top_positive': top_pos, 'top_negative': top_neg, 'explanations': expl, 'timestamp': time.time()})
+        except Exception as e:
+            _safe_send_json(self, {'error': str(e)}, 500)
+
+    def serve_signature_optimization_history(self):
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            name = (q.get('name') or [''])[0]
+            if not name:
+                _safe_send_json(self, {'error': 'missing name'}, 400)
+                return
+            m = self.data_manager.get_signature_metrics(name)
+            if not m:
+                _safe_send_json(self, {'history': [], 'metrics': None, 'timestamp': time.time()})
+                return
+            hist = m.optimization_history or []
+            _safe_send_json(self, {'history': hist, 'metrics': m.to_dict(), 'timestamp': time.time()})
+        except Exception as e:
+            _safe_send_json(self, {'error': str(e)}, 500)
+
+    def serve_signature_gepa_analysis(self):
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            name = (q.get('name') or [''])[0]
+            if not name:
+                _safe_send_json(self, {'error': 'missing name'}, 400)
+                return
+            window = int((q.get('window') or ['86400'])[0])
+            env_filter = (q.get('env') or [''])[0]
+            m = self.data_manager.get_signature_metrics(name)
+            if not m or not (m.optimization_history):
+                self.send_json_response({'error': 'no optimization history'}, 400)
+                return
+            t_opt = float(m.optimization_history[-1].get('timestamp') or 0)
+            if t_opt <= 0:
+                self.send_json_response({'error': 'invalid optimization timestamp'}, 400)
+                return
+            acts = self.data_manager.get_recent_actions(limit=5000)
+            name_l = name.lower()
+            pre = []; post = []
+            for a in acts:
+                try:
+                    # signature match (exact)
+                    ok = False
+                    for cont in (getattr(a,'parameters',{}), getattr(a,'result',{}), getattr(a,'state_before',{}), getattr(a,'state_after',{})):
+                        if isinstance(cont, dict) and isinstance(cont.get('signature_name'), str) and cont.get('signature_name').lower() == name_l:
+                            ok = True; break
+                    if not ok:
+                        continue
+                    ts = float(getattr(a, 'timestamp', 0) or 0)
+                    if ts <= 0: continue
+                    if env_filter:
+                        try:
+                            env_val = getattr(Environment, env_filter.strip().upper())
+                            if getattr(a, 'environment', None) != env_val:
+                                continue
+                        except Exception:
+                            pass
+                    if t_opt - window <= ts <= t_opt:
+                        pre.append(a)
+                    elif t_opt < ts <= t_opt + window:
+                        post.append(a)
+                except Exception:
+                    continue
+            def summarize(arr):
+                if not arr:
+                    return {'count': 0, 'avg_reward': 0.0, 'verifiers': []}
+                rs = [float(getattr(a,'reward',0.0) or 0.0) for a in arr]
+                avg = sum(rs)/len(rs)
+                agg = {}
+                for a in arr:
+                    sc = None
+                    if isinstance(a.result, dict) and isinstance(a.result.get('verifier_scores'), dict):
+                        sc = a.result['verifier_scores']
+                    elif isinstance(a.parameters, dict) and isinstance(a.parameters.get('verifier_scores'), dict):
+                        sc = a.parameters['verifier_scores']
+                    if isinstance(sc, dict):
+                        for k,v in sc.items():
+                            try:
+                                agg[k] = agg.get(k, {'sum':0.0,'cnt':0}); agg[k]['sum'] += float(v); agg[k]['cnt'] += 1
+                            except Exception:
+                                continue
+                ver = [{'name': k, 'avg': (v['sum']/max(1,v['cnt'])), 'count': v['cnt']} for k,v in agg.items()]
+                ver.sort(key=lambda x: (x['avg'], x['count']), reverse=True)
+                return {'count': len(arr), 'avg_reward': avg, 'verifiers': ver}
+            pre_s = summarize(pre); post_s = summarize(post)
+            delta = {'reward': (post_s['avg_reward'] - pre_s['avg_reward']), 'verifiers': []}
+            # Match verifiers by name
+            idx = {v['name']: v for v in pre_s['verifiers']}
+            for v in post_s['verifiers']:
+                namev = v['name']; before = idx.get(namev, {'avg':0.0,'count':0})
+                delta['verifiers'].append({'name': namev, 'delta': v['avg'] - before['avg'], 'post_avg': v['avg'], 'pre_avg': before['avg']})
+            _safe_send_json(self, {'signature': name, 't_opt': t_opt, 'window': window, 'pre': pre_s, 'post': post_s, 'delta': delta, 'timestamp': time.time()})
+        except Exception as e:
+            _safe_send_json(self, {'error': str(e)}, 500)
+
+    def serve_signature_graph(self):
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            timeframe = (q.get('timeframe') or ['24h'])[0]
+            env_filter = (q.get('env') or [''])[0]
+            try:
+                min_reward = float((q.get('min_reward') or ['-1e9'])[0])
+            except Exception:
+                min_reward = float('-inf')
+            ver_filter = (q.get('verifier') or [''])[0].strip()
+            download = (q.get('download') or ['0'])[0] in ('1','true','yes','on')
+            now = time.time()
+            if timeframe == '1h': cutoff = now - 3600
+            elif timeframe == '7d': cutoff = now - 7*24*3600
+            elif timeframe.lower() == '30d': cutoff = now - 30*24*3600
+            else: cutoff = now - 24*3600
+            acts = self.data_manager.get_recent_actions(limit=5000)
+            acts = [a for a in acts if getattr(a, 'timestamp', 0) >= cutoff]
+            if env_filter:
+                try:
+                    env_val = getattr(Environment, env_filter.strip().upper())
+                    acts = [a for a in acts if getattr(a, 'environment', None) == env_val]
+                except Exception:
+                    pass
+            # reward filter
+            acts = [a for a in acts if float(getattr(a, 'reward', 0.0) or 0.0) >= min_reward]
+            # Build nodes and edges signature->verifier
+            sig_nodes = {}; ver_nodes = {}; edges = {}
+            for a in acts:
+                sig = None
+                for cont in (getattr(a,'parameters',{}), getattr(a,'result',{}), getattr(a,'state_before',{}), getattr(a,'state_after',{})):
+                    if isinstance(cont, dict) and isinstance(cont.get('signature_name'), str): sig = cont.get('signature_name'); break
+                if not sig: continue
+                scores = None
+                if isinstance(a.result, dict) and isinstance(a.result.get('verifier_scores'), dict): scores = a.result['verifier_scores']
+                elif isinstance(a.parameters, dict) and isinstance(a.parameters.get('verifier_scores'), dict): scores = a.parameters['verifier_scores']
+                if not isinstance(scores, dict): continue
+                if ver_filter and ver_filter not in scores:
+                    continue
+                sig_nodes[sig] = True
+                for ver, val in scores.items():
+                    ver_nodes[ver] = True
+                    key = (sig, ver)
+                    e = edges.get(key) or {'sum':0.0,'cnt':0}
+                    try:
+                        e['sum'] += float(val); e['cnt'] += 1
+                    except Exception:
+                        e['cnt'] += 0
+                    edges[key] = e
+            # Signature<->signature co-occurrence edges (within 90s proximity)
+            acts_sig = []
+            for a in acts:
+                sig = None
+                for cont in (getattr(a,'parameters',{}), getattr(a,'result',{}), getattr(a,'state_before',{}), getattr(a,'state_after',{})):
+                    if isinstance(cont, dict) and isinstance(cont.get('signature_name'), str): sig = cont.get('signature_name'); break
+                if sig: acts_sig.append((float(getattr(a,'timestamp',0) or 0.0), sig))
+            acts_sig.sort(key=lambda x: x[0])
+            edges_ss = {}
+            for i in range(len(acts_sig)-1):
+                t1, s1 = acts_sig[i]; t2, s2 = acts_sig[i+1]
+                if s1 == s2: continue
+                if abs(t2 - t1) <= 90:
+                    key = tuple(sorted((s1, s2)))
+                    e = edges_ss.get(key) or 0; edges_ss[key] = e + 1
+            nodes = ([{'id': s, 'type': 'signature'} for s in sig_nodes.keys()] + [{'id': v, 'type': 'verifier'} for v in ver_nodes.keys()])
+            out_edges = [{'source': s, 'target': v, 'avg': (e['sum']/max(1,e['cnt'])), 'count': e['cnt']} for (s,v), e in edges.items()]
+            out_edges_ss = [{'a': a, 'b': b, 'count': c} for (a,b), c in edges_ss.items()]
+            payload = {'nodes': nodes, 'edges': out_edges, 'edges_sig_sig': out_edges_ss, 'timestamp': time.time()}
+            if download:
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.send_header('Content-Disposition', 'attachment; filename="signature-graph.json"')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(payload, indent=2).encode('utf-8'))
+                    return
+                except Exception:
+                    pass
+            _safe_send_json(self, payload)
+        except Exception as e:
+            _safe_send_json(self, {'error': str(e)}, 500)
+
+    def _rl_config_path(self, workspace: str | None = None) -> Path:
+        """Resolve RL config path, preferring workspace/.dspy_rl.json if provided or env DSPY_WORKSPACE."""
+        if workspace:
+            try:
+                wp = Path(workspace).expanduser()
+                if wp.exists():
+                    return wp / '.dspy_rl.json'
+            except Exception:
+                pass
+        env_ws = os.getenv('DSPY_WORKSPACE')
+        if env_ws:
+            try:
+                p = Path(env_ws).expanduser()
+                return p / '.dspy_rl.json'
+            except Exception:
+                pass
+        return REPO_ROOT / '.dspy_rl.json'
+
+    def _read_rl_config(self, workspace: str | None = None) -> dict:
+        cfg_path = self._rl_config_path(workspace)
+        try:
+            if cfg_path.exists():
+                return json.loads(cfg_path.read_text())
+        except Exception:
+            pass
+        return {}
+
+    def _write_rl_config(self, cfg: dict, workspace: str | None = None) -> None:
+        cfg_path = self._rl_config_path(workspace)
+        try:
+            cfg_path.write_text(json.dumps(cfg, indent=2))
+        except Exception:
+            pass
+
+    def serve_rewards_config(self):
+        """Return current rewards/rl configuration for editing in UI."""
+        try:
+            query_params = parse_qs(urlparse(self.path).query)
+            workspace = query_params.get('workspace', [None])[0]
+            cfg = self._read_rl_config(workspace)
+            # Limit to key fields that matter to UI, include defaults
+            resp = {
+                'policy': cfg.get('policy', 'epsilon-greedy'),
+                'epsilon': cfg.get('epsilon', 0.1),
+                'ucb_c': cfg.get('ucb_c', 2.0),
+                'n_envs': cfg.get('n_envs', 1),
+                'puffer': cfg.get('puffer', False),
+                'weights': cfg.get('weights', {}),
+                'penalty_kinds': cfg.get('penalty_kinds', []),
+                'clamp01_kinds': cfg.get('clamp01_kinds', []),
+                'scales': cfg.get('scales', {}),
+                'actions': cfg.get('actions', []),
+                'test_cmd': cfg.get('test_cmd'),
+                'lint_cmd': cfg.get('lint_cmd'),
+                'build_cmd': cfg.get('build_cmd'),
+                'timeout_sec': cfg.get('timeout_sec')
+            }
+            # Include resolved path in response for transparency
+            resp['path'] = str(self._rl_config_path(workspace))
+            self.send_json_response(resp)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_rewards_config_update(self):
+        """Merge updated values into .dspy_rl.json (weights, penalties, etc.)."""
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            if not isinstance(data, dict):
+                self.send_json_response({'error': 'invalid payload'}, 400)
+                return
+            workspace = data.get('workspace') if isinstance(data.get('workspace'), str) else None
+            cfg = self._read_rl_config(workspace)
+            # Shallow merge for known fields
+            for key in ['policy', 'epsilon', 'ucb_c', 'n_envs', 'puffer', 'test_cmd', 'lint_cmd', 'build_cmd', 'timeout_sec']:
+                if key in data:
+                    cfg[key] = data[key]
+            # Dict merges
+            for key in ['weights', 'scales']:
+                if key in data and isinstance(data[key], dict):
+                    base = cfg.get(key, {})
+                    if not isinstance(base, dict):
+                        base = {}
+                    base.update(data[key])
+                    cfg[key] = base
+            # List replacements
+            for key in ['penalty_kinds', 'clamp01_kinds', 'actions']:
+                if key in data and isinstance(data[key], list):
+                    cfg[key] = list(data[key])
+            self._write_rl_config(cfg, workspace)
+            self.send_json_response({'success': True, 'updated': True, 'path': str(self._rl_config_path(workspace))})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    # Capacity endpoints -------------------------------------------------
+    def serve_capacity_status(self):
+        try:
+            root = REPO_ROOT
+            from dspy_agent.provision.autoscaler import load_config as _lc, capacity_snapshot as _snap, propose_scale as _pp, persist_proposals as _persist
+            cfg = _lc()
+            snap = _snap(root)
+            props = _pp(root, cfg)
+            try:
+                _persist(props)
+            except Exception:
+                pass
+            self.send_json_response({'config': cfg.to_dict(), 'snapshot': snap, 'proposals': props, 'ts': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_capacity_config(self):
+        try:
+            from dspy_agent.provision.autoscaler import load_config as _lc
+            cfg = _lc()
+            self.send_json_response(cfg.to_dict())
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_capacity_approve(self):
+        try:
+            from dspy_agent.provision.autoscaler import record_request as _rec, load_config as _lc, save_config as _sc
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            kind = str(data.get('kind') or '')
+            params = dict(data.get('params') or {})
+            if not kind:
+                self.send_json_response({'error': 'missing kind'}, 400); return
+            _rec(kind, params, approved=True)
+            # Apply simple config changes for approved actions
+            cfg = _lc()
+            changed = False
+            try:
+                if kind == 'storage_budget_increase':
+                    to_gb = int(params.get('to_gb') or 0)
+                    if to_gb > 0:
+                        cfg.storage_budget_gb = to_gb; changed = True
+                elif kind == 'gpu_hours_increase':
+                    to_hpd = int(params.get('to_hpd') or 0)
+                    if to_hpd >= 0:
+                        cfg.gpu_hours_per_day = to_hpd; changed = True
+            except Exception:
+                pass
+            if changed:
+                _sc(cfg)
+            self.send_json_response({'ok': True, 'config_applied': changed, 'config': cfg.to_dict()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_capacity_deny(self):
+        try:
+            from dspy_agent.provision.autoscaler import record_request as _rec
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            kind = str(data.get('kind') or '')
+            params = dict(data.get('params') or {})
+            if not kind:
+                self.send_json_response({'error': 'missing kind'}, 400); return
+            _rec(kind, params, approved=False)
+            self.send_json_response({'ok': True})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_capacity_apply(self):
+        """Run Terraform apply for a bundle (admin only)."""
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            bundle = data.get('bundle') or 'deploy/provision/aws/dspy-agent'
+            auto = bool(data.get('yes') or data.get('auto_approve') or False)
+            bundle_path = (REPO_ROOT / bundle) if not str(bundle).startswith('/') else Path(bundle)
+            if not bundle_path.exists():
+                self.send_json_response({'error': f'bundle not found: {bundle_path}'}, 404); return
+            import shutil
+            if shutil.which('terraform') is None:
+                self.send_json_response({'error': 'terraform not found on PATH'}, 500); return
+            logger = DeploymentLogger(workspace=REPO_ROOT, name='apply-aws')
+            code = logger.run_stream(["terraform", f"-chdir={str(bundle_path)}", "init"], phase='init')
+            if code != 0:
+                logger.close(); self.send_json_response({'error': 'terraform init failed'}, 500); return
+            args = ["terraform", f"-chdir={str(bundle_path)}", "apply"] + (["-auto-approve"] if auto else [])
+            code = logger.run_stream(args, phase='apply')
+            ok = (code == 0)
+            logger.close()
+            self.send_json_response({'ok': ok, 'bundle': str(bundle_path)})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_capacity_apply_approved(self):
+        """Build a plan from approved requests, estimate costs, and run IaC apply."""
+        try:
+            from dspy_agent.provision.autoscaler import read_requests as _reads, load_config as _lc
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            bundle = data.get('bundle') or 'deploy/provision/aws/dspy-agent'
+            auto = bool(data.get('yes') or data.get('auto_approve') or False)
+            bundle_path = (REPO_ROOT / bundle) if not str(bundle).startswith('/') else Path(bundle)
+            reqs = [r for r in _reads() if r.get('approved')]
+            cfg = _lc()
+            # Aggregate proposed changes
+            plan = {'storage_gb': cfg.storage_budget_gb, 'gpu_hours_per_day': cfg.gpu_hours_per_day}
+            for r in reqs[-20:]:
+                kind = str(r.get('kind') or '')
+                params = r.get('params') or {}
+                if kind == 'storage_budget_increase':
+                    to_gb = int(params.get('to_gb') or 0)
+                    if to_gb > plan['storage_gb']:
+                        plan['storage_gb'] = to_gb
+                elif kind == 'gpu_hours_increase':
+                    to_hpd = int(params.get('to_hpd') or 0)
+                    if to_hpd > plan['gpu_hours_per_day']:
+                        plan['gpu_hours_per_day'] = to_hpd
+            # Cost estimate
+            rates = get_pricing('aws', 'prime-intellect', live=False)
+            s3 = float(rates.get('aws.s3.gb', 0.023))
+            gpu = float(rates.get('prime-intellect.gpu.hour', 0.89))
+            storage_cost = plan['storage_gb'] * s3
+            gpu_cost = plan['gpu_hours_per_day'] * 22 * gpu
+            estimate = {'storage_usd': round(storage_cost, 2), 'gpu_usd': round(gpu_cost, 2), 'monthly_total': round(storage_cost + gpu_cost, 2)}
+            # Apply IaC
+            ok = True
+            if bundle_path.exists():
+                import shutil
+                if shutil.which('terraform') is None:
+                    ok = False
+                else:
+                    logger = DeploymentLogger(workspace=REPO_ROOT, name='apply-aws')
+                    code = logger.run_stream(["terraform", f"-chdir={str(bundle_path)}", "init"], phase='init')
+                    if code != 0:
+                        logger.close(); self.send_json_response({'error': 'terraform init failed', 'plan': plan, 'estimate': estimate}, 500); return
+                    args = ["terraform", f"-chdir={str(bundle_path)}", "apply"] + (["-auto-approve"] if auto else [])
+                    code = logger.run_stream(args, phase='apply')
+                    ok = (code == 0)
+                    logger.close()
+            self.send_json_response({'ok': ok, 'plan': plan, 'estimate': estimate, 'bundle': str(bundle_path)})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_action_feedback(self):
+        """Record user feedback on a specific action (approve/reject/suggest)."""
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            action_id = data.get('action_id')
+            decision = str(data.get('decision', '')).lower()
+            comment = data.get('comment')
+            if not action_id or decision not in {'approve', 'reject', 'suggest'}:
+                self.send_json_response({'error': 'invalid payload'}, 400)
+                return
+            # Log feedback
+            entry = create_log_entry(
+                level="INFO",
+                source="user_feedback",
+                message=f"User {decision} on action {action_id}",
+                context={
+                    'action_id': action_id,
+                    'decision': decision,
+                    'comment': comment
+                },
+                environment=Environment.DEVELOPMENT
+            )
+            self.data_manager.log(entry)
+            # Optionally: write a synthetic action record for learning
+            reward = 0.0
+            if decision == 'approve':
+                reward = 1.0
+            elif decision == 'reject':
+                reward = -1.0
+            if reward != 0.0:
+                rec = create_action_record(
+                    action_type=ActionType.VERIFICATION,
+                    state_before={'action_id': action_id},
+                    state_after={'action_id': action_id},
+                    parameters={'user_feedback': decision},
+                    result={'note': 'user_feedback'},
+                    reward=reward,
+                    confidence=0.99,
+                    execution_time=0.0,
+                    environment=Environment.DEVELOPMENT
+                )
+                self.data_manager.record_action(rec)
+            self.send_json_response({'success': True})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_actions_analytics(self):
+        """Return distributions over recent actions: reward, type counts, durations."""
+        try:
+            query_params = parse_qs(urlparse(self.path).query)
+            limit = int(query_params.get('limit', ['500'])[0])
+            timeframe = query_params.get('timeframe', ['24h'])[0]
+            # Resolve time window
+            now = time.time()
+            if timeframe == '1h':
+                cutoff = now - 3600
+            elif timeframe == '7d':
+                cutoff = now - 7*24*3600
+            elif timeframe == '30d' or timeframe == '30D':
+                cutoff = now - 30*24*3600
+            else:
+                cutoff = now - 24*3600
+            actions = self.data_manager.get_recent_actions(limit=max(1000, limit))
+            actions = [a for a in actions if getattr(a, 'timestamp', 0) >= cutoff]
+            if len(actions) > limit:
+                actions = sorted(actions, key=lambda a: getattr(a, 'timestamp', 0), reverse=True)[:limit]
+            # Summaries
+            by_type = {}
+            rewards = []
+            durations = []
+            recent = []
+            for a in actions:
+                at = getattr(a.action_type, 'value', str(a.action_type))
+                by_type[at] = by_type.get(at, 0) + 1
+                try:
+                    rewards.append(float(a.reward))
+                except Exception:
+                    pass
+                try:
+                    durations.append(float(a.execution_time))
+                except Exception:
+                    pass
+                recent.append({
+                    'id': a.action_id,
+                    'timestamp': a.timestamp,
+                    'type': at,
+                    'reward': a.reward,
+                    'confidence': a.confidence,
+                    'execution_time': a.execution_time,
+                    'environment': getattr(a.environment, 'value', str(a.environment)),
+                })
+            # Build histograms
+            def histogram(values, bins=20):
+                if not values:
+                    return {'bins': [], 'counts': []}
+                lo = min(values); hi = max(values)
+                if hi <= lo:
+                    edges = [lo, hi or lo + 1e-6]
+                else:
+                    step = (hi - lo) / float(bins)
+                    edges = [lo + i * step for i in range(bins + 1)]
+                counts = [0] * (len(edges) - 1)
+                for v in values:
+                    if v <= edges[0]:
+                        counts[0] += 1
+                        continue
+                    if v >= edges[-1]:
+                        counts[-1] += 1
+                        continue
+                    idx = int((v - edges[0]) / max(1e-12, (edges[-1] - edges[0])) * (len(edges) - 1))
+                    idx = max(0, min(len(counts) - 1, idx))
+                    counts[idx] += 1
+                return {'bins': edges, 'counts': counts}
+
+            reward_hist = histogram(rewards, bins=30)
+            dur_hist = histogram(durations, bins=30)
+            # Top/bottom
+            top = sorted(recent, key=lambda x: x.get('reward', 0), reverse=True)[:20]
+            worst = sorted(recent, key=lambda x: x.get('reward', 0))[:20]
+            self.send_json_response({
+                'counts_by_type': by_type,
+                'reward_hist': reward_hist,
+                'duration_hist': dur_hist,
+                'top_actions': top,
+                'worst_actions': worst,
+                'recent': recent[:100],
+                'timestamp': time.time()
+            })
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def _actions_payload(self, limit: int = 50, timeframe: str = '1h') -> dict:
+        try:
+            now = time.time()
+            if timeframe == '1h':
+                cutoff = now - 3600
+            elif timeframe == '7d':
+                cutoff = now - 7*24*3600
+            elif timeframe.lower() == '30d':
+                cutoff = now - 30*24*3600
+            else:
+                cutoff = now - 24*3600
+            actions = self.data_manager.get_recent_actions(limit=max(1000, limit))
+            actions = [a for a in actions if getattr(a, 'timestamp', 0) >= cutoff]
+            if len(actions) > limit:
+                actions = sorted(actions, key=lambda a: getattr(a, 'timestamp', 0), reverse=True)[:limit]
+            by_type = {}
+            rewards = []
+            durations = []
+            recent = []
+            for a in actions:
+                at = getattr(a.action_type, 'value', str(a.action_type))
+                by_type[at] = by_type.get(at, 0) + 1
+                try:
+                    rewards.append(float(a.reward))
+                except Exception:
+                    pass
+                try:
+                    durations.append(float(a.execution_time))
+                except Exception:
+                    pass
+                recent.append({
+                    'id': a.action_id,
+                    'timestamp': a.timestamp,
+                    'type': at,
+                    'reward': a.reward,
+                    'confidence': a.confidence,
+                    'execution_time': a.execution_time,
+                    'environment': getattr(a.environment, 'value', str(a.environment)),
+                })
+            def histogram(values, bins=20):
+                if not values:
+                    return {'bins': [], 'counts': []}
+                lo = min(values); hi = max(values)
+                if hi <= lo:
+                    edges = [lo, hi or lo + 1e-6]
+                else:
+                    step = (hi - lo) / float(bins)
+                    edges = [lo + i * step for i in range(bins + 1)]
+                counts = [0] * (len(edges) - 1)
+                for v in values:
+                    if v <= edges[0]:
+                        counts[0] += 1
+                        continue
+                    if v >= edges[-1]:
+                        counts[-1] += 1
+                        continue
+                    idx = int((v - edges[0]) / max(1e-12, (edges[-1] - edges[0])) * (len(edges) - 1))
+                    idx = max(0, min(len(counts) - 1, idx))
+                    counts[idx] += 1
+                return {'bins': edges, 'counts': counts}
+            reward_hist = histogram(rewards, bins=30)
+            dur_hist = histogram(durations, bins=30)
+            top = sorted(recent, key=lambda x: x.get('reward', 0), reverse=True)[:20]
+            worst = sorted(recent, key=lambda x: x.get('reward', 0))[:20]
+            return {
+                'counts_by_type': by_type,
+                'reward_hist': reward_hist,
+                'duration_hist': dur_hist,
+                'top_actions': top,
+                'worst_actions': worst,
+                'recent': recent[:100],
+                'timestamp': time.time()
+            }
+        except Exception as e:
+            return {'counts_by_type': {}, 'reward_hist': {'bins': [], 'counts': []}, 'duration_hist': {'bins': [], 'counts': []}, 'top_actions': [], 'worst_actions': [], 'recent': [], 'error': str(e), 'timestamp': time.time()}
+
     def serve_learning_metrics(self):
         """Get learning performance metrics from RedDB"""
         try:
@@ -560,6 +2530,114 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
+    def serve_kafka_configs(self):
+        """Describe Kafka topic configs (e.g., retention.ms) via docker-compose exec.
+
+        Query params:
+          topics: comma-separated list (default: agent.results,embeddings)
+          compose_file: override compose file path
+          service: kafka service name (default: kafka)
+        """
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            # Load defaults
+            cfg = {}
+            try:
+                kpath = (REPO_ROOT / '.dspy_kafka.json')
+                if kpath.exists():
+                    cfg = json.loads(kpath.read_text()) or {}
+            except Exception:
+                cfg = {}
+            raw_topics = q.get('topics', ['agent.results,embeddings'])[0]
+            topics = [t.strip() for t in raw_topics.split(',') if t.strip()]
+            compose_file = q.get('compose_file', [None])[0] or cfg.get('compose_file') or str(REPO_ROOT / 'docker' / 'lightweight' / 'docker-compose.yml')
+            service = q.get('service', [None])[0] or cfg.get('service') or 'kafka'
+            out = {}
+            # Load history file
+            reports = REPO_ROOT / '.dspy_reports'; reports.mkdir(exist_ok=True)
+            hist_path = reports / 'kafka_retention_history.json'
+            try:
+                history = json.loads(hist_path.read_text()) if hist_path.exists() else {}
+            except Exception:
+                history = {}
+            for tp in topics:
+                try:
+                    cmd = [
+                        'docker-compose', '-f', compose_file,
+                        'exec', '-T', service,
+                        'bash', '-lc', f"/opt/bitnami/kafka/bin/kafka-configs.sh --bootstrap-server kafka:9092 --entity-type topics --entity-name {tp} --describe"
+                    ]
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                    raw = (proc.stdout or proc.stderr or '').strip()
+                    retention = None
+                    for ln in raw.splitlines():
+                        if 'retention.ms' in ln:
+                            import re as _re
+                            m = _re.search(r'retention\.ms\s*=\s*(\d+)', ln)
+                            if not m:
+                                m = _re.search(r'retention\.ms=(\d+)', ln)
+                            if m:
+                                try:
+                                    retention = int(m.group(1))
+                                except Exception:
+                                    pass
+                            break
+                    out[tp] = {'retention_ms': retention, 'ok': proc.returncode == 0, 'raw': raw}
+                    # Append to history
+                    try:
+                        if retention is not None:
+                            arr = history.get(tp) or []
+                            arr.append({'ts': time.time(), 'retention_ms': int(retention)})
+                            # cap length
+                            if len(arr) > 200:
+                                arr = arr[-200:]
+                            history[tp] = arr
+                    except Exception:
+                        pass
+                except Exception as e:
+                    out[tp] = {'retention_ms': None, 'ok': False, 'raw': str(e)}
+            # Persist history
+            try:
+                hist_path.write_text(json.dumps(history, indent=2))
+            except Exception:
+                pass
+            self.send_json_response({'topics': out, 'history': history, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_kafka_settings(self):
+        try:
+            if self.command == 'GET':
+                try:
+                    p = (REPO_ROOT / '.dspy_kafka.json')
+                    data = json.loads(p.read_text()) if p.exists() else {}
+                except Exception:
+                    data = {}
+                self.send_json_response({'settings': data})
+                return
+            self.send_json_response({'error': 'method not allowed'}, 405)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_kafka_settings(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            body = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+        except Exception:
+            body = {}
+        try:
+            allowed = {'compose_file', 'service'}
+            settings = { k: v for k, v in body.items() if k in allowed }
+            (REPO_ROOT / '.dspy_kafka.json').write_text(json.dumps(settings, indent=2))
+            try:
+                self._trace('POST', '/api/kafka/settings', settings)
+            except Exception:
+                pass
+            self.send_json_response({'ok': True, 'settings': settings})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
     def serve_spark_workers(self):
         """Get Spark cluster and worker information"""
         try:
@@ -627,6 +2705,249 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                 'timestamp': time.time()
             })
             
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_spark_stream(self):
+        """SSE stream of Spark metrics from the driver UI REST API, with graceful fallback.
+
+        Tries to read from SPARK UI (default http://localhost:4041/api/v1).
+        """
+        base = os.getenv('SPARK_VECTOR_UI_URL', 'http://localhost:4041/api/v1').rstrip('/')
+        def fetch_json(path: str, timeout=2):
+            try:
+                req = urllib.request.Request(base + path, method='GET')
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode('utf-8'))
+            except Exception:
+                return None
+        def snapshot():
+            apps = fetch_json('/applications') or []
+            if isinstance(apps, list) and apps:
+                # pick the most recent app named 'kafka_vectorizer' or last
+                app = None
+                for a in apps:
+                    if str(a.get('name','')).lower() == 'kafka_vectorizer':
+                        app = a; break
+                if not app:
+                    app = apps[-1]
+                app_id = app.get('id')
+                # Streaming statistics
+                stats = fetch_json(f'/applications/{app_id}/streaming/statistics') or {}
+                # Jobs summary
+                jobs = fetch_json(f'/applications/{app_id}/jobs') or []
+                running = len([j for j in jobs if str(j.get('status','')).upper() == 'RUNNING']) if isinstance(jobs, list) else 0
+                completed = len([j for j in jobs if str(j.get('status','')).upper() == 'SUCCEEDED']) if isinstance(jobs, list) else 0
+                # Executors
+                execs = fetch_json(f'/applications/{app_id}/executors') or []
+                total_cores = 0; used_cores = 0; mem_total = 0; mem_used = 0
+                if isinstance(execs, list):
+                    for ex in execs:
+                        total_cores += int(ex.get('totalCores', 0))
+                        mem_total += int(ex.get('memory', 0)) if isinstance(ex.get('memory'), int) else 0
+                        mem_used += int(ex.get('memoryUsed', 0)) if isinstance(ex.get('memoryUsed'), int) else 0
+                cluster_metrics = {
+                    'total_cores': total_cores,
+                    'used_cores': used_cores or min(total_cores, running * 2),
+                    'total_memory': f"{mem_total//(1024**3)}GB" if mem_total else '0GB',
+                    'used_memory': f"{mem_used//(1024**3)}GB" if mem_used else '0GB',
+                    'cpu_utilization': round((used_cores or 1) / float(total_cores or 1) * 100, 1)
+                }
+                # Build a compact payload
+                s = stats if isinstance(stats, dict) else {}
+                streaming = {
+                    'batchesCompleted': s.get('numBatchesTotal'),
+                    'inputRate': s.get('inputRateTotal'),
+                    'processingRate': s.get('processingRateTotal'),
+                    'avgInputPerBatch': s.get('avgInputPerBatch'),
+                    'avgProcessingTimeMs': s.get('avgProcessingTime'),
+                    'avgSchedulingDelayMs': s.get('avgSchedulingDelay'),
+                    'avgTotalDelayMs': s.get('avgTotalDelay'),
+                }
+                return {
+                    'master': {'status': 'RUNNING', 'workers': 1, 'cores_total': total_cores, 'cores_used': used_cores, 'memory_total': cluster_metrics['total_memory'], 'memory_used': cluster_metrics['used_memory'], 'applications_running': running, 'applications_completed': completed},
+                    'workers': [],
+                    'applications': [{'id': app_id, 'name': app.get('name'), 'status': 'RUNNING' if running else 'IDLE', 'executors': len(execs)}],
+                    'cluster_metrics': cluster_metrics,
+                    'streaming': streaming,
+                    'timestamp': time.time()
+                }
+            # Fallback simulated snapshot
+            master_info = {
+                'status': 'RUNNING', 'workers': 1, 'cores_total': 2, 'cores_used': 1,
+                'memory_total': '4GB', 'memory_used': '1.5GB', 'applications_running': 1, 'applications_completed': 0
+            }
+            return {
+                'master': master_info,
+                'workers': [],
+                'applications': [{'id': 'local', 'name': 'kafka_vectorizer', 'status': 'RUNNING', 'executors': 1}],
+                'cluster_metrics': {
+                    'total_cores': master_info['cores_total'],
+                    'used_cores': master_info['cores_used'],
+                    'total_memory': master_info['memory_total'],
+                    'used_memory': master_info['memory_used'],
+                    'cpu_utilization': round(master_info['cores_used'] / master_info['cores_total'] * 100, 1)
+                },
+                'timestamp': time.time()
+            }
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(2400):
+                payload = snapshot()
+                try:
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                time.sleep(5)
+        except Exception:
+            pass
+
+    # ----- Simple KNN over RedDB KV (shard-assisted) -----
+    def _reddb_session(self):
+        sess = getattr(self, '_reddb_sess', None)
+        if sess is None:
+            sess = urllib.request
+            setattr(self, '_reddb_sess', sess)
+        return sess
+
+    def _reddb_cfg(self):
+        return os.getenv('REDDB_URL', ''), os.getenv('REDDB_NAMESPACE', 'dspy'), os.getenv('REDDB_TOKEN', '')
+
+    def _reddb_get(self, key: str):
+        base, ns, token = self._reddb_cfg()
+        if not base:
+            return None
+        try:
+            url = f"{base.rstrip('/')}/api/kv/{ns}/{key}"
+            req = urllib.request.Request(url, method='GET', headers={'Authorization': f'Bearer {token}'} if token else {})
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.getcode() == 200:
+                    body = resp.read().decode('utf-8')
+                    return json.loads(body)
+        except Exception:
+            return None
+        return None
+
+    def handle_knn_query(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+            query_vec = payload.get('vector')
+            doc_id = payload.get('doc_id')
+            k = int(payload.get('k', 5))
+            shards = payload.get('shards')
+            if not isinstance(query_vec, list) and isinstance(doc_id, str):
+                rec = self._reddb_get(f'embvec:{doc_id}') or {}
+                query_vec = rec.get('vector') or rec.get('unit')
+            if not isinstance(query_vec, list) or not query_vec:
+                self.send_json_response({'error': 'missing vector or doc_id'}, 400)
+                return
+            # normalize
+            import math
+            norm = math.sqrt(sum(float(x)*float(x) for x in query_vec)) or 1.0
+            q = [float(x)/norm for x in query_vec]
+            # candidate ids from shards
+            cand_ids = []
+            if isinstance(shards, list) and shards:
+                for s in shards:
+                    ids = self._reddb_get(f'shard:{int(s)}:ids')
+                    if isinstance(ids, list):
+                        cand_ids.extend(ids)
+            else:
+                # scan small number of default shards
+                for s in range(8):
+                    ids = self._reddb_get(f'shard:{s}:ids')
+                    if isinstance(ids, list):
+                        cand_ids.extend(ids)
+            # score
+            seen = set(); scored = []
+            for cid in cand_ids:
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                rec = self._reddb_get(f'embvec:{cid}') or {}
+                unit = rec.get('unit') or rec.get('vector')
+                if not isinstance(unit, list) or not unit:
+                    continue
+                # cosine
+                sim = sum((float(a)*float(b) for a,b in zip(q, unit)))
+                scored.append({'doc_id': cid, 'score': float(sim), 'model': rec.get('model'), 'topic': rec.get('topic')})
+            scored.sort(key=lambda x: x['score'], reverse=True)
+            self.send_json_response({'neighbors': scored[:max(1, k)], 'count_scored': len(scored), 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_knn_shards(self):
+        try:
+            n = int(os.getenv('EMB_INDEX_SHARDS', '32') or '32')
+            shards = []
+            total = 0
+            nonempty = 0
+            dims_by_model = {}
+            for s in range(max(1, n)):
+                ids = self._reddb_get(f'shard:{s}:ids')
+                count = len(ids) if isinstance(ids, list) else 0
+                total += count
+                nonempty += 1 if count > 0 else 0
+                if count > 0:
+                    sample_ids = ids[: min(5, count)] if isinstance(ids, list) else []
+                    for cid in sample_ids:
+                        rec = self._reddb_get(f'embvec:{cid}') or {}
+                        model = rec.get('model') or 'unknown'
+                        dim = len(rec.get('vector') or rec.get('unit') or [])
+                        if model not in dims_by_model and dim:
+                            dims_by_model[model] = dim
+                shards.append({'id': s, 'count': count, 'samples': (ids[: min(5, count)] if isinstance(ids, list) else [])})
+            self.send_json_response({'shards': shards, 'total_ids': total, 'nonempty': nonempty, 'dims_by_model': dims_by_model, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_embed_worker_dlq(self):
+        try:
+            base, ns, token = self._reddb_cfg()
+            if not base:
+                self.send_json_response({'error': 'REDDB_URL not configured'}, 400)
+                return
+            stream = os.getenv('REDDB_DLQ_STREAM', 'embeddings_dlq').strip() or 'embeddings_dlq'
+            limit = int(parse_qs(urlparse(self.path).query).get('limit', ['500'])[0])
+            headers = {'Authorization': f'Bearer {token}'} if token else {}
+            body = None
+            # Prefer explicit override path if provided (format placeholders: {ns}, {stream}, {limit})
+            override = os.getenv('REDDB_DLQ_HTTP_PATH') or os.getenv('REDDB_DLQ_READ_PATH')
+            candidates = []
+            if override:
+                try:
+                    candidates.append(override.format(ns=ns, stream=stream, limit=limit))
+                except Exception:
+                    candidates.append(override)
+            candidates.extend([
+                f"/api/streams/{ns}/{stream}/tail?limit={limit}",
+                f"/api/streams/{ns}/{stream}/read?limit={limit}",
+                f"/api/streams/{ns}/{stream}?limit={limit}",
+            ])
+            for path in candidates:
+                try:
+                    req = urllib.request.Request(base.rstrip('/') + path, method='GET', headers=headers)
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        text = resp.read().decode('utf-8')
+                        try:
+                            body = json.loads(text)
+                        except Exception:
+                            lines = [json.loads(l) for l in text.strip().splitlines() if l.strip()]
+                            body = lines
+                        break
+                except Exception:
+                    continue
+            if body is None:
+                self.send_json_response({'error': 'unable to read DLQ stream'}, 502)
+                return
+            items = body if isinstance(body, list) else (body.get('items') if isinstance(body, dict) else [])
+            self.send_json_response({'items': items[:limit], 'count': len(items[:limit]), 'timestamp': time.time()})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
@@ -833,6 +3154,24 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
     def serve_stream_metrics(self):
         """Get real-time streaming metrics"""
         try:
+            # Try to incorporate real queue depth/backpressure from bus metrics snapshot
+            bus_cur = Path('.dspy_reports') / 'bus_metrics.json'
+            bus_snap = None
+            if bus_cur.exists():
+                try:
+                    bus_snap = json.loads(bus_cur.read_text())
+                except Exception:
+                    bus_snap = None
+            # Compute queue depth
+            queue_depth = 0
+            if isinstance(bus_snap, dict):
+                try:
+                    topics = bus_snap.get('topics', {})
+                    for sizes in topics.values():
+                        if isinstance(sizes, list) and sizes:
+                            queue_depth = max(queue_depth, max(int(x) for x in sizes if isinstance(x, int)))
+                except Exception:
+                    queue_depth = 0
             stream_metrics = {
                 'kafka_throughput': {
                     'messages_per_second': random.randint(40, 80),
@@ -852,8 +3191,8 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                     'input_rate': random.randint(200, 400),
                     'output_rate': random.randint(180, 380),
                     'error_rate': random.uniform(0.1, 2.0),
-                    'backpressure': random.choice([True, False]),
-                    'queue_depth': random.randint(10, 100)
+                    'backpressure': bool(queue_depth >= BACKPRESSURE_THRESHOLD),
+                    'queue_depth': int(queue_depth)
                 },
                 'network_io': {
                     'bytes_in_per_sec': random.randint(1024*100, 1024*500),
@@ -1102,11 +3441,12 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                     "performance": optimized_metrics.performance_score,
                     "success_rate": optimized_metrics.success_rate
                 },
-                parameters={"optimization_type": optimization_type},
+                parameters={"optimization_type": optimization_type, "signature_name": signature_name},
                 result={
                     "performance_gain": performance_gain,
                     "accuracy_improvement": accuracy_improvement,
-                    "response_time_reduction": response_time_reduction
+                    "response_time_reduction": response_time_reduction,
+                    "signature_name": signature_name
                 },
                 reward=performance_gain / 10.0,  # Scale reward
                 confidence=random.uniform(0.8, 0.95),
@@ -1176,7 +3516,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             config_type = data.get('type')
             config_value = data.get('value')
             
-            # Simulate config update
+            # Persist select config types
             result = {
                 'success': True,
                 'config_type': config_type,
@@ -1184,24 +3524,42 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                 'applied_at': time.time(),
                 'restart_required': config_type in ['memory_limit', 'timeout']
             }
+            if config_type == 'profile':
+                # Persist profile to workspace or current dir
+                ws = data.get('workspace')
+                try:
+                    root = Path(ws) if ws else Path.cwd()
+                    (root / '.dspy_profile.json').write_text(json.dumps({'profile': config_value, 'updated_at': time.time()}, indent=2))
+                    # Log change
+                    self.data_manager.log(create_log_entry(
+                        level="INFO", source="config", message=f"Profile set to {config_value}",
+                        context={'profile': config_value, 'workspace': str(root)}, environment=Environment.DEVELOPMENT
+                    ))
+                except Exception as e:
+                    result['success'] = False
+                    result['error'] = str(e)
             
             self.send_json_response(result)
             
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
+    def serve_profile(self):
+        """Return current profile preference if present."""
+        try:
+            for path in [Path.cwd() / '.dspy_profile.json']:
+                if path.exists():
+                    data = json.loads(path.read_text())
+                    self.send_json_response({'profile': data.get('profile'), 'updated_at': data.get('updated_at')})
+                    return
+            self.send_json_response({'profile': None})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
     # Include legacy simple dashboard behaviour for compatibility
     def serve_status(self):
         """Check status of all services"""
-        status = {
-            'agent': self.check_agent_status(),
-            'ollama': self.check_ollama_status(),
-            'kafka': self.check_kafka_status(),
-            'containers': self.check_containers_status(),
-            'learning_active': True,
-            'auto_training': True,
-            'timestamp': time.time()
-        }
+        status = self._status_payload()
         
         self.send_json_response(status)
 
@@ -1235,20 +3593,781 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
 
     def serve_metrics(self):
         """Get system metrics"""
-        metrics = {
-            'timestamp': time.time(),
-            'containers': self.get_container_count(),
-            'memory_usage': self.get_memory_usage(),
-            'response_time': self.get_avg_response_time(),
-            'uptime': self.get_uptime(),
-            'learning_metrics': {
-                'active_signatures': 6,
-                'training_iterations': 1247 + random.randint(0, 20),
-                'avg_performance': 87.3 + random.uniform(-1, 1),
-                'optimization_rate': 0.23 + random.uniform(-0.05, 0.05)
-            }
-        }
+        metrics = self._metrics_payload()
         self.send_json_response(metrics)
+
+    # -------------------------
+    # System resources: CPU/RAM/GPU + container stats + disk space
+    # -------------------------
+    def _parse_size_to_mb(self, txt: str) -> float:
+        try:
+            s = (txt or '').strip().upper()
+            # formats like '19.82MiB', '1.944GiB', '512kB'
+            num = float(''.join(ch for ch in s if (ch.isdigit() or ch=='.')) or '0')
+            if 'G' in s:
+                return num * 1024.0
+            if 'M' in s:
+                return num
+            if 'K' in s:
+                return num / 1024.0
+            if 'B' in s:
+                return num / (1024.0 * 1024.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _docker_stats(self) -> list:
+        try:
+            proc = subprocess.run(['docker', 'stats', '--no-stream', '--format', '{{json .}}'], capture_output=True, text=True, timeout=5)
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            out = []
+            for ln in lines:
+                try:
+                    obj = json.loads(ln)
+                    name = obj.get('Name') or obj.get('Container')
+                    cpu = float((obj.get('CPUPerc') or '0').strip('% '))
+                    mem = (obj.get('MemUsage') or '').split('/')
+                    used_mb = self._parse_size_to_mb(mem[0]) if len(mem) > 0 else 0.0
+                    lim_mb = self._parse_size_to_mb(mem[1]) if len(mem) > 1 else 0.0
+                    mem_pct = float((obj.get('MemPerc') or '0').strip('% '))
+                    out.append({
+                        'name': name,
+                        'cpu_pct': cpu,
+                        'mem_used_mb': used_mb,
+                        'mem_limit_mb': lim_mb,
+                        'mem_pct': mem_pct,
+                        'net_io': obj.get('NetIO'),
+                        'block_io': obj.get('BlockIO'),
+                        'pids': obj.get('PIDs')
+                    })
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    def _disk_usage(self, path: Path) -> dict:
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage(str(path))
+            to_gb = lambda b: round(b / (1024**3), 2)
+            pct = round((used / total) * 100.0, 1) if total else 0.0
+            return {'path': str(path), 'total_gb': to_gb(total), 'used_gb': to_gb(used), 'free_gb': to_gb(free), 'pct_used': pct}
+        except Exception:
+            return {'path': str(path), 'total_gb': 0, 'used_gb': 0, 'free_gb': 0, 'pct_used': 0}
+
+    def _gpu_info(self) -> list:
+        try:
+            proc = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.used,memory.total,utilization.gpu', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=3)
+            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+            gpus = []
+            for ln in lines:
+                parts = [p.strip() for p in ln.split(',')]
+                if len(parts) >= 4:
+                    gpus.append({'name': parts[0], 'mem_used_mb': float(parts[1]), 'mem_total_mb': float(parts[2]), 'util_pct': float(parts[3])})
+            return gpus
+        except Exception:
+            return []
+
+    def _enforce_storage_quota(self, min_free_gb: float) -> tuple[bool, dict]:
+        ds = self._disk_usage(self.workspace)
+        ok = (ds.get('free_gb', 0.0) >= float(min_free_gb))
+        return ok, ds
+
+    def _host_memory(self) -> dict:
+        # Best-effort across platforms
+        try:
+            # Linux: /proc/meminfo
+            if Path('/proc/meminfo').exists():
+                info = {}
+                for line in Path('/proc/meminfo').read_text().splitlines():
+                    parts = line.split(':', 1)
+                    if len(parts) == 2:
+                        key = parts[0].strip(); val = parts[1].strip()
+                        info[key] = val
+                to_mb = lambda k: float((info.get(k,'0 kB').split()[0]))/1024.0
+                total = to_mb('MemTotal'); avail = to_mb('MemAvailable')
+                used = max(0.0, total - avail)
+                pct = round((used/total)*100.0, 1) if total else 0.0
+                return {'total_gb': round(total/1024.0,2), 'used_gb': round(used/1024.0,2), 'free_gb': round(avail/1024.0,2), 'pct_used': pct}
+            # macOS: vm_stat + sysctl
+            proc = subprocess.run(['sysctl','-n','hw.memsize'], capture_output=True, text=True, timeout=2)
+            total_b = float(proc.stdout.strip() or 0)
+            vm = subprocess.run(['vm_stat'], capture_output=True, text=True, timeout=2)
+            page_size = 4096.0
+            free_pages = 0.0; inactive_pages = 0.0
+            for ln in vm.stdout.splitlines():
+                if 'page size of' in ln.lower():
+                    try:
+                        page_size = float(''.join(ch for ch in ln if ch.isdigit()))
+                    except Exception: pass
+                if ln.startswith('Pages free'):
+                    free_pages = float(''.join(ch for ch in ln if ch.isdigit()))
+                if ln.startswith('Pages inactive'):
+                    inactive_pages = float(''.join(ch for ch in ln if ch.isdigit()))
+            free_b = (free_pages + inactive_pages) * page_size
+            used_b = max(0.0, total_b - free_b)
+            pct = round((used_b/total_b)*100.0, 1) if total_b else 0.0
+            return {'total_gb': round(total_b/(1024**3),2), 'used_gb': round(used_b/(1024**3),2), 'free_gb': round(free_b/(1024**3),2), 'pct_used': pct}
+        except Exception:
+            return {}
+
+    def _host_cpu(self) -> dict:
+        try:
+            load1, load5, load15 = os.getloadavg()
+            return {'load1': round(load1,2), 'load5': round(load5,2), 'load15': round(load15,2)}
+        except Exception:
+            return {}
+
+    def serve_system_resources(self):
+        try:
+            containers = self._docker_stats()
+            disk = self._disk_usage(self.workspace)
+            gpu = self._gpu_info()
+            mem = self._host_memory()
+            cpu = self._host_cpu()
+            # thresholds from guard config (fallback to env)
+            guard = {}
+            try:
+                gpath = (self.workspace / '.dspy_guard.json')
+                if gpath.exists():
+                    guard = json.loads(gpath.read_text()) or {}
+            except Exception:
+                guard = {}
+            min_free = float(guard.get('min_free_gb', float(os.getenv('MIN_FREE_GB', '2') or '2')))
+            min_ram = float(guard.get('min_ram_gb', 0.0))
+            min_vram = float(guard.get('min_vram_mb', 0.0))
+            disk_ok, _ = self._enforce_storage_quota(min_free)
+            ram_ok = True
+            if isinstance(mem, dict) and isinstance(mem.get('free_gb'), (int, float)):
+                ram_ok = float(mem.get('free_gb') or 0.0) >= min_ram
+            gpu_ok = True
+            if isinstance(gpu, list) and gpu and min_vram > 0.0:
+                free = max([(g.get('mem_total_mb', 0) - g.get('mem_used_mb', 0)) for g in gpu] or [0])
+                gpu_ok = float(free) >= float(min_vram)
+            ok = bool(disk_ok and ram_ok and gpu_ok)
+            payload = {'host': {'disk': disk, 'gpu': gpu, 'memory': mem, 'cpu': cpu, 'threshold_free_gb': min_free, 'threshold_ram_gb': min_ram, 'threshold_vram_mb': min_vram, 'disk_ok': disk_ok, 'ram_ok': ram_ok, 'gpu_ok': gpu_ok, 'ok': ok, 'timestamp': time.time()}, 'containers': containers}
+            try:
+                self._write_hw_snapshot(payload)
+            except Exception:
+                pass
+            self.send_json_response(payload)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_system_workspace(self):
+        try:
+            self.send_json_response({'path': str(self.workspace)})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_system_workspace_post(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            body = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+            path = (body.get('path') or '').strip()
+            if not path:
+                self.send_json_response({'ok': False, 'error': 'missing path'}, 400)
+                return
+            # persist
+            p = REPO_ROOT / '.dspy_reports' / 'workspace.json'
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({'path': path, 'updated': time.time()}, indent=2))
+            # update for this request handler
+            try:
+                self.workspace = Path(path).expanduser()
+            except Exception:
+                pass
+            try:
+                self._trace('POST', '/api/system/workspace', {'path': path})
+            except Exception:
+                pass
+            self.send_json_response({'ok': True, 'path': path})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    # Seed GRPO dataset from mesh tail items ----------------------------------
+    def handle_mesh_tail_to_grpo(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            body = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+        except Exception:
+            body = {}
+        try:
+            items = body.get('items') or []
+            out = body.get('out') or None
+            min_k = int(body.get('min_k', 2))
+            if not isinstance(items, list) or not items:
+                self.send_json_response({'ok': False, 'error': 'no items provided'}, 400)
+                return
+            # Group by prompt
+            groups = {}
+            total = 0
+            for it in items:
+                try:
+                    prompt = None
+                    text = None
+                    reward = None
+                    if isinstance(it, dict):
+                        # Prefer compact keys
+                        prompt = it.get('prompt') or it.get('query') or it.get('input')
+                        text = it.get('text') or it.get('output') or it.get('message')
+                        rv = it.get('reward') or it.get('score') or it.get('r')
+                        try:
+                            reward = float(rv)
+                        except Exception:
+                            reward = None
+                    if not (isinstance(prompt, str) and len(prompt.strip()) >= 4 and isinstance(text, str) and text.strip() and isinstance(reward, float)):
+                        continue
+                    pkey = ' '.join(str(prompt).split())
+                    arr = groups.setdefault(pkey, [])
+                    arr.append({'text': text, 'reward': reward})
+                    total += 1
+                except Exception:
+                    continue
+            # Write JSONL
+            if not groups:
+                self.send_json_response({'ok': False, 'error': 'no valid items after filtering'}, 200)
+                return
+            out_dir = self.workspace / '.grpo' / 'seed'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = Path(out) if out else (out_dir / f'mesh_tail_{int(time.time())}.jsonl')
+            with path.open('w', encoding='utf-8') as f:
+                for prompt, cands in groups.items():
+                    if len(cands) < min_k:
+                        continue
+                    rec = {'prompt': prompt, 'candidates': cands, 'meta': {'seed': 'mesh-tail', 'count': len(cands)}}
+                    f.write(json.dumps(rec) + "\n")
+            self.send_json_response({'ok': True, 'path': str(path), 'groups': len(groups), 'candidates': total}, 200)
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    def handle_system_cleanup(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            data = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+        except Exception:
+            data = {}
+        try:
+            dry = bool(data.get('dry_run', False))
+            actions = data.get('actions') or {}
+            try:
+                self._trace('POST', '/api/system/cleanup', {'dry_run': dry, 'actions': list(actions.keys())})
+            except Exception:
+                pass
+            result = {
+                'deleted': [],
+                'would_delete': [],
+                'errors': [],
+                'timestamp': time.time(),
+            }
+            # GRPO checkpoints cleanup
+            if actions.get('grpo_checkpoints'):
+                base = Path(str(actions.get('base_dir') or '.grpo')).resolve()
+                keep_last = int(actions.get('keep_last') or 3)
+                if base.exists():
+                    for ckdir in base.rglob('checkpoints'):
+                        if not ckdir.is_dir():
+                            continue
+                        files = sorted([p for p in ckdir.glob('policy_step*.pt') if p.is_file()], key=lambda p: p.stat().st_mtime, reverse=True)
+                        doomed = files[keep_last:]
+                        for f in doomed:
+                            try:
+                                if dry:
+                                    result['would_delete'].append(str(f))
+                                else:
+                                    f.unlink(missing_ok=True)
+                                    result['deleted'].append(str(f))
+                            except Exception as e:
+                                result['errors'].append(f"ckpt {f}: {e}")
+            # Embeddings prune by age
+            if actions.get('embeddings_prune'):
+                dir_path = Path(str(actions.get('dir') or os.getenv('EMBED_PARQUET_DIR') or (self.workspace / 'vectorized' / 'embeddings_imesh')))
+                older_days = int(actions.get('older_than_days') or 30)
+                cutoff = time.time() - (older_days * 86400)
+                if dir_path.exists():
+                    for p in dir_path.rglob('*.parquet'):
+                        try:
+                            if p.stat().st_mtime < cutoff:
+                                if dry:
+                                    result['would_delete'].append(str(p))
+                                else:
+                                    p.unlink(missing_ok=True)
+                                    result['deleted'].append(str(p))
+                        except Exception as e:
+                            result['errors'].append(f"parquet {p}: {e}")
+            # Kafka prune via docker-compose exec into kafka service
+            if actions.get('kafka_prune'):
+                topics = actions.get('topics') or []
+                retention_ms = int(actions.get('retention_ms') or 60000)
+                compose_file = actions.get('compose_file') or str(REPO_ROOT / 'docker' / 'lightweight' / 'docker-compose.yml')
+                service = actions.get('service') or 'kafka'
+                for tp in topics:
+                    try:
+                        if dry:
+                            result['would_delete'].append(f"kafka topic {tp} set retention.ms={retention_ms}")
+                        else:
+                            cmd = [
+                                'docker-compose', '-f', compose_file,
+                                'exec', '-T', service,
+                                'bash', '-lc', f"/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --alter --topic {tp} --config retention.ms={retention_ms}"
+                            ]
+                            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                            if proc.returncode == 0:
+                                result['deleted'].append(f"kafka topic {tp} retention.ms={retention_ms}")
+                            else:
+                                result['errors'].append(f"kafka {tp}: {proc.stderr.strip()}")
+                    except Exception as e:
+                        result['errors'].append(f"kafka {tp}: {e}")
+            self.send_json_response(result)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_system_guard(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+        except Exception:
+            data = {}
+        try:
+            min_free_gb = float(data.get('min_free_gb') or 2.0)
+            min_ram_gb = float(data.get('min_ram_gb') or 1.0)
+            min_vram_mb = float(data.get('min_vram_mb') or 0.0)
+            disk_ok, disk = self._enforce_storage_quota(min_free_gb)
+            mem = self._host_memory() or {}
+            ram_ok = float(mem.get('free_gb') or 0.0) >= float(min_ram_gb)
+            gpu = self._gpu_info() or []
+            if float(min_vram_mb) > 0.0 and gpu:
+                gpu_ok = any(((g.get('mem_total_mb') or 0.0) - (g.get('mem_used_mb') or 0.0)) >= float(min_vram_mb) for g in gpu)
+            else:
+                gpu_ok = True
+            ok = bool(disk_ok and ram_ok and gpu_ok)
+            # Persist guard thresholds for future evaluations
+            try:
+                gp = (self.workspace / '.dspy_guard.json')
+                gp.write_text(json.dumps({'min_free_gb': min_free_gb, 'min_ram_gb': min_ram_gb, 'min_vram_mb': min_vram_mb}, indent=2))
+            except Exception:
+                pass
+            # Trace
+            try:
+                self._trace('POST', '/api/system/guard', {'min_free_gb': min_free_gb, 'min_ram_gb': min_ram_gb, 'min_vram_mb': min_vram_mb})
+            except Exception:
+                pass
+            result = {
+                'ok': ok,
+                'disk_ok': disk_ok,
+                'ram_ok': ram_ok,
+                'gpu_ok': gpu_ok,
+                'thresholds': {'min_free_gb': min_free_gb, 'min_ram_gb': min_ram_gb, 'min_vram_mb': min_vram_mb},
+                'snapshot': {'host': {'disk': disk, 'memory': mem, 'gpu': gpu}},
+                'timestamp': time.time(),
+            }
+            self.send_json_response(result)
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    # System resources SSE ----------------------------------------------------
+    def _write_hw_snapshot(self, payload: dict) -> None:
+        try:
+            host = payload.get('host') or {}
+            snap = {
+                'ts': host.get('timestamp', time.time()),
+                'cpu': host.get('cpu'),
+                'memory': host.get('memory') or host.get('mem'),
+                'disk': host.get('disk'),
+                'gpu': host.get('gpu'),
+            }
+            p = self.workspace / '.dspy_hw.json'
+            p.write_text(json.dumps(snap, indent=2))
+            # Append to history (best-effort)
+            ph = self.workspace / '.dspy_hw_history.jsonl'
+            with ph.open('a') as f:
+                f.write(json.dumps(snap) + "\n")
+        except Exception:
+            pass
+
+    def serve_system_resources_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(2400):  # ~2 hours at 3s interval
+                try:
+                    containers = self._docker_stats()
+                    disk = self._disk_usage(self.workspace)
+                    gpu = self._gpu_info()
+                    mem = self._host_memory()
+                    cpu = self._host_cpu()
+                    payload = {'host': {'disk': disk, 'gpu': gpu, 'memory': mem, 'cpu': cpu, 'timestamp': time.time()}, 'containers': containers}
+                    try:
+                        self._write_hw_snapshot(payload)
+                    except Exception:
+                        pass
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                    time.sleep(3)
+                except Exception:
+                    time.sleep(3)
+        except Exception:
+            pass
+
+    # Debug trace ------------------------------------------------------------
+    def _trace(self, method: str, path: str, extra: dict | None = None) -> None:
+        try:
+            rec = {'ts': time.time(), 'method': method, 'path': path}
+            if extra:
+                rec.update(extra)
+            with TRACE_FILE.open('a', encoding='utf-8') as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+
+    def serve_debug_trace(self):
+        try:
+            if self.command == 'GET':
+                size = TRACE_FILE.stat().st_size if TRACE_FILE.exists() else 0
+                self.send_json_response({'enabled': True, 'bytes': int(size)})
+                return
+            self.send_json_response({'error': 'method not allowed'}, 405)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_debug_trace_post(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length) if length > 0 else b''
+            body = json.loads(raw.decode('utf-8') or '{}') if raw else {}
+        except Exception:
+            body = {}
+        try:
+            if body.get('clear') and TRACE_FILE.exists():
+                TRACE_FILE.unlink(missing_ok=True)
+            self.send_json_response({'ok': True})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    def serve_debug_trace_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            pos = 0
+            for _ in range(600):
+                try:
+                    if TRACE_FILE.exists():
+                        with TRACE_FILE.open('r', encoding='utf-8') as f:
+                            f.seek(pos)
+                            lines = f.readlines()
+                            pos = f.tell()
+                        for ln in lines[-25:]:
+                            self.wfile.write(f"data: {ln.strip()}\n\n".encode('utf-8'))
+                            self.wfile.flush()
+                except Exception:
+                    pass
+                time.sleep(1)
+        except Exception:
+            pass
+
+    # Dev cycle --------------------------------------------------------------
+    def _append_dev_line(self, text: str) -> None:
+        try:
+            self._dev_cycle_lines.append(text)
+            if len(self._dev_cycle_lines) > 500:
+                self._dev_cycle_lines = self._dev_cycle_lines[-500:]
+        except Exception:
+            pass
+
+    def handle_dev_cycle_start(self):
+        try:
+            if self._dev_cycle_running:
+                self.send_json_response({'ok': False, 'error': 'already running'})
+                return
+            script = (REPO_ROOT / 'scripts' / 'dev_cycle.sh')
+            cmd = ['bash', str(script)] if script.exists() else ['make', 'dev-cycle']
+            self._trace('POST', '/api/dev-cycle/start', {'cmd': ' '.join(cmd)})
+            import subprocess as sp
+            proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True, cwd=str(REPO_ROOT))
+            self._dev_cycle_proc = proc
+            self._dev_cycle_running = True
+            self._append_dev_line(f"[start] {' '.join(cmd)}")
+            def _reader():
+                try:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        self._append_dev_line(line.rstrip('\n'))
+                except Exception:
+                    pass
+                finally:
+                    self._dev_cycle_running = False
+                    self._append_dev_line('[done] dev cycle finished')
+            import threading as _th
+            _th.Thread(target=_reader, daemon=True).start()
+            self.send_json_response({'ok': True})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    def serve_dev_cycle_status(self):
+        try:
+            out = {'running': bool(self._dev_cycle_running), 'lines': list(self._dev_cycle_lines[-50:]), 'timestamp': time.time()}
+            self.send_json_response(out)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_dev_cycle_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            pos = 0
+            for _ in range(600):
+                try:
+                    lines = self._dev_cycle_lines
+                    chunk = lines[pos:]
+                    pos = len(lines)
+                    for ln in chunk:
+                        self.wfile.write(f"data: {json.dumps(ln)}\n\n".encode('utf-8'))
+                        self.wfile.flush()
+                except Exception:
+                    pass
+                time.sleep(1)
+        except Exception:
+            pass
+
+    # RL Sweep APIs -----------------------------------------------------
+    def handle_rl_sweep_run(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+            method = str(data.get('method') or 'eprotein')
+            iterations = int(data.get('iterations') or 4)
+            trainer_steps = data.get('trainer_steps')
+            puffer = bool(data.get('puffer', False))
+            ws = Path(data.get('workspace') or Path.cwd())
+
+            def _run():
+                try:
+                    sweep_cfg = load_rl_sweep_config(None)
+                    sweep_cfg['method'] = method
+                    sweep_cfg['iterations'] = iterations
+                    settings = SweepSettings()
+                    settings.iterations = int(iterations)
+                    settings.puffer_backend = bool(puffer)
+                    if trainer_steps is not None:
+                        try:
+                            settings.trainer_steps = int(trainer_steps)
+                        except Exception:
+                            pass
+                    outcome = run_rl_sweep(ws, sweep_cfg, base_config=None, settings=settings)
+                    # Log summary and persist experiment record
+                    out_dir = Path('.dspy_reports'); out_dir.mkdir(exist_ok=True)
+                    rec = {
+                        'ts': time.time(),
+                        'method': method,
+                        'iterations': iterations,
+                        'best_metric': outcome.best_summary.metric,
+                    }
+                    with (out_dir / 'rl_sweep_experiments.jsonl').open('a') as f:
+                        f.write(json.dumps(rec) + "\n")
+                except Exception as e:
+                    out_dir = Path('.dspy_reports'); out_dir.mkdir(exist_ok=True)
+                    with (out_dir / 'rl_sweep_experiments.jsonl').open('a') as f:
+                        f.write(json.dumps({'ts': time.time(), 'error': str(e)}) + "\n")
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            self.send_json_response({'started': True, 'method': method, 'iterations': iterations})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_rl_sweep_state(self):
+        try:
+            path = Path('.dspy/rl/sweep_state.json')
+            if not path.exists():
+                self.send_json_response({'exists': False})
+                return
+            data = json.loads(path.read_text())
+            # Derive Pareto (if observations present)
+            obs = (data.get('strategy') or {}).get('observations') if isinstance(data.get('strategy'), dict) else None
+            pareto = []
+            if isinstance(obs, list) and obs:
+                observations = [{"output": float(o.get('output',0.0)), "cost": float(o.get('cost',0.0))} for o in obs]
+                pts, idxs = pareto_points(observations)
+                pareto = pts
+            self.send_json_response({'exists': True, 'state': data, 'pareto': pareto})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_rl_sweep_history(self):
+        try:
+            best = Path('.dspy/rl/best.json')
+            rows = []
+            log = Path('.dspy_reports/rl_sweep_experiments.jsonl')
+            if log.exists():
+                with log.open('r') as f:
+                    for line in f:
+                        line = line.strip();
+                        if not line: continue
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            pass
+            payload = {'best': None, 'experiments': rows}
+            if best.exists():
+                try:
+                    payload['best'] = json.loads(best.read_text())
+                except Exception:
+                    payload['best'] = None
+            self.send_json_response(payload)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_reddb_summary(self):
+        """Return counts from RedDB for retention audit."""
+        try:
+            dm = self.data_manager
+            sigs = dm.get_all_signature_metrics()
+            recent_actions = dm.get_recent_actions(limit=1000)
+            recent_training = dm.get_training_history(limit=1000)
+            rec = {
+                'signatures': len(sigs),
+                'recent_actions': len(recent_actions),
+                'recent_training': len(recent_training),
+                'timestamp': time.time(),
+            }
+            self.send_json_response(rec)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_reddb_health(self):
+        """Basic RedDB health: counts + simple status/alerts."""
+        try:
+            dm = self.data_manager
+            sigs = len(dm.get_all_signature_metrics())
+            actions = len(dm.get_recent_actions(limit=5000))
+            training = len(dm.get_training_history(limit=5000))
+            status = 'ok'
+            alerts = []
+            if sigs == 0:
+                alerts.append('no-signatures')
+            if actions < 10:
+                alerts.append('low-actions')
+            if training < 1:
+                alerts.append('no-training-recent')
+            if alerts:
+                status = 'warn'
+            self.send_json_response({'status': status, 'alerts': alerts, 'signatures': sigs, 'recent_actions': actions, 'recent_training': training, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'status': 'error', 'error': str(e)}, 500)
+
+    # -------- Teleprompt Experiment APIs ----------
+    def handle_teleprompt_run(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+            modules = data.get('modules') or ['codectx', 'task']
+            if isinstance(modules, str):
+                modules = [m.strip() for m in modules.split(',') if m.strip()]
+            methods = data.get('methods') or ['bootstrap']
+            if isinstance(methods, str):
+                methods = [m.strip() for m in methods.split(',') if m.strip()]
+            shots = int(data.get('shots') or 8)
+            dataset_dir = Path(data.get('dataset_dir') or (Path.cwd() / '.dspy_data/splits'))
+            save_best_dir = Path(data.get('save_best_dir') or (Path.cwd() / '.dspy_prompts'))
+            log_dir = Path(data.get('log_dir') or (Path.cwd() / '.teleprompt_logs'))
+
+            from dspy_agent.training.train_teleprompt import run_teleprompt_suite
+            # Run in a thread to avoid blocking the server
+            def _run():
+                try:
+                    res = run_teleprompt_suite(
+                        modules=modules,
+                        methods=methods,
+                        dataset_dir=dataset_dir,
+                        shots=shots,
+                        reflection_lm=None,
+                        log_dir=log_dir,
+                        save_best_dir=save_best_dir,
+                    )
+                    # Persist experiment summary for dashboard
+                    out_dir = Path('.dspy_reports'); out_dir.mkdir(exist_ok=True)
+                    with (out_dir / 'teleprompt_experiments.jsonl').open('a') as f:
+                        f.write(json.dumps({'ts': time.time(), 'modules': modules, 'methods': methods, 'result': res}) + "\n")
+                except Exception as e:
+                    out_dir = Path('.dspy_reports'); out_dir.mkdir(exist_ok=True)
+                    with (out_dir / 'teleprompt_experiments.jsonl').open('a') as f:
+                        f.write(json.dumps({'ts': time.time(), 'error': str(e)}) + "\n")
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            self.send_json_response({'started': True, 'modules': modules, 'methods': methods, 'shots': shots})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_teleprompt_experiments(self):
+        try:
+            path = Path('.dspy_reports') / 'teleprompt_experiments.jsonl'
+            rows = []
+            if path.exists():
+                with path.open('r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            pass
+            self.send_json_response({'experiments': rows})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    # -------------------------
+    # Bus metrics & DLQ (new)
+    # -------------------------
+    def _read_json(self, path: Path):
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return None
+
+    def _dlq_summary(self) -> dict:
+        try:
+            path = Path('.dspy_reports') / 'dlq.jsonl'
+            total = 0
+            by_topic = {}
+            last_ts = None
+            if path.exists():
+                with path.open('r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        total += 1
+                        try:
+                            rec = json.loads(line)
+                            t = rec.get('topic', 'unknown')
+                            by_topic[t] = by_topic.get(t, 0) + 1
+                            last_ts = rec.get('ts', last_ts)
+                        except Exception:
+                            pass
+            return {'total': total, 'by_topic': by_topic, 'last_ts': last_ts}
+        except Exception:
+            return {'total': 0, 'by_topic': {}, 'last_ts': None}
+
+    def serve_bus_metrics(self):
+        """Serve LocalBus queue metrics + DLQ summary with simple alerts."""
+        try:
+            payload = self._bus_payload()
+            self.send_json_response(payload)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
 
     # Legacy compatibility methods retained from previous simple dashboard implementation
     def check_agent_status(self):
@@ -1355,12 +4474,45 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             if not command:
                 self.send_json_response({'error': 'No command provided'}, 400)
                 return
+            workspace = data.get('workspace') or '/app/test_project'
+            logs_dir = data.get('logs') or '/app/logs'
             
-            # Execute command in agent container
+            # Guardrails: if enabled, enqueue instead of executing
+            if self._guardrails_enabled():
+                pending = self._read_pending_cmds()
+                cmd_id = f"cmd_{int(time.time()*1000)}_{random.randint(1000,9999)}"
+                pending.append({'id': cmd_id, 'command': command, 'workspace': workspace, 'logs': logs_dir, 'ts': time.time()})
+                self._write_pending_cmds(pending)
+                self.send_json_response({'success': True, 'pending': True, 'id': cmd_id, 'timestamp': time.time()})
+                return
+
+            # Inject profile if not provided for default behavior
+            try:
+                prof = None
+                pfile = Path(workspace) / '.dspy_profile.json'
+                if pfile.exists():
+                    prof = (json.loads(pfile.read_text()).get('profile') or '').strip()
+                if prof and ('--profile' not in command):
+                    command = f"{command} --profile {prof}"
+            except Exception:
+                pass
+
+            # Enforce minimal free disk before heavy ops (guard override)
+            try:
+                gpath = (self.workspace / '.dspy_guard.json'); guard = json.loads(gpath.read_text()) if gpath.exists() else {}
+            except Exception:
+                guard = {}
+            min_free = float(guard.get('min_free_gb', float(os.getenv('MIN_FREE_GB', '2') or '2')))
+            ok, disk = self._enforce_storage_quota(min_free)
+            if not ok:
+                self.send_json_response({'success': False, 'error': f'insufficient_storage: need >= {min_free} GB free', 'disk': disk}, 507)
+                return
+
+            # Execute command in agent container immediately
             result = subprocess.run([
                 'docker-compose', '-f', '/Users/robbiepasquale/dspy_stuff/docker/lightweight/docker-compose.yml',
                 'exec', '-T', 'dspy-agent', 'bash', '-c',
-                f'cd /app && PYTHONPATH=/app dspy-agent --workspace /app/test_project --logs /app/logs {command}'
+                f'cd /app && PYTHONPATH=/app dspy-agent --workspace {workspace} --logs {logs_dir} {command}'
             ], capture_output=True, text=True, timeout=30)
             
             response = {
@@ -1406,6 +4558,127 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'containers': f'Error: {e}', 'timestamp': time.time()})
 
+    # ---------------------
+    # Guardrails helpers
+    # ---------------------
+    def _guardrails_cfg_path(self) -> Path:
+        return REPO_ROOT / '.dspy_reports' / 'guardrails.json'
+
+    def _pending_cmds_path(self) -> Path:
+        return REPO_ROOT / '.dspy_reports' / 'pending_cmds.json'
+
+    def _pending_actions_path(self) -> Path:
+        return REPO_ROOT / '.dspy_reports' / 'pending_actions.json'
+
+    def _guardrails_enabled(self) -> bool:
+        try:
+            p = self._guardrails_cfg_path()
+            if p.exists():
+                cfg = json.loads(p.read_text())
+                return bool(cfg.get('enabled'))
+        except Exception:
+            pass
+        return False
+
+    def _read_pending_cmds(self) -> list:
+        try:
+            p = self._pending_cmds_path()
+            if not p.exists():
+                return []
+            return json.loads(p.read_text()) or []
+        except Exception:
+            return []
+
+    def _write_pending_cmds(self, items: list) -> None:
+        try:
+            p = self._pending_cmds_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(items, indent=2))
+        except Exception:
+            pass
+
+    def serve_guardrails_state(self):
+        try:
+            state = {
+                'enabled': self._guardrails_enabled(),
+                'pending': self._read_pending_cmds(),
+                'timestamp': time.time()
+            }
+            self.send_json_response(state)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    # Minimal stubs to ensure routes exist even on older builds where
+    # these handlers may be conditionally appended or generated.
+    def serve_guardrails_pending_actions(self):  # safe no-op
+        try:
+            self.send_json_response({'pending': [], 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_guardrails_action_status(self):  # safe no-op
+        try:
+            self.send_json_response({'status': 'unknown'})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_guardrails_toggle(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            enabled = bool(data.get('enabled'))
+            p = self._guardrails_cfg_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({'enabled': enabled, 'updated': time.time()}, indent=2))
+            self.send_json_response({'success': True, 'enabled': enabled})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_guardrails_approve(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            cmd_id = data.get('id')
+            if not cmd_id:
+                self.send_json_response({'error': 'missing id'}, 400)
+                return
+            pending = self._read_pending_cmds()
+            match = None
+            rest = []
+            for item in pending:
+                if item.get('id') == cmd_id:
+                    match = item
+                else:
+                    rest.append(item)
+            if not match:
+                self.send_json_response({'error': 'not found'}, 404)
+                return
+            # Execute
+            result = subprocess.run([
+                'docker-compose', '-f', '/Users/robbiepasquale/dspy_stuff/docker/lightweight/docker-compose.yml',
+                'exec', '-T', 'dspy-agent', 'bash', '-c',
+                f"cd /app && PYTHONPATH=/app dspy-agent --workspace {match.get('workspace','/app/test_project')} --logs {match.get('logs','/app/logs')} {match.get('command','')}"
+            ], capture_output=True, text=True, timeout=60)
+            # Update queue
+            self._write_pending_cmds(rest)
+            self.send_json_response({'success': result.returncode == 0, 'output': result.stdout, 'error': result.stderr})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_guardrails_reject(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            cmd_id = data.get('id')
+            if not cmd_id:
+                self.send_json_response({'error': 'missing id'}, 400)
+                return
+            pending = [item for item in self._read_pending_cmds() if item.get('id') != cmd_id]
+            self._write_pending_cmds(pending)
+            self.send_json_response({'success': True})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
     def send_json_response(self, data, status_code=200):
         """Send JSON response"""
         self.send_response(status_code)
@@ -1414,6 +4687,552 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(json.dumps(data, indent=2).encode())
+
+    # -------------------------
+    # Overview (batched) + SSE
+    # -------------------------
+    def _status_payload(self) -> dict:
+        return {
+            'agent': self.check_agent_status(),
+            'ollama': self.check_ollama_status(),
+            'kafka': self.check_kafka_status(),
+            'containers': self.check_containers_status(),
+            'learning_active': True,
+            'auto_training': True,
+            'timestamp': time.time()
+        }
+
+    def _metrics_payload(self) -> dict:
+        return {
+            'timestamp': time.time(),
+            'containers': self.get_container_count(),
+            'memory_usage': self.get_memory_usage(),
+            'response_time': self.get_avg_response_time(),
+            'uptime': self.get_uptime(),
+            'learning_metrics': {
+                'active_signatures': 6,
+                'training_iterations': 1247 + random.randint(0, 20),
+                'avg_performance': 87.3 + random.uniform(-1, 1),
+                'optimization_rate': 0.23 + random.uniform(-0.05, 0.05)
+            }
+        }
+
+    def _rl_payload(self) -> dict:
+        # Reuse logic from serve_rl_metrics
+        current_episode = 1247 + random.randint(0, 20)
+        rl_metrics = {
+            'training_status': 'ACTIVE',
+            'current_episode': current_episode,
+            'total_episodes': current_episode,
+            'avg_reward': 120 + random.uniform(-10, 15),
+            'best_reward': 156.7,
+            'worst_reward': 23.4,
+            'epsilon': 0.2 + random.uniform(-0.05, 0.05),
+            'learning_rate': 0.001,
+            'loss': 0.04 + random.uniform(-0.01, 0.02),
+            'q_value_mean': 45.6 + random.uniform(-5, 5),
+            'exploration_rate': 0.15 + random.uniform(-0.03, 0.03),
+            'replay_buffer_size': 50000,
+            'replay_buffer_used': random.randint(35000, 49000)
+        }
+        reward_history = []
+        for i in range(50):
+            episode_num = current_episode - 49 + i
+            reward = 100 + random.uniform(-20, 30) + (i * 0.5)
+            reward_history.append({
+                'episode': episode_num,
+                'reward': round(reward, 2),
+                'timestamp': (datetime.now() - timedelta(minutes=50-i)).isoformat()
+            })
+        action_stats = {
+            'code_analysis': random.randint(150, 200),
+            'code_generation': random.randint(80, 120),
+            'optimization': random.randint(40, 80),
+            'verification': random.randint(100, 150),
+            'learning': random.randint(60, 100)
+        }
+        return {
+            'metrics': rl_metrics,
+            'reward_history': reward_history,
+            'action_stats': action_stats,
+            'environment_info': {
+                'state_space_size': 1024,
+                'action_space_size': 64,
+                'observation_type': 'continuous',
+                'reward_range': [-100, 200]
+            },
+            'timestamp': time.time()
+        }
+
+    def _bus_payload(self) -> dict:
+        cur = Path('.dspy_reports') / 'bus_metrics.json'
+        snap = self._read_json(cur) or {}
+        dlq = self._dlq_summary()
+        alerts = []
+        try:
+            topics = snap.get('topics', {})
+            max_depth = 0
+            for sizes in topics.values():
+                if isinstance(sizes, list) and sizes:
+                    max_depth = max(max_depth, max(int(x) for x in sizes if isinstance(x, int)))
+            if max_depth >= BACKPRESSURE_THRESHOLD:
+                alerts.append({'level': 'warning', 'message': f'Backpressure detected (max queue depth {max_depth})', 'timestamp': time.time()})
+        except Exception:
+            pass
+        if int(dlq.get('total', 0)) >= DLQ_ALERT_MIN:
+            alerts.append({'level': 'info', 'message': f"DLQ entries present: {int(dlq.get('total', 0))}", 'timestamp': time.time()})
+        hist_path = Path('.dspy_reports') / 'bus_metrics.jsonl'
+        history = {'timestamps': [], 'queue_max_depth': [], 'dlq_total': []}
+        try:
+            if hist_path.exists():
+                lines = hist_path.read_text().strip().splitlines()
+                for line in lines[-60:]:
+                    try:
+                        rec = json.loads(line)
+                        history['timestamps'].append(rec.get('ts'))
+                        md = 0
+                        for sizes in (rec.get('topics') or {}).values():
+                            if isinstance(sizes, list) and sizes:
+                                md = max(md, max(int(x) for x in sizes if isinstance(x, int)))
+                        history['queue_max_depth'].append(md)
+                        history['dlq_total'].append(int(dlq.get('total', 0)))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return {'bus': snap, 'dlq': dlq, 'alerts': alerts, 'history': history, 'thresholds': {'backpressure_depth': BACKPRESSURE_THRESHOLD, 'dlq_min': DLQ_ALERT_MIN}, 'timestamp': time.time()}
+
+    def serve_overview(self):
+        try:
+            payload = {
+                'status': self._status_payload(),
+                'metrics': self._metrics_payload(),
+                'rl': self._rl_payload(),
+                'bus': self._bus_payload(),
+                'timestamp': time.time()
+            }
+            self.send_json_response(payload)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_overview_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            # Stream periodic updates
+            for _ in range(1200):  # ~1 hour at 3s interval
+                payload = {
+                    'status': self._status_payload(),
+                    'metrics': self._metrics_payload(),
+                    'rl': self._rl_payload(),
+                    'bus': self._bus_payload(),
+                    'timestamp': time.time()
+                }
+                data = json.dumps(payload)
+                self.wfile.write(f"data: {data}\n\n".encode('utf-8'))
+                self.wfile.flush()
+                time.sleep(3)
+        except Exception:
+            # Client disconnected or error; just end stream
+            pass
+
+    def serve_overview_stream_diff(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            prev = {'status': None, 'metrics': None, 'rl': None, 'bus': None}
+            for _ in range(2400):  # ~2 hours at 3s interval
+                cur = {
+                    'status': self._status_payload(),
+                    'metrics': self._metrics_payload(),
+                    'rl': self._rl_payload(),
+                    'bus': self._bus_payload(),
+                }
+                out = {'timestamp': time.time()}
+                for key in ('status', 'metrics', 'rl', 'bus'):
+                    try:
+                        if prev[key] is None or json.dumps(prev[key], sort_keys=True) != json.dumps(cur[key], sort_keys=True):
+                            out[key] = cur[key]
+                            prev[key] = cur[key]
+                    except Exception:
+                        out[key] = cur[key]
+                        prev[key] = cur[key]
+                data = json.dumps(out)
+                self.wfile.write(f"data: {data}\n\n".encode('utf-8'))
+                self.wfile.flush()
+                time.sleep(3)
+        except Exception:
+            pass
+
+    def serve_logs_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(1800):
+                payload = self._logs_payload()
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                self.wfile.flush()
+                time.sleep(2)
+        except Exception:
+            pass
+
+    def serve_actions_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(1800):
+                payload = self._actions_payload(limit=50, timeframe='1h')
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                self.wfile.flush()
+                time.sleep(3)
+        except Exception:
+            pass
+
+    def serve_monitor_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(2400):
+                payload = {
+                    'logs': self._logs_payload(),
+                    'actions': self._actions_payload(limit=50, timeframe='1h'),
+                    'timestamp': time.time()
+                }
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                self.wfile.flush()
+                time.sleep(2)
+        except Exception:
+            pass
+
+    # -----------------------------
+    # Vectorizer metrics (files/s)
+    # -----------------------------
+    def _vectorizer_stats(self):
+        import math
+        base = os.getenv('VEC_OUTPUT_DIR', '/workspace/vectorized/embeddings')
+        try:
+            p = Path(base)
+            if not p.exists():
+                return {'enabled': False, 'path': base, 'files': 0, 'bytes': 0, 'rows_est': 0, 'latest_ts': None}
+            files = [f for f in p.rglob('*.parquet') if f.is_file()]
+            files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+            total_bytes = sum(f.stat().st_size for f in files)
+            latest_ts = files[0].stat().st_mtime if files else None
+            # Estimate rows by sampling up to 5 newest files
+            rows_est = 0
+            sampled = 0
+            try:
+                import pyarrow.parquet as pq
+                for f in files[:5]:
+                    try:
+                        pf = pq.ParquetFile(str(f))
+                        rows_est += pf.metadata.num_rows or 0
+                        sampled += 1
+                    except Exception:
+                        continue
+                if sampled and len(files) > sampled:
+                    avg = rows_est / sampled
+                    rows_est = int(avg * len(files))
+            except Exception:
+                # Fallback: estimate rows by average record size ~1KB
+                rows_est = int(total_bytes / 1024)
+            return {'enabled': True, 'path': base, 'files': len(files), 'bytes': int(total_bytes), 'rows_est': int(rows_est), 'latest_ts': latest_ts}
+        except Exception as e:
+            return {'enabled': False, 'path': base, 'error': str(e), 'files': 0, 'bytes': 0, 'rows_est': 0, 'latest_ts': None}
+
+    def serve_vectorizer_metrics(self):
+        try:
+            stats = self._vectorizer_stats()
+            # Approx throughput over ~1m: consider files modified in last 60s
+            base = stats.get('path')
+            recent_rows = 0
+            recent_bytes = 0
+            now = time.time()
+            try:
+                p = Path(base)
+                files = [f for f in p.rglob('*.parquet') if f.is_file() and (now - f.stat().st_mtime) <= 60]
+                files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                # Estimate rows as above but for recent files only
+                import pyarrow.parquet as pq
+                sampled = 0
+                for f in files[:5]:
+                    try:
+                        pf = pq.ParquetFile(str(f))
+                        recent_rows += pf.metadata.num_rows or 0
+                        sampled += 1
+                    except Exception:
+                        continue
+                if sampled and len(files) > sampled:
+                    avg = recent_rows / sampled
+                    recent_rows = int(avg * len(files))
+                recent_bytes = sum(f.stat().st_size for f in files)
+            except Exception:
+                pass
+            stats.update({'recent_rows_60s': int(recent_rows), 'recent_bytes_60s': int(recent_bytes), 'timestamp': now})
+            self.send_json_response(stats)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_vectorizer_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            prev = None
+            prev_t = None
+            for _ in range(2400):
+                stats = self._vectorizer_stats()
+                now = time.time()
+                rows = int(stats.get('rows_est', 0))
+                bytes_total = int(stats.get('bytes', 0))
+                rate_rows = None
+                rate_bytes = None
+                if prev is not None and prev_t is not None and (now - prev_t) > 0:
+                    rate_rows = max(0.0, (rows - prev) / (now - prev_t))
+                    rate_bytes = max(0.0, (bytes_total - prev_bytes) / (now - prev_t))
+                payload = {
+                    'stats': stats,
+                    'rate_rows_per_sec': rate_rows,
+                    'rate_bytes_per_sec': rate_bytes,
+                    'timestamp': now
+                }
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                self.wfile.flush()
+                prev = rows
+                prev_bytes = bytes_total
+                prev_t = now
+                time.sleep(3)
+        except Exception:
+            pass
+
+    def serve_metrics_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(2400):
+                payload = {}
+                try:
+                    hw = (self.workspace / '.dspy_hw.json')
+                    if hw.exists(): payload['hw'] = json.loads(hw.read_text())
+                except Exception: pass
+                try:
+                    srl = (self.workspace / '.dspy_stream_rl.json')
+                    if srl.exists(): payload['stream_rl'] = json.loads(srl.read_text())
+                except Exception: pass
+                try:
+                    ob = (self.workspace / '.dspy_online_bandit.json')
+                    if ob.exists(): payload['online_bandit'] = json.loads(ob.read_text())
+                except Exception: pass
+                payload['timestamp'] = time.time()
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                self.wfile.flush(); time.sleep(2)
+        except Exception:
+            pass
+
+    def serve_monitor_lite(self):
+        try:
+            html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8'/>
+  <title>DSPy Monitor Lite</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; margin: 1rem; }}
+    .row {{ display: flex; gap: 2rem; flex-wrap: wrap; }}
+    .card {{ border: 1px solid #ddd; border-radius: 6px; padding: 1rem; min-width: 280px; }}
+    h3 {{ margin: 0 0 0.5rem 0; }}
+    pre {{ white-space: pre-wrap; word-wrap: break-word; }}
+    .kv span {{ display: inline-block; min-width: 140px; font-weight: 600; }}
+  </style>
+  <script>
+    function fmt(n, d=1) {{ return (typeof n==='number') ? n.toFixed(d) : n; }}
+    window.onload = () => {{
+      const es = new EventSource('/api/metrics/stream');
+      es.onmessage = (ev) => {{
+        try {{
+          const data = JSON.parse(ev.data || '{{}}');
+          const hw = data.hw || {{}};
+          const srl = data.stream_rl || {{}};
+          const ob = data.online_bandit || {{}};
+          document.getElementById('cpu').innerText = fmt(hw.cpu_percent);
+          document.getElementById('mem').innerText = fmt(hw.mem_percent);
+          document.getElementById('gpu').innerText = (hw.gpu_name||'') + ' util ' + fmt(hw.gpu_util_percent) + '% mem ' + fmt(hw.gpu_mem_used_mb) + '/' + fmt(hw.gpu_mem_total_mb) + ' MB';
+          document.getElementById('rate').innerText = fmt(srl.rate_per_sec,2);
+          document.getElementById('total').innerText = srl.total || 0;
+          document.getElementById('bandit').innerText = JSON.stringify(ob.tools||{{}}, null, 2);
+        }} catch (e) {{ console.error(e); }}
+      }}
+    }}
+  </script>
+</head>
+<body>
+  <h2>DSPy Monitor Lite</h2>
+  <div class='row'>
+    <div class='card'>
+      <h3>Hardware</h3>
+      <div class='kv'><span>CPU %:</span> <b id='cpu'>-</b></div>
+      <div class='kv'><span>Mem %:</span> <b id='mem'>-</b></div>
+      <div class='kv'><span>GPU:</span> <b id='gpu'>-</b></div>
+    </div>
+    <div class='card'>
+      <h3>Stream RL</h3>
+      <div class='kv'><span>Rate / sec:</span> <b id='rate'>-</b></div>
+      <div class='kv'><span>Total:</span> <b id='total'>-</b></div>
+    </div>
+    <div class='card'>
+      <h3>Online Bandit</h3>
+      <pre id='bandit'>-</pre>
+    </div>
+  </div>
+</body>
+</html>
+"""
+            body = html.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_stream_rl(self):
+        try:
+            # Provide a paginated view of streaming_rl_metrics from RedDB when available
+            q = parse_qs(urlparse(self.path).query)
+            start = int((q.get('start') or ['0'])[0])
+            count = int((q.get('count') or ['100'])[0])
+            ns = os.getenv('REDDB_NAMESPACE', 'dspy')
+            items = []
+            try:
+                from dspy_agent.db import get_storage as _get
+                st = _get()
+            except Exception:
+                st = None
+            if st is not None:
+                try:
+                    for off, rec in st.read('streaming_rl_metrics', start=start, count=count):  # type: ignore[attr-defined]
+                        if isinstance(rec, dict):
+                            items.append({'offset': off, **rec})
+                except Exception:
+                    pass
+            # Also include current snapshot
+            try:
+                srl = (Path.cwd() / '.dspy_stream_rl.json')
+                snap = json.loads(srl.read_text()) if srl.exists() else None
+            except Exception:
+                snap = None
+            self.send_json_response({'namespace': ns, 'items': items, 'snapshot': snap, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_infermesh_stream(self):
+        """SSE health + crude QPS approximation for InferMesh."""
+        try:
+            url = os.getenv('INFERMESH_URL', 'http://infermesh:9000')
+            base = url.rstrip('/')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            prev_rows = None
+            prev_t = None
+            for _ in range(2400):
+                t0 = time.time()
+                status = 'unknown'
+                rtt_ms = None
+                try:
+                    req = urllib.request.Request(base + '/health', method='GET')
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        status = 'healthy' if resp.getcode() == 200 else 'unhealthy'
+                        rtt_ms = int((time.time() - t0) * 1000)
+                except Exception:
+                    status = 'unreachable'
+                # approximate embeds/sec from Parquet sink (if enabled)
+                rows_est = 0
+                try:
+                    p = Path('/workspace/vectorized/embeddings_imesh')
+                    if p.exists():
+                        files = [f for f in p.rglob('*.parquet') if f.is_file()]
+                        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                        import pyarrow.parquet as pq
+                        for f in files[:5]:
+                            try:
+                                pf = pq.ParquetFile(str(f))
+                                rows_est += pf.metadata.num_rows or 0
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                rate = None
+                now = time.time()
+                if prev_rows is not None and prev_t is not None and (now - prev_t) > 0:
+                    rate = max(0.0, (rows_est - prev_rows) / (now - prev_t))
+                payload = {
+                    'infermesh': {'status': status, 'rtt_ms': rtt_ms},
+                    'rows_est': rows_est,
+                    'rows_per_sec': rate,
+                    'timestamp': now,
+                }
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                self.wfile.flush()
+                prev_rows = rows_est
+                prev_t = now
+                time.sleep(3)
+        except Exception:
+            pass
+
+    def serve_embed_worker_stream(self):
+        """SSE stream of embed-worker internal metrics exposed via its HTTP /metrics endpoint.
+
+        Configure EMBED_WORKER_METRICS_URL to override default http://localhost:9101/metrics.
+        """
+        try:
+            url = os.getenv('EMBED_WORKER_METRICS_URL', 'http://localhost:9101/metrics')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(2400):
+                try:
+                    req = urllib.request.Request(url, method='GET')
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        data = json.loads(resp.read().decode('utf-8'))
+                    payload = {'metrics': data, 'timestamp': time.time()}
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                except Exception:
+                    try:
+                        self.wfile.write(b'data: {"error": "unreachable"}\n\n')
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                time.sleep(3)
+        except Exception:
+            pass
 
 def start_enhanced_dashboard_server(port=8080):
     """Start the enhanced dashboard server"""
@@ -1465,3 +5284,272 @@ if __name__ == "__main__":
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     start_enhanced_dashboard_server(port)
+    def _read_pending_actions(self) -> list:
+        try:
+            p = self._pending_actions_path()
+            if not p.exists():
+                return []
+            return json.loads(p.read_text()) or []
+        except Exception:
+            return []
+
+    def _write_pending_actions(self, items: list) -> None:
+        try:
+            p = self._pending_actions_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(items, indent=2))
+        except Exception:
+            pass
+
+    # Guardrails: propose internal actions -------------------------------------------------
+    def handle_guardrails_propose_action(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            kind = str(data.get('type', ''))
+            if not kind:
+                self.send_json_response({'error': 'missing type'}, 400)
+                return
+            # Construct new item
+            actions = self._read_pending_actions()
+            aid = f"act_{int(time.time()*1000)}_{random.randint(1000,9999)}"
+            item = {
+                'id': aid,
+                'type': kind,
+                'status': 'pending',
+                'ts': time.time(),
+                'payload': data.get('payload') or {},
+            }
+            actions.append(item)
+            self._write_pending_actions(actions)
+            self.send_json_response({'id': aid, 'status': 'pending'})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    # Mesh Core status --------------------------------------------------------
+    def _mesh(self) -> Any:
+        try:
+            return MeshCoreClient() if MeshCoreClient else None
+        except Exception:
+            return None
+
+    def serve_mesh_status(self):
+        try:
+            cli = self._mesh()
+            if not cli:
+                self.send_json_response({'ok': False, 'error': 'mesh-core client not available'})
+                return
+            st = cli.status()
+            self.send_json_response({'status': st, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)})
+
+    def serve_mesh_topics(self):
+        try:
+            cli = self._mesh()
+            if not cli:
+                self.send_json_response({'topics': [], 'error': 'mesh-core client not available'})
+                return
+            data = cli.topics()
+            self.send_json_response({'topics': data, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'topics': [], 'error': str(e)})
+
+    def serve_mesh_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            cli = self._mesh()
+            if not cli:
+                self.wfile.write(b"data: {\"ok\":false,\"error\":\"mesh client not available\"}\n\n")
+                self.wfile.flush()
+                return
+            for _ in range(2400):
+                try:
+                    st = cli.status()
+                    tp = cli.topics()
+                    payload = {'status': st, 'topics': tp, 'timestamp': time.time()}
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                time.sleep(3)
+        except Exception:
+            pass
+
+    def serve_mesh_tail(self):
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            topic = (qs.get('topic', [''])[0] or '').strip()
+            limit = int(qs.get('limit', ['50'])[0])
+            if not topic:
+                self.send_json_response({'error': 'missing topic'}, 400)
+                return
+            cli = self._mesh()
+            if not cli:
+                self.send_json_response({'error': 'mesh-core client not available'}, 200)
+                return
+            data = cli.tail(topic, limit=limit)
+            out = {'topic': topic, 'limit': limit, 'data': data, 'timestamp': time.time()}
+            try:
+                items = data.get('items') if isinstance(data, dict) else None
+                out['count'] = len(items) if isinstance(items, list) else None
+                if isinstance(items, list):
+                    out['items_fmt'] = [self._format_mesh_item(x) for x in items]
+            except Exception:
+                pass
+            self.send_json_response(out, 200)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def _format_mesh_item(self, it: dict) -> dict:
+        try:
+            prompt = None
+            text = None
+            reward = None
+            sig = it.get('signature_name') or it.get('signature')
+            a_type = it.get('action_type') or it.get('type')
+            env = (it.get('environment') or it.get('env'))
+            ts = it.get('timestamp') or it.get('ts')
+            # Extract prompt
+            for k in ('prompt','query','input','task','user'):
+                v = it.get(k)
+                if isinstance(v, str) and len(v.strip()) >= 4:
+                    prompt = v.strip(); break
+            # Extract text
+            for k in ('response','output','text','message','stdout'):
+                v = it.get(k)
+                if isinstance(v, str) and v.strip():
+                    text = v.strip(); break
+            # Extract reward
+            for k in ('reward','score','r'):
+                v = it.get(k)
+                try:
+                    reward = float(v)
+                    break
+                except Exception:
+                    continue
+            def trunc(s: str, n: int = 120) -> str:
+                return (s[:n] + '…') if s and len(s) > n else s
+            return {
+                'prompt': trunc(prompt or ''),
+                'text': trunc(text or ''),
+                'reward': reward,
+                'signature': sig,
+                'action_type': a_type,
+                'environment': env,
+                'timestamp': ts,
+            }
+        except Exception:
+            return {'raw': it}
+
+    def serve_mesh_tail_stream(self):
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            topic = (qs.get('topic', [''])[0] or '').strip()
+            limit = int(qs.get('limit', ['50'])[0])
+            if not topic:
+                self.send_error(400)
+                return
+            cli = self._mesh()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            if not cli:
+                self.wfile.write(b"data: {\"ok\":false,\"error\":\"mesh client not available\"}\n\n")
+                self.wfile.flush(); return
+            last_count = 0
+            for _ in range(2400):
+                try:
+                    data = cli.tail(topic, limit=limit)
+                    items = data.get('items') if isinstance(data, dict) else None
+                    count = len(items) if isinstance(items, list) else 0
+                    delta = []
+                    delta_fmt = []
+                    if isinstance(items, list) and count > last_count:
+                        delta = items[-(count - last_count):]
+                        delta_fmt = [self._format_mesh_item(x) for x in delta]
+                        last_count = count
+                    payload = {'topic': topic, 'limit': limit, 'delta': delta, 'delta_fmt': delta_fmt, 'count': count, 'timestamp': time.time()}
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                time.sleep(2)
+        except Exception:
+            pass
+
+    def serve_guardrails_pending_actions(self):
+        try:
+            items = self._read_pending_actions()
+            # Only pending
+            items = [x for x in items if x.get('status') == 'pending']
+            self.send_json_response({'pending': items, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_guardrails_action_status(self):
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            aid = q.get('id', [''])[0]
+            if not aid:
+                self.send_json_response({'error': 'missing id'}, 400)
+                return
+            items = self._read_pending_actions()
+            for it in items:
+                if it.get('id') == aid:
+                    self.send_json_response({'id': aid, 'status': it.get('status'), 'decision': it.get('decision'), 'comment': it.get('comment')})
+                    return
+            self.send_json_response({'id': aid, 'status': 'unknown'}, 404)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_guardrails_approve_action(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            aid = data.get('id')
+            if not aid:
+                self.send_json_response({'error': 'missing id'}, 400)
+                return
+            items = self._read_pending_actions()
+            for it in items:
+                if it.get('id') == aid:
+                    it['status'] = 'approved'
+                    it['decision'] = 'approve'
+            self._write_pending_actions(items)
+            self.send_json_response({'success': True})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_guardrails_reject_action(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            aid = data.get('id')
+            comment = data.get('comment')
+            if not aid:
+                self.send_json_response({'error': 'missing id'}, 400)
+                return
+            items = self._read_pending_actions()
+            for it in items:
+                if it.get('id') == aid:
+                    it['status'] = 'rejected'
+                    it['decision'] = 'reject'
+                    if comment:
+                        it['comment'] = str(comment)
+            self._write_pending_actions(items)
+            self.send_json_response({'success': True})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+try:
+    from dspy_agent.mesh.core import MeshCoreClient
+except Exception:
+    MeshCoreClient = None  # type: ignore

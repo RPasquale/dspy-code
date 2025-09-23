@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Tuple
+from typing import Tuple, Optional
 
 import dspy
 
@@ -42,12 +42,15 @@ class PatchVerifierSig(dspy.Signature):
     risk_level: str = dspy.OutputField(desc="low, medium, or high")
     reasons: str = dspy.OutputField(desc="Brief reasons and evidence")
     fix_suggestions: str = dspy.OutputField(desc="Concrete next steps to improve")
+    rationale: str = dspy.OutputField(desc="Brief reasoning to justify verdict", default="")
 
 
 class PatchVerifier(dspy.Module):
-    def __init__(self, max_files: int = 4, max_lines: int = 200):
+    def __init__(self, max_files: int = 4, max_lines: int = 200, use_cot: Optional[bool] = None):
         super().__init__()
-        self.predict = dspy.Predict(PatchVerifierSig)
+        self.fast = dspy.Predict(PatchVerifierSig)
+        self.slow = dspy.ChainOfThought(PatchVerifierSig)
+        self.use_cot = use_cot
         self.max_files = int(max_files)
         self.max_lines = int(max_lines)
 
@@ -78,6 +81,13 @@ class PatchVerifier(dspy.Module):
                 fix_suggestions="Split into smaller, task-focused patches and limit scope to the smallest viable change.",
             )
 
-        # Delegate nuanced assessment to the LM
-        return self.predict(task=task, context=context, patch=patch)
-
+        # Delegate nuanced assessment to the LM with light gating
+        if self.use_cot is True:
+            return self.slow(task=task, context=context, patch=patch)
+        pred = self.fast(task=task, context=context, patch=patch)
+        if self.use_cot is False:
+            return pred
+        reasons = (getattr(pred, 'reasons', '') or '').strip()
+        verdict = (getattr(pred, 'verdict', '') or '').strip().lower()
+        low_signal = (len(reasons) < 20) or (verdict not in {'pass', 'fail'})
+        return pred if not low_signal else self.slow(task=task, context=context, patch=patch)

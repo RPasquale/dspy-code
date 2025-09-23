@@ -9,10 +9,11 @@ import threading
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from .feature_store import FeatureStore
+from ..monitor.hw_profiler import HardwareProfiler
 
 # -----------------
 # Config dataclasses
@@ -135,9 +136,12 @@ def render_kafka_topic_commands(cfg: StreamConfig) -> List[str]:
 class LocalBus:
     def __init__(self, storage: Optional[object] = None, kafka: Optional[object] = None) -> None:
         self._topics: Dict[str, List[Queue]] = {}
+        self._groups: Dict[str, Dict[str, List[Queue]]] = {}
+        self._group_index: Dict[Tuple[str, str], int] = {}
         self._lock = threading.Lock()
         self._storage = storage
         self._kafka = kafka
+        self._dlq_path = Path('.dspy_reports') / 'dlq.jsonl'
         
         # Initialize RedDB data manager for enhanced logging
         try:
@@ -159,20 +163,50 @@ class LocalBus:
             self._data_manager = None
             self._environment = None
     def publish(self, topic: str, message: Any) -> None:
-        with self._lock: subs = list(self._topics.get(topic, []))
-        for q in subs: q.put(message)
+        with self._lock:
+            subs = list(self._topics.get(topic, []))
+            # Grouped delivery: exactly-once per consumer group via round-robin
+            groups = self._groups.get(topic, {})
+            group_queues: List[Queue] = []
+            for gid, qlist in groups.items():
+                if not qlist:
+                    continue
+                idx = self._group_index.get((topic, gid), 0) % len(qlist)
+                q = qlist[idx]
+                self._group_index[(topic, gid)] = (idx + 1) % len(qlist)
+                group_queues.append(q)
+        # Deliver to non-group subscribers (non-blocking; DLQ on backpressure)
+        for q in subs:
+            try:
+                q.put_nowait(message)
+            except Full:
+                self._to_dlq(topic, message, "backpressure_full:subscriber")
+                self._publish_backpressure(topic, group_id=None, q=q)
+            except Exception as e:
+                self._to_dlq(topic, message, f"subscriber_error: {e}")
+        # Deliver one per consumer group (non-blocking)
+        for q in group_queues:
+            try:
+                q.put_nowait(message)
+            except Full:
+                self._to_dlq(topic, message, "backpressure_full:group")
+                self._publish_backpressure(topic, group_id="*", q=q)
+            except Exception as e:
+                self._to_dlq(topic, message, f"group_subscriber_error: {e}")
         
         # Store in original storage (RedDB streams)
         try:
             if self._storage is not None and hasattr(self._storage, "append"):
                 self._storage.append(topic, message)  # type: ignore[attr-defined]
-        except Exception: pass
+        except Exception as e:
+            self._to_dlq(topic, message, f"storage_error: {e}")
         
         # Send to Kafka
         try:
             if self._kafka is not None:
                 self._kafka.send(topic, message)  # type: ignore[attr-defined]
-        except Exception: pass
+        except Exception as e:
+            self._to_dlq(topic, message, f"kafka_error: {e}")
         
         # Enhanced logging to RedDB for important topics
         if self._data_manager is not None:
@@ -246,9 +280,20 @@ class LocalBus:
             environment=self._environment
         )
         self._data_manager.log(log_entry)
-    def subscribe(self, topic: str) -> Queue:
-        q: Queue = Queue()
+    def subscribe(self, topic: str, *, maxsize: int = 0) -> Queue:
+        q: Queue = Queue(maxsize=maxsize)
         with self._lock: self._topics.setdefault(topic, []).append(q)
+        return q
+    
+    def subscribe_group(self, topic: str, group_id: str, *, maxsize: int = 0) -> Queue:
+        """Subscribe as part of a consumer group. Each message is delivered
+        to exactly one member per group (round-robin).
+        """
+        q: Queue = Queue(maxsize=maxsize)
+        with self._lock:
+            tg = self._groups.setdefault(topic, {})
+            tg.setdefault(group_id, []).append(q)
+            self._group_index.setdefault((topic, group_id), 0)
         return q
     
     def get_latest(self, topic: str, timeout: float = 1.0) -> Optional[Any]:
@@ -321,6 +366,247 @@ class LocalBus:
             except Exception:
                 pass
         return None
+
+    # Dead letter queue helpers -----------------------------------------
+    def _to_dlq(self, topic: str, message: Any, reason: str) -> None:
+        try:
+            self._dlq_path.parent.mkdir(parents=True, exist_ok=True)
+            rec = {"ts": time.time(), "topic": topic, "reason": str(reason), "message": message}
+            with self._dlq_path.open('a') as f:
+                f.write(json.dumps(rec) + "\n")
+            # Also publish to a DLQ topic for observers
+            with self._lock:
+                subs = list(self._topics.get('agent.deadletter', []))
+            for q in subs:
+                try: q.put(rec)
+                except Exception: pass
+        except Exception:
+            pass
+
+    def _publish_backpressure(self, topic: str, *, group_id: Optional[str], q: Queue) -> None:
+        evt = {"ts": time.time(), "topic": topic, "group": group_id, "qsize": self._safe_qsize(q)}
+        with self._lock:
+            subs = list(self._topics.get('agent.backpressure', []))
+        for s in subs:
+            try: s.put_nowait(evt)
+            except Exception: pass
+
+    def _safe_qsize(self, q: Queue) -> int:
+        try:
+            return int(q.qsize())
+        except Exception:
+            return -1
+
+    def metrics(self) -> Dict[str, Any]:
+        # Local snapshot of queue depths per topic/group and DLQ count
+        m: Dict[str, Any] = {"topics": {}, "groups": {}, "dlq_total": 0}
+        # DLQ total
+        try:
+            if self._dlq_path.exists():
+                m["dlq_total"] = sum(1 for _ in self._dlq_path.open('r'))
+        except Exception:
+            pass
+        # Queue sizes
+        with self._lock:
+            for t, qs in self._topics.items():
+                m["topics"][t] = [self._safe_qsize(q) for q in qs]
+            for t, groups in self._groups.items():
+                m["groups"][t] = {gid: [self._safe_qsize(q) for q in ql] for gid, ql in groups.items()}
+        return m
+
+
+class MetricsWriter(threading.Thread):
+    def __init__(self, bus: LocalBus, root: Path, interval_sec: float = 30.0) -> None:
+        super().__init__(daemon=True)
+        self.bus = bus
+        self.root = root
+        self.interval = float(max(1.0, interval_sec))
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        out_dir = self.root / '.dspy_reports'
+        cur = out_dir / 'bus_metrics.json'
+        hist = out_dir / 'bus_metrics.jsonl'
+        while not self._stop.is_set():
+            try:
+                snap = self.bus.metrics()
+                snap = dict(snap) if isinstance(snap, dict) else {"error": "unavailable"}
+                snap['ts'] = time.time()
+                out_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    cur.write_text(json.dumps(snap, indent=2))
+                except Exception:
+                    pass
+                try:
+                    with hist.open('a') as f:
+                        f.write(json.dumps(snap) + "\n")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                time.sleep(self.interval)
+
+
+class StreamAutoLearner(threading.Thread):
+    """Watch vectorized stream and write granular stats for auto-learning dashboards."""
+    def __init__(self, bus: LocalBus, workspace: Path, vector_topic: str = 'agent.rl.vectorized', window_sec: float = 60.0) -> None:
+        super().__init__(daemon=True)
+        self.bus = bus
+        self.workspace = workspace
+        self.topic = vector_topic
+        self.q: Queue = bus.subscribe(vector_topic)
+        self._stop = threading.Event()
+        self._counts = 0
+        self._times: List[float] = []
+        self._features = FeatureStore(window=512)
+        self._out = (workspace / '.dspy_stream_rl.json')
+        self._window = float(max(1.0, window_sec))
+        try:
+            from ..db.factory import get_storage as _get
+            self._storage = _get()
+        except Exception:
+            self._storage = None
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # pragma: no cover
+        while not self._stop.is_set():
+            try:
+                item = self.q.get(timeout=0.5)
+            except Empty:
+                item = None
+            if item is None:
+                self._flush(); continue
+            try:
+                feats = item.get('features') if isinstance(item, dict) else None
+                if isinstance(feats, list) and feats:
+                    self._features.update({'features': feats, 'feature_names': item.get('feature_names') or []})
+                self._counts += 1
+                now = time.time(); self._times.append(now)
+                cutoff = now - self._window
+                self._times = [t for t in self._times if t >= cutoff]
+            except Exception:
+                pass
+            if self._counts % 50 == 0:
+                self._flush()
+        self._flush()
+
+    def _flush(self) -> None:
+        try:
+            snap = self._features.snapshot()
+            now = time.time()
+            rate = (len(self._times) / self._window) if self._window > 0 else 0.0
+            data: Dict[str, Any] = {
+                'topic': self.topic,
+                'total': int(self._counts),
+                'rate_per_sec': float(rate),
+                'ts': now,
+            }
+            if snap is not None:
+                data['feature_snapshot'] = {
+                    'timestamp': snap.timestamp,
+                    'count': snap.count,
+                    'means': list(snap.means),
+                    'variances': list(snap.variances),
+                    'min_values': list(snap.min_values),
+                    'max_values': list(snap.max_values),
+                    'feature_names': list(snap.feature_names),
+                }
+            try:
+                self._out.write_text(json.dumps(data, indent=2))
+            except Exception:
+                pass
+            if self._storage is not None:
+                try:
+                    self._storage.append('streaming_rl_metrics', data)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+class OnlineBanditUpdater(threading.Thread):
+    """True online bandit updates from streaming context and feedback events.
+
+    - Listens to vector context ('agent.rl.vectorized') to capture latest x
+    - Listens to reward events ('agent.learning') with {'tool','reward'}
+    - Per-tool online linear model: w <- w + alpha * (r - w·x) * x
+    - Persists to workspace/.dspy_online_bandit.json and optional RedDB stream
+    """
+    def __init__(self, bus: LocalBus, workspace: Path, vector_topic: str = 'agent.rl.vectorized', learning_topic: str = 'agent.learning', alpha: float = 0.05) -> None:
+        super().__init__(daemon=True)
+        self.bus = bus
+        self.workspace = workspace
+        self.vec_q = bus.subscribe(vector_topic)
+        self.learn_q = bus.subscribe(learning_topic)
+        self.alpha = float(alpha)
+        self._stop = threading.Event()
+        self._out = workspace / '.dspy_online_bandit.json'
+        self._state: Dict[str, Any] = {'tools': {}, 'updated_at': 0.0}
+        self._last_vec: Optional[list[float]] = None
+        try:
+            from ..db.factory import get_storage as _get
+            self._storage = _get()
+        except Exception:
+            self._storage = None
+
+    def stop(self) -> None: self._stop.set()
+
+    def _update_tool(self, tool: str, reward: float, x: Optional[list[float]]) -> None:
+        if not x: return
+        t = self._state['tools'].setdefault(tool, {'count': 0, 'mean_reward': 0.0, 'w': [0.0] * len(x)})
+        if len(t['w']) != len(x):
+            t['w'] = [0.0] * len(x)
+        w = t['w']
+        # prediction and SGD update
+        pred = sum(wi * xi for wi, xi in zip(w, x))
+        err = float(reward) - float(pred)
+        lr = self.alpha
+        for i in range(len(w)):
+            w[i] = float(w[i] + lr * err * float(x[i]))
+        # mean
+        t['count'] = int(t['count']) + 1
+        t['mean_reward'] = float(t['mean_reward'] + (float(reward) - float(t['mean_reward'])) / max(1, t['count']))
+        self._state['updated_at'] = time.time()
+        # Persist incremental event
+        rec = {'ts': self._state['updated_at'], 'tool': tool, 'reward': float(reward), 'pred': float(pred), 'error': float(err)}
+        try:
+            if self._storage is not None:
+                self._storage.append('online_bandit_updates', rec)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _flush(self) -> None:
+        try:
+            self._out.write_text(json.dumps(self._state, indent=2))
+        except Exception:
+            pass
+
+    def run(self) -> None:  # pragma: no cover
+        while not self._stop.is_set():
+            # Non-blocking drain both queues with small timeouts
+            try:
+                item = self.vec_q.get(timeout=0.2)
+                if isinstance(item, dict):
+                    vec = item.get('features')
+                    if isinstance(vec, list) and vec:
+                        self._last_vec = [float(v) for v in vec]
+            except Empty:
+                pass
+            try:
+                evt = self.learn_q.get(timeout=0.2)
+                if isinstance(evt, dict):
+                    tool = evt.get('tool'); reward = evt.get('reward')
+                    if isinstance(tool, str) and (isinstance(reward, (int, float))):
+                        self._update_tool(tool, float(reward), self._last_vec)
+                        self._flush()
+            except Empty:
+                pass
 
 
 @dataclass
@@ -678,6 +964,25 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
             setattr(bus, 'vectorizer', vectorizer)
             setattr(bus, 'vector_orchestrator', orchestrator)
             setattr(bus, 'feature_store', feature_store)
+            # Optional: start auto-learner to write granular stats
+            try:
+                auto_env = os.getenv('DSPY_STREAM_AUTO_LEARN', '1').strip().lower()
+                if auto_env in {'1','true','yes','on'}:
+                    learner = StreamAutoLearner(bus, root, vector_topic=out_topic)
+                    learner.start(); threads.append(learner)
+                    setattr(bus, 'auto_learner', learner)
+            except Exception:
+                pass
+            # Optional: online bandit updates
+            try:
+                ob_env = os.getenv('DSPY_ONLINE_BANDIT', '1').strip().lower()
+                if ob_env in {'1','true','yes','on'}:
+                    alpha = float(os.getenv('ONLINE_BANDIT_ALPHA', '0.05') or '0.05')
+                    obu = OnlineBanditUpdater(bus, root, vector_topic=out_topic, learning_topic='agent.learning', alpha=alpha)
+                    obu.start(); threads.append(obu)
+                    setattr(bus, 'online_bandit', obu)
+            except Exception:
+                pass
         except Exception as exc:
             print(f"Warning: vectorization pipeline unavailable: {exc}")
 
@@ -702,6 +1007,26 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
     except Exception:
         pass
 
+    # Background bus metrics writer (opt-in via env, default 30s)
+    try:
+        interval_env = os.getenv('BUS_METRICS_INTERVAL', '30').strip()
+        interval = float(interval_env) if interval_env else 30.0
+    except Exception:
+        interval = 30.0
+    if interval > 0:
+        try:
+            mw = MetricsWriter(bus, root, interval_sec=interval)
+            mw.start(); threads.append(mw)
+        except Exception:
+            pass
+    # Hardware profiler (opt-in via env, default on)
+    try:
+        hw_env = os.getenv('DSPY_HW_PROFILER', '1').strip().lower()
+        if hw_env in {'1','true','yes','on'}:
+            hp = HardwareProfiler(root, interval_sec=float(os.getenv('HW_INTERVAL_SEC','5') or '5'))
+            hp.start(); threads.append(hp)
+    except Exception:
+        pass
     return threads, bus
 
 

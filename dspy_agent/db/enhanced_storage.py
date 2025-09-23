@@ -513,6 +513,24 @@ class EnhancedDataManager(RedDBDataManager):
         """Clear all caches"""
         self.cache.clear()
         self.query_cache.clear()
+
+    # Middleware: ensure signature_name is propagated across action containers when present
+    def record_action(self, action: ActionRecord) -> None:  # type: ignore[override]
+        try:
+            sig = None
+            for cont in (action.parameters, action.result, action.state_before, action.state_after):
+                if isinstance(cont, dict) and isinstance(cont.get('signature_name'), str):
+                    sig = cont.get('signature_name'); break
+            if sig:
+                for cont in (action.parameters, action.result, action.state_before, action.state_after):
+                    try:
+                        if isinstance(cont, dict):
+                            cont.setdefault('signature_name', sig)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return super().record_action(action)
     
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
@@ -535,6 +553,52 @@ class EnhancedDataManager(RedDBDataManager):
         """Cleanup on destruction"""
         if hasattr(self, '_executor'):
             self._executor.shutdown(wait=False)
+
+    # -------------------------------
+    # Security: secret scrubbing in logs
+    # -------------------------------
+    def _scrub(self, obj: Any) -> Any:
+        """Recursively scrub secrets from dicts/strings before persistence."""
+        SECRET_KEYS = {
+            'openai_api_key', 'api_key', 'ollama_api_key', 'reddb_token', 'authorization',
+            'password', 'secret', 'token', 'bearer', 'x-api-key'
+        }
+        try:
+            if isinstance(obj, dict):
+                out = {}
+                for k, v in obj.items():
+                    kl = str(k).lower()
+                    if any(s in kl for s in SECRET_KEYS):
+                        out[k] = '***'
+                    else:
+                        out[k] = self._scrub(v)
+                return out
+            if isinstance(obj, (list, tuple)):
+                return [self._scrub(v) for v in obj] if isinstance(obj, list) else tuple(self._scrub(v) for v in obj)
+            if isinstance(obj, str):
+                # Replace common patterns in free text
+                import re
+                patterns = [
+                    re.compile(r'(sk-[A-Za-z0-9]{20,})'),
+                    re.compile(r'(Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*)', re.IGNORECASE),
+                    re.compile(r'(?i)(api[_-]?key|token|secret)\s*[:=]\s*[^\s;,]+'),
+                ]
+                redacted = obj
+                for pat in patterns:
+                    redacted = pat.sub('***', redacted)
+                return redacted
+        except Exception:
+            return obj
+        return obj
+
+    def log(self, entry):  # type: ignore[override]
+        """Override: scrub secrets from log entry before storing."""
+        try:
+            entry.message = self._scrub(entry.message)  # type: ignore[attr-defined]
+            entry.context = self._scrub(getattr(entry, 'context', {}))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return super().log(entry)  # type: ignore[misc]
 
 
 # Global enhanced data manager instance

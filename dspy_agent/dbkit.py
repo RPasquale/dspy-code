@@ -14,6 +14,8 @@ class Storage(Protocol):
     def delete(self, key: str) -> None: ...
     def append(self, stream: str, value: Any) -> None: ...
     def read(self, stream: str, start: int = 0, count: int = 100) -> Iterable[Tuple[int, Any]]: ...
+    # Optional, best-effort diagnostics
+    def health_check(self) -> dict: ...
 
 
 class RedDBStorage:
@@ -110,6 +112,48 @@ class RedDBStorage:
         req = _req.Request(self._http_url(path), headers=self._headers(), method="DELETE")
         with _req.urlopen(req, timeout=5): return None
 
+    # -----------------
+    # Health diagnostics
+    # -----------------
+    def health_check(self) -> dict:
+        """Return a lightweight health snapshot for this storage.
+
+        - If HTTP is configured, try a quick GET /health and a no-op KV echo.
+        - Otherwise, report in-memory mode as healthy.
+        """
+        result = {
+            "backend": "reddb",
+            "namespace": self.ns,
+            "mode": "http" if self._http_enabled else "memory",
+            "ok": True,
+            "details": "",
+        }
+        if not self._http_enabled:
+            result["details"] = "in-memory fallback"
+            return result
+        # HTTP mode: probe /health then attempt a tiny echo write/read
+        try:
+            # Prefer a /health endpoint if server supports it
+            try:
+                req = _req.Request(self._http_url("/health"), headers=self._headers(), method="GET")
+                with _req.urlopen(req, timeout=2) as resp:
+                    result["http_health"] = int(resp.getcode() or 0)
+            except Exception as e:
+                result["http_health_error"] = str(e)
+            # Echo KV
+            key = f"health:echo:{os.getpid()}"
+            payload = {"ts": os.getenv("SOURCE_DATE_EPOCH", None) or 0}
+            self._http_put(f"/api/kv/{self.ns}/{key}", payload)
+            echoed = self._http_get(f"/api/kv/{self.ns}/{key}")
+            self._http_delete(f"/api/kv/{self.ns}/{key}")
+            result["kv_echo"] = bool(echoed is not None)
+            result["ok"] = True
+            result["details"] = "http ok"
+        except Exception as e:
+            result["ok"] = False
+            result["details"] = f"http error: {e}"
+        return result
+
 
 def get_storage() -> Storage:
     from .config import get_settings
@@ -118,4 +162,3 @@ def get_storage() -> Storage:
         return RedDBStorage(url=s.reddb_url, namespace=s.reddb_namespace or "dspy")
     # Always return a storage instance, even if it's in-memory fallback
     return RedDBStorage(url=None, namespace=s.reddb_namespace or "dspy")
-

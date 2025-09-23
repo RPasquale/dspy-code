@@ -382,6 +382,9 @@ class Orchestrator(dspy.Module):
         if workspace:
             self.memory = SessionMemory(workspace)
             
+        # Optional signature tagging for analytics
+        self.signature_name: Optional[str] = None
+
         # Log orchestrator initialization
         init_log = create_log_entry(
             level="INFO",
@@ -395,6 +398,10 @@ class Orchestrator(dspy.Module):
             environment=Environment.DEVELOPMENT
         )
         self.data_manager.log(init_log)
+
+    def set_signature_name(self, name: Optional[str]) -> None:
+        """Tag subsequent actions with a signature name for analytics (optional)."""
+        self.signature_name = name if (isinstance(name, str) and name.strip()) else None
 
     def __call__(self, query: str, state: str, memory: Optional[SessionMemory] = None):
         """Enhanced forward with memory, caching, and performance tracking"""
@@ -410,6 +417,8 @@ class Orchestrator(dspy.Module):
             "has_memory": active_memory is not None,
             "cache_size": len(self.prediction_cache)
         }
+        if self.signature_name:
+            initial_state["signature_name"] = self.signature_name
         
         # Add memory context to state
         enhanced_state = state
@@ -418,6 +427,26 @@ class Orchestrator(dspy.Module):
             if context:
                 enhanced_state = f"{state} | Memory context: {context}"
                 initial_state["memory_context_added"] = True
+        # Learned policy prompt (if present)
+        if self.workspace:
+            try:
+                pfile = self.workspace / '.dspy_policy_prompt.txt'
+                if pfile.exists():
+                    text = pfile.read_text()[:400].replace('\n', '; ')
+                    enhanced_state = f"{enhanced_state} | Learned policy: {text}"
+                    initial_state["policy_learned"] = True
+            except Exception:
+                pass
+        # Policy hints
+        if self.workspace:
+            try:
+                from ..policy import Policy, apply_policy_to_state
+                pol = Policy.load(self.workspace)
+                if pol is not None:
+                    enhanced_state = apply_policy_to_state(query, enhanced_state, pol)
+                    initial_state["policy_applied"] = True
+            except Exception:
+                pass
         
         # Check cache first
         cache_key = self._get_cache_key(query, enhanced_state)
@@ -448,9 +477,9 @@ class Orchestrator(dspy.Module):
                 cache_action = create_action_record(
                     action_type=ActionType.TOOL_SELECTION,
                     state_before=initial_state,
-                    state_after={"tool": cached_result['tool'], "cached": True},
-                    parameters={"query": query, "cache_hit": True},
-                    result={"tool": cached_result['tool'], "args_json": cached_result['args_json']},
+                    state_after={"tool": cached_result['tool'], "cached": True, **({"signature_name": self.signature_name} if self.signature_name else {})},
+                    parameters={"query": query, "cache_hit": True, **({"signature_name": self.signature_name} if self.signature_name else {})},
+                    result={"tool": cached_result['tool'], "args_json": cached_result['args_json'], **({"signature_name": self.signature_name} if self.signature_name else {})},
                     reward=0.9,  # High reward for cache hits
                     confidence=0.95,
                     execution_time=execution_time,
@@ -515,8 +544,20 @@ class Orchestrator(dspy.Module):
                 cached=False
             )
 
-        # Validate tool selection
+        # Validate tool selection (with policy enforcement)
         tool = (getattr(pred, "tool", None) or "").strip()
+        if self.workspace:
+            try:
+                from ..policy import Policy, enforce_policy_on_tool
+                pol = Policy.load(self.workspace)
+                if pol is not None:
+                    new_tool, note = enforce_policy_on_tool(query, tool, pol)
+                    if new_tool != tool:
+                        tool = new_tool
+                        error_msg = (error_msg or "") + (f" | {note}" if note else "")
+                        setattr(pred, 'tool', tool)
+            except Exception:
+                pass
         if tool not in TOOLS:
             success = False
             error_msg = f"Invalid tool '{tool}' not in TOOLS"
@@ -592,13 +633,15 @@ class Orchestrator(dspy.Module):
                 "query": query,
                 "enhanced_state": enhanced_state,
                 "cache_checked": True,
-                "cache_hit": cache_hit
+                "cache_hit": cache_hit,
+                **({"signature_name": self.signature_name} if self.signature_name else {})
             },
             result={
                 "tool": tool,
                 "args_json": getattr(pred, 'args_json', '{}'),
                 "success": success,
-                "error": error_msg
+                "error": error_msg,
+                **({"signature_name": self.signature_name} if self.signature_name else {})
             },
             reward=reward,
             confidence=confidence,

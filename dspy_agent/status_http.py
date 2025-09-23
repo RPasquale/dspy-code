@@ -11,6 +11,7 @@ from .db.factory import get_storage
 from .streaming.streaming_config import DEFAULT_CONFIG_PATH, load_config, StreamConfig
 from .streaming.streaming_runtime import autodiscover_logs
 from .agents.knowledge import summarize_code_graph
+from .llm import get_circuit_breaker_status
 
 
 def _container_names(workspace: Path) -> List[str]:
@@ -39,6 +40,7 @@ def _container_names(workspace: Path) -> List[str]:
 class _Handler(BaseHTTPRequestHandler):
     storage = None
     workspace = Path.cwd()
+    bus = None
 
     def _json(self, code: int, obj: Dict[str, Any]):
         body = json.dumps(obj).encode('utf-8')
@@ -48,6 +50,31 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dlq_metrics(self) -> Dict[str, Any]:
+        try:
+            path = self.workspace / '.dspy_reports' / 'dlq.jsonl'
+            if not path.exists():
+                return {"total": 0, "by_topic": {}, "last_ts": None}
+            total = 0
+            by_topic: Dict[str, int] = {}
+            last_ts = None
+            with path.open('r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    total += 1
+                    try:
+                        rec = json.loads(line)
+                        t = rec.get('topic', 'unknown')
+                        by_topic[t] = by_topic.get(t, 0) + 1
+                        last_ts = rec.get('ts', last_ts)
+                    except Exception:
+                        pass
+            return {"total": total, "by_topic": by_topic, "last_ts": last_ts}
+        except Exception:
+            return {"total": 0, "by_topic": {}, "last_ts": None}
+
     def log_message(self, format: str, *args):
         # Silence default logging
         return
@@ -55,7 +82,60 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         st = self.storage
         if self.path == '/health':
-            return self._json(200, {"status": "ok"})
+            cb = get_circuit_breaker_status()
+            return self._json(200, {"status": "ok", "lm_circuit": cb})
+        if self.path == '/metrics':
+            try:
+                cb = get_circuit_breaker_status()
+            except Exception:
+                cb = {"open": False}
+            result = {"lm_circuit": cb}
+            # Hardware metrics snapshot
+            try:
+                hw = (self.workspace / '.dspy_hw.json')
+                if hw.exists():
+                    import json as _json
+                    result['hw'] = _json.loads(hw.read_text())
+            except Exception:
+                pass
+            # Include last RL summary if present
+            try:
+                rl_state = (self.workspace / '.dspy_rl_state.json')
+                if rl_state.exists():
+                    import json as _json
+                    result['rl'] = _json.loads(rl_state.read_text())
+            except Exception:
+                pass
+            # Include streaming RL metrics snapshot
+            try:
+                srl = (self.workspace / '.dspy_stream_rl.json')
+                if srl.exists():
+                    import json as _json
+                    result['stream_rl'] = _json.loads(srl.read_text())
+            except Exception:
+                pass
+            # Include online bandit snapshot
+            try:
+                band = (self.workspace / '.dspy_online_bandit.json')
+                if band.exists():
+                    import json as _json
+                    result['online_bandit'] = _json.loads(band.read_text())
+            except Exception:
+                pass
+            # Include DLQ metrics
+            try:
+                result['dlq'] = self._dlq_metrics()
+            except Exception:
+                result['dlq'] = {"total": 0}
+            # Include bus queue metrics when available
+            try:
+                if getattr(self, 'bus', None) is not None and hasattr(self.bus, 'metrics'):
+                    bm = self.bus.metrics()  # type: ignore[attr-defined]
+                    if isinstance(bm, dict):
+                        result['bus'] = bm
+            except Exception:
+                pass
+            return self._json(200, result)
         if self.path == '/deploy':
             if st is None:
                 return self._json(200, {"status": "unknown", "reason": "no storage"})
@@ -105,10 +185,11 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
-def start_status_server(host: str, port: int, workspace: Path) -> threading.Thread:
+def start_status_server(host: str, port: int, workspace: Path, bus: Optional[object] = None) -> threading.Thread:
     handler = _Handler
     handler.storage = get_storage()
     handler.workspace = workspace
+    handler.bus = bus
     httpd = HTTPServer((host, port), handler)
     th = threading.Thread(target=httpd.serve_forever, daemon=True)
     th.start()

@@ -103,10 +103,17 @@ class DeploymentLogger:
         except Exception:
             pass
 
-    def run_stream(self, cmd: list[str], phase: str) -> int:
+    def run_stream(self, cmd: list[str], phase: str, *, env: Optional[dict] = None, cwd: Optional[Path] = None) -> int:
         self.event(phase, "info", f"$ {' '.join(cmd)}")
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=(env or os.environ.copy()),
+                cwd=str(cwd) if cwd else None,
+            )
         except Exception as e:
             self.event(phase, "error", f"failed to start: {e}")
             return 1

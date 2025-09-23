@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import dspy
 
 
@@ -19,12 +21,23 @@ class PlanTaskSig(dspy.Signature):
     commands: str = dspy.OutputField(desc="Copy-pasteable shell commands")
     assumptions: str = dspy.OutputField(desc="Assumptions or prerequisites", default="")
     risks: str = dspy.OutputField(desc="Potential risks and mitigations", default="")
+    rationale: str = dspy.OutputField(desc="Why this plan/commands", default="")
 
 
 class TaskAgent(dspy.Module):
-    def __init__(self):
+    def __init__(self, use_cot: Optional[bool] = None):
         super().__init__()
-        self.plan = dspy.Predict(PlanTaskSig)
+        self.fast = dspy.Predict(PlanTaskSig)
+        self.slow = dspy.ChainOfThought(PlanTaskSig)
+        self.use_cot = use_cot
 
     def forward(self, task: str, context: str):
-        return self.plan(task=task, context=context)
+        if self.use_cot is True:
+            return self.slow(task=task, context=context)
+        pred = self.fast(task=task, context=context)
+        if self.use_cot is False:
+            return pred
+        plan = (getattr(pred, 'plan', '') or '').strip()
+        commands = (getattr(pred, 'commands', '') or '').strip()
+        low_signal = (len(plan.splitlines()) < 2) or (not commands)
+        return pred if not low_signal else self.slow(task=task, context=context)

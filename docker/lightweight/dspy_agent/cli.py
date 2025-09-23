@@ -32,6 +32,7 @@ from .skills.context_builder import ContextBuilder
 from .skills.code_context import CodeContext
 from .skills.code_context_rag import CodeContextRAG
 from .skills.task_agent import TaskAgent
+from .skills.controller import Controller
 from .skills.file_locator import FileLocator
 from .skills.patch_verifier import PatchVerifier
 from .skills.test_planner import TestPlanner
@@ -50,6 +51,7 @@ from .embedding.indexer import build_index, save_index, load_index, semantic_sea
 from .training.train_gepa import run_gepa, run_gepa_with_val, evaluate_on_set
 from .training.train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
 from .training.train_codegen import run_gepa_codegen
+from .training.rl_sweep import run_sweep as _run_rl_sweep, load_sweep_config as _load_sweep_config, SweepSettings as _SweepSettings
 from .training.autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
 from .agents.orchestrator_runtime import evaluate_tool_choice
 from .embedding.indexer import tokenize
@@ -806,6 +808,32 @@ class AutoTrainingLoop:
                 'workspace': str(ws),
                 'updated_at': time.time(),
             })
+        # Run a short, efficient local sweep to refine RL hyperparameters
+        try:
+            sweep_cfg = _load_sweep_config(None)
+            # Allow env to tune method/iterations
+            iters_env = os.getenv('DSPY_AUTO_SWEEP_ITERS')
+            method_env = os.getenv('DSPY_AUTO_SWEEP_METHOD')
+            if iters_env is not None:
+                try:
+                    sweep_cfg['iterations'] = int(iters_env)
+                except Exception:
+                    sweep_cfg['iterations'] = min(int(sweep_cfg.get('iterations', 10)), 4)
+            else:
+                sweep_cfg['iterations'] = min(int(sweep_cfg.get('iterations', 10)), 4)
+            if method_env:
+                sweep_cfg['method'] = method_env
+            else:
+                # Prefer native efficient strategies to avoid optional deps
+                sweep_cfg['method'] = 'eprotein'
+            settings = _SweepSettings()
+            settings.iterations = int(sweep_cfg['iterations'])
+            settings.puffer_backend = False
+            outcome = _run_rl_sweep(ws, sweep_cfg, base_config=None, settings=settings)
+            self.console.print(f"[dim]auto-sweep method={sweep_cfg['method']} best_metric={outcome.best_summary.metric:.3f}[/dim]")
+        except Exception as e:
+            # Best-effort: do not break auto training if sweep fails
+            self.console.print(Panel(f"auto-sweep failed: {e}", title="auto-train", border_style="yellow"))
         try:
             avg_reward = self._run_rl_training(ws, rl_steps)
             now = time.time()
@@ -1095,8 +1123,170 @@ app = typer.Typer(add_completion=False, help="DSPy-based local coding agent", no
 console = Console(theme=CYBER_THEME)
 LIGHTWEIGHT_DIR = Path('docker/lightweight')
 
+# Rationale printing controls -----------------------------------------------
+def _should_show_rationale() -> bool:
+    v = str(os.environ.get('DSPY_SHOW_RATIONALE', '0')).strip().lower()
+    return v not in {'', '0', 'false', 'no'}
+
+def _set_show_rationale(value: bool) -> None:
+    os.environ['DSPY_SHOW_RATIONALE'] = '1' if value else '0'
+
+def _maybe_panel_rationale(text: Optional[str], title: str = "Rationale") -> None:
+    t = (text or '').strip()
+    if _should_show_rationale() and t:
+        try:
+            console.print(Panel.fit(escape(t), title=title, border_style="dim"))
+        except Exception:
+            console.print(t)
+
+def _maybe_inline_rationale(text: Optional[str]) -> None:
+    t = (text or '').strip()
+    if _should_show_rationale() and t:
+        console.print(f"[dim]Rationale: {t}[/dim]")
+
 # Register RL subcommands under main app
 app.add_typer(rl_app, name="rl")
+
+# -----------------------------
+# Logs attach/forward utilities
+# -----------------------------
+logs_app = typer.Typer(help="Attach to logs and forward to Kafka topics.")
+app.add_typer(logs_app, name="logs")
+
+def _resolve_bootstrap(bootstrap: Optional[str]) -> Optional[str]:
+    return bootstrap or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or os.getenv('KAFKA_BOOTSTRAP')
+
+def _make_producer(bootstrap: str):
+    try:
+        from confluent_kafka import Producer  # type: ignore
+        p = Producer({'bootstrap.servers': bootstrap})
+        class _P:
+            def send(self, topic: str, value: dict):
+                import json as _j
+                p.produce(topic, _j.dumps(value).encode('utf-8'))
+            def flush(self):
+                p.flush()
+        return _P()
+    except Exception:
+        pass
+    try:
+        from kafka import KafkaProducer  # type: ignore
+        return KafkaProducer(bootstrap_servers=bootstrap, value_serializer=lambda v: __import__('json').dumps(v).encode('utf-8'))
+    except Exception as e:
+        raise RuntimeError(f"No Kafka producer available: {e}")
+
+@logs_app.command('pipe')
+def logs_pipe(
+    container: str = typer.Option('app', '--container', help='Logical container/service name'),
+    bootstrap: Optional[str] = typer.Option(None, '--bootstrap', help='Kafka bootstrap (defaults from env)'),
+    topic_prefix: str = typer.Option('logs.raw.', '--topic-prefix', help='Topic prefix; full topic is <prefix><container>'),
+):
+    bs = _resolve_bootstrap(bootstrap)
+    if not bs:
+        console.print(Panel("Set --bootstrap or KAFKA_BOOTSTRAP[_SERVERS]", title="logs pipe", border_style="red")); raise typer.Exit(1)
+    topic = f"{topic_prefix}{container}"
+    prod = _make_producer(bs)
+    console.print(Panel.fit(f"Forwarding stdin → {topic} @ {bs}", title="logs pipe", border_style="accent"))
+    import sys, time
+    sent = 0
+    for line in sys.stdin:
+        msg = {'line': line.rstrip('\n'), 'ts': time.time()}
+        prod.send(topic, msg)
+        sent += 1
+        if sent % 1000 == 0:
+            try: prod.flush()
+            except Exception: pass
+    try: prod.flush()
+    except Exception: pass
+    console.print(f"[green]Sent {sent} line(s) to {topic}[/green]")
+
+@logs_app.command('file')
+def logs_file(
+    file: Path = typer.Option(..., '--file', exists=True, readable=True, help='Log file to tail'),
+    container: str = typer.Option('app', '--container', help='Logical container/service name'),
+    bootstrap: Optional[str] = typer.Option(None, '--bootstrap', help='Kafka bootstrap (defaults from env)'),
+    topic_prefix: str = typer.Option('logs.raw.', '--topic-prefix', help='Topic prefix; full topic is <prefix><container>'),
+    poll: float = typer.Option(0.5, '--poll', help='Polling interval for new lines'),
+):
+    bs = _resolve_bootstrap(bootstrap)
+    if not bs:
+        console.print(Panel("Set --bootstrap or KAFKA_BOOTSTRAP[_SERVERS]", title="logs file", border_style="red")); raise typer.Exit(1)
+    topic = f"{topic_prefix}{container}"
+    prod = _make_producer(bs)
+    console.print(Panel.fit(f"Tailing {file} → {topic} @ {bs}", title="logs file", border_style="accent"))
+    import time
+    sent = 0
+    with file.open('r', errors='ignore') as f:
+        f.seek(0, 2)
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(max(0.05, poll)); continue
+            msg = {'line': line.rstrip('\n'), 'ts': time.time()}
+            prod.send(topic, msg); sent += 1
+            if sent % 1000 == 0:
+                try: prod.flush()
+                except Exception: pass
+    try: prod.flush()
+    except Exception: pass
+
+@logs_app.command('http-server')
+def logs_http_server(
+    host: str = typer.Option('0.0.0.0', '--host'),
+    port: int = typer.Option(9010, '--port'),
+    container: str = typer.Option('app', '--container'),
+    bootstrap: Optional[str] = typer.Option(None, '--bootstrap'),
+    topic_prefix: str = typer.Option('logs.raw.', '--topic-prefix'),
+):
+    bs = _resolve_bootstrap(bootstrap)
+    if not bs:
+        console.print(Panel("Set --bootstrap or KAFKA_BOOTSTRAP[_SERVERS]", title="logs http-server", border_style="red")); raise typer.Exit(1)
+    topic = f"{topic_prefix}{container}"
+    prod = _make_producer(bs)
+    if not prod:
+        console.print(Panel("No Kafka producer available (install confluent-kafka or kafka-python)", title="logs http-server", border_style="red")); raise typer.Exit(1)
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    import json as _j, time as _t
+
+    class H(BaseHTTPRequestHandler):
+        def _ok(self, obj):
+            data = _j.dumps(obj).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def do_POST(self):  # type: ignore[override]
+            ltype = self.headers.get('Content-Type','')
+            length = int(self.headers.get('Content-Length','0') or '0')
+            body = self.rfile.read(length) if length>0 else b''
+            n = 0
+            try:
+                if 'application/json' in ltype:
+                    obj = _j.loads(body.decode('utf-8', errors='ignore') or '{}')
+                    items = obj if isinstance(obj, list) else [obj]
+                    for it in items:
+                        if isinstance(it, dict):
+                            prod.send(topic, {'line': it.get('message') or it.get('line') or _j.dumps(it), 'ts': _t.time(), **it}); n += 1
+                else:
+                    text = body.decode('utf-8', errors='ignore')
+                    for line in text.splitlines(): prod.send(topic, {'line': line, 'ts': _t.time()}); n += 1
+            except Exception:
+                pass
+            try: prod.flush()
+            except Exception: pass
+            self._ok({'status': 'ok', 'forwarded': n})
+        def log_message(self, format, *args): return
+
+    httpd = HTTPServer((host, port), H)
+    th = threading.Thread(target=httpd.serve_forever, daemon=True)
+    th.start()
+    console.print(Panel.fit(f"HTTP ingest on http://{host}:{port} → {topic} @ {bs}", title="logs http-server", border_style="accent"))
+    try:
+        while th.is_alive(): th.join(1.0)
+    except KeyboardInterrupt:
+        pass
 
 
 @app.callback(invoke_without_command=True)
@@ -1522,6 +1712,39 @@ def _progress_panel(module: str, auto: str, tr: list[float], va: list[float], ti
 
 
 @app.command()
+def control(
+    query: str = typer.Argument(..., help="Natural instruction / goal"),
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+    logs: Optional[Path] = typer.Option(None, '--logs', file_okay=True, dir_okay=True, exists=True, help="Logs path"),
+    ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama for LLM"),
+    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Model name"),
+    base_url: Optional[str] = typer.Option(None, '--base-url'),
+    api_key: Optional[str] = typer.Option(None, '--api-key'),
+):
+    ws = workspace
+    logs_path = logs or (ws / 'logs')
+    code_graph = _get_code_summary(ws)
+    bundle_logs, _ = load_logs([logs_path])
+    key = extract_key_events(bundle_logs) if bundle_logs else ""
+    state = f"workspace={ws} logs={logs_path} | key={key[:200]} | code={code_graph[:400]}"
+    lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
+    if lm is None:
+        console.print("[yellow]No LM configured; controller requires an LM.[/yellow]")
+        raise typer.Exit(1)
+    ctrl = Controller(use_cot=True)
+    pred = ctrl(query=query, state=state, memory="", preferences="", metrics="")
+    _print_header("Controller Plan"); console.print(Panel.fit(escape(getattr(pred, 'plan', '') or ''), title="plan", border_style="blue"))
+    if getattr(pred, 'mode', None):
+        console.print(Panel.fit(escape(getattr(pred, 'mode') or ''), title="mode", border_style="cyan"))
+    tool = (getattr(pred, 'tool', '') or '').strip(); args_json = getattr(pred, 'args_json', '') or '{}'
+    if tool:
+        console.print(Panel.fit(escape(f"{tool} {args_json}"), title="action", border_style="yellow"))
+    if getattr(pred, 'guardrails', None):
+        console.print(Panel.fit(escape(getattr(pred, 'guardrails') or ''), title="guardrails", border_style="magenta"))
+    _maybe_panel_rationale(getattr(pred, 'rationale', None), title="Controller Rationale")
+    if getattr(pred, 'next_steps', None):
+        console.print(Panel.fit(escape(getattr(pred, 'next_steps') or ''), title="next steps", border_style="green"))
+
 def context(
     logs: Optional[Path] = typer.Option(
         None, '--logs', file_okay=True, dir_okay=True, exists=True,
@@ -1601,6 +1824,10 @@ def codectx(
     model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Model name for LLM"),
     base_url: Optional[str] = typer.Option(None, '--base-url', help="Override base URL"),
     api_key: Optional[str] = typer.Option(None, '--api-key', help="API key"),
+    beam_k: int = typer.Option(1, '--beam', help="Beam size (best-of-K)"),
+    speculative: bool = typer.Option(False, '--speculative/--no-speculative', help="Use draft model for speculative pass"),
+    draft_model: Optional[str] = typer.Option(None, '--draft-model', help="Draft LM (e.g., qwen2:0.5b)"),
+    profile: Optional[str] = typer.Option(None, '--profile', help="Performance profile: fast|balanced|maxquality"),
 ):
     # Runtime toggle for adapter behavior
     if os.environ.get('DSPY_FORCE_JSON_OBJECT') is None:
@@ -1620,9 +1847,40 @@ def codectx(
     # Try retrieval to enrich context
     ask = "Summarize key components, APIs, and likely modification points."
     retrieved_snippets, references = _retrieve_for_query(workspace, ask)
+    # Load persisted profile if not provided
+    if not profile:
+        try:
+            prof_path = workspace / '.dspy_profile.json'
+            if prof_path.exists():
+                import json as _json
+                profile = (_json.loads(prof_path.read_text()).get('profile') or '').strip() or None
+        except Exception:
+            pass
+    # Apply performance profile defaults
+    key_prof = (profile or '').strip().lower()
+    if key_prof in {'fast','balanced','maxquality'}:
+        if key_prof == 'fast':
+            beam_k = max(1, beam_k or 1); speculative = True if speculative is False else speculative
+        elif key_prof == 'balanced':
+            beam_k = max(2, beam_k or 2); speculative = True if speculative is False else speculative
+        elif key_prof == 'maxquality':
+            beam_k = max(4, beam_k or 4); speculative = False if speculative is False else speculative
+        if speculative and not draft_model and ollama:
+            draft_model = 'qwen2:0.5b'
+
     if retrieved_snippets:
-        cc_rag = CodeContextRAG()
-        out = cc_rag(snapshot=snap, ask=ask, code_graph=code_graph, retrieved_snippets=retrieved_snippets, references=references)
+        out = None
+        if speculative and draft_model:
+            from .llm import configure_lm, temporary_lm
+            draft_lm = configure_lm(provider="ollama" if ollama else None, model_name=draft_model, base_url=base_url, api_key=api_key)
+            with temporary_lm(draft_lm):
+                cc_rag = CodeContextRAG(beam_k=max(1, int(beam_k)))
+                cand = cc_rag(snapshot=snap, ask=ask, code_graph=code_graph, retrieved_snippets=retrieved_snippets, references=references)
+            if (getattr(cand, 'hot_spots', '') or '').strip():
+                out = cand
+        if out is None:
+            cc_rag = CodeContextRAG(beam_k=max(1, int(beam_k)))
+            out = cc_rag(snapshot=snap, ask=ask, code_graph=code_graph, retrieved_snippets=retrieved_snippets, references=references)
         console.print(Panel.fit(escape(out.summary), title="Summary", border_style="cyan"))
         console.print(Panel.fit(escape(out.bullets), title="Bullets", border_style="green"))
         if getattr(out, 'hot_spots', None):
@@ -1634,8 +1892,18 @@ def codectx(
         if getattr(out, 'citations', None):
             console.print(Panel.fit(escape(getattr(out, 'citations')), title="Citations", border_style="dim"))
     else:
-        cc = CodeContext()
-        out = cc(snapshot=snap, ask=ask, code_graph=code_graph)
+        out = None
+        if speculative and draft_model:
+            from .llm import configure_lm, temporary_lm
+            draft_lm = configure_lm(provider="ollama" if ollama else None, model_name=draft_model, base_url=base_url, api_key=api_key)
+            with temporary_lm(draft_lm):
+                cc = CodeContext(beam_k=max(1, int(beam_k)))
+                cand = cc(snapshot=snap, ask=ask, code_graph=code_graph)
+            if (getattr(cand, 'entry_points', '') or getattr(cand, 'risk_areas', '') or '').strip():
+                out = cand
+        if out is None:
+            cc = CodeContext(beam_k=max(1, int(beam_k)))
+            out = cc(snapshot=snap, ask=ask, code_graph=code_graph)
         console.print(Panel.fit(escape(out.summary), title="Summary", border_style="cyan"))
         console.print(Panel.fit(escape(out.bullets), title="Bullets", border_style="green"))
     console.print(Panel.fit(escape(out.summary), title="Summary", border_style="cyan"))
@@ -2459,11 +2727,36 @@ def chat(
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
     structured: bool = typer.Option(False, '--structured', help="Prefer structured-outputs when available (overrides --force-json)"),
     approval: Optional[str] = typer.Option(None, '--approval', help='Tool approval mode: auto|manual'),
+    show_rationale: bool = typer.Option(False, '--show-rationale/--no-show-rationale', help='Show/hide model rationales (debug)'),
+    speculative: bool = typer.Option(False, '--speculative/--no-speculative', help='Use draft model for speculative routing'),
+    draft_model: Optional[str] = typer.Option(None, '--draft-model', help='Draft LM for speculative routing (e.g., qwen2:0.5b)'),
+    profile: Optional[str] = typer.Option(None, '--profile', help='Performance profile: fast|balanced|maxquality'),
 ):
     if structured:
         os.environ['DSPY_FORCE_JSON_OBJECT'] = 'false'
     elif force_json:
         os.environ['DSPY_FORCE_JSON_OBJECT'] = 'true'
+    # Set rationale printing preference for this session
+    _set_show_rationale(bool(show_rationale))
+    # Load persisted profile if not provided
+    if not profile:
+        try:
+            prof_path = workspace / '.dspy_profile.json'
+            if prof_path.exists():
+                import json as _json
+                profile = (_json.loads(prof_path.read_text()).get('profile') or '').strip() or None
+        except Exception:
+            pass
+    # Apply performance profile defaults for routing
+    key_prof = (profile or '').strip().lower()
+    if key_prof in {'fast','balanced','maxquality'}:
+        if key_prof in {'fast','balanced'} and speculative is False:
+            speculative = True
+        if key_prof == 'maxquality' and speculative is False:
+            speculative = False
+        if speculative and not draft_model and provider_is_ollama:
+            draft_model = 'qwen2:0.5b'
+
     # Local session variables
     ws = workspace
     logs_path = logs or (ws / 'logs')
@@ -2499,17 +2792,29 @@ def chat(
         lm = _maybe_configure_lm(True, provider_is_ollama, model_name, base, key)
         if lm is not None:
             try:
-                # Confidence gating: use fast Predict first; escalate to CoT if ambiguous
-                fast = Orchestrator(use_cot=False)
-                pred_fast = fast(query=task, state=state)
-                tool = (pred_fast.tool or "").strip(); import json as _json; args = _json.loads(pred_fast.args_json or "{}")
-                ambiguous = (not tool) or (last_tool == tool and last_args == args) or (tool in {"knowledge","sg"} and not args)
-                if ambiguous:
-                    slow = Orchestrator(use_cot=True)
-                    pred = slow(query=task, state=state)
-                    tool = (pred.tool or tool).strip(); args = _json.loads(pred.args_json or "{}")
-                    if getattr(pred, 'rationale', None):
-                        console.print(Panel.fit(escape(pred.rationale), title="Routing Rationale", border_style="dim"))
+                import json as _json
+                did_spec = False
+                if speculative and draft_model:
+                    from .llm import configure_lm, temporary_lm
+                    draft_lm = configure_lm(provider="ollama" if provider_is_ollama else None, model_name=draft_model, base_url=base, api_key=key)
+                    with temporary_lm(draft_lm):
+                        fast_d = Orchestrator(use_cot=False)
+                        pred_d = fast_d(query=task, state=state)
+                        tool_d = (pred_d.tool or "").strip(); args_d = _json.loads(pred_d.args_json or "{}")
+                        ambiguous_d = (not tool_d) or (last_tool == tool_d and last_args == args_d) or (tool_d in {"knowledge","sg"} and not args_d)
+                        if not ambiguous_d:
+                            tool = tool_d; args = args_d; did_spec = True
+                if not did_spec:
+                    # Confidence gating: use fast Predict first; escalate to CoT if ambiguous
+                    fast = Orchestrator(use_cot=False)
+                    pred_fast = fast(query=task, state=state)
+                    tool = (pred_fast.tool or "").strip(); args = _json.loads(pred_fast.args_json or "{}")
+                    ambiguous = (not tool) or (last_tool == tool and last_args == args) or (tool in {"knowledge","sg"} and not args)
+                    if ambiguous:
+                        slow = Orchestrator(use_cot=True)
+                        pred = slow(query=task, state=state)
+                        tool = (pred.tool or tool).strip(); args = _json.loads(pred.args_json or "{}")
+                        _maybe_panel_rationale(getattr(pred, 'rationale', None), title="Routing Rationale")
             except Exception:
                 tool = None; args = {}
         if not tool:
@@ -2666,8 +2971,22 @@ def emb_index(
     lines: int = typer.Option(200, '--chunk-lines', help="Lines per chunk for non-Python"),
     smart: bool = typer.Option(True, '--smart/--no-smart', help="Code-aware chunking (Python)"),
     persist: bool = typer.Option(False, '--persist/--no-persist', help="Also persist embeddings and code chunks to RedDB"),
+    infermesh_url: Optional[str] = typer.Option(None, '--infermesh-url', help="Use InferMesh embedding service at this base URL (overrides other embed options)"),
+    infermesh_model: Optional[str] = typer.Option(None, '--infermesh-model', help="InferMesh model id (defaults to --model)"),
+    infermesh_api_key: Optional[str] = typer.Option(None, '--infermesh-api-key', help="Bearer token for InferMesh (optional)"),
 ):
-    if hf or model.startswith("Qwen/"):
+    if infermesh_url:
+        try:
+            from .embedding.infermesh import InferMeshEmbedder
+            embedder = InferMeshEmbedder(
+                infermesh_url,
+                infermesh_model or model,
+                api_key=infermesh_api_key,
+            )
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="InferMesh init failed", border_style="red"))
+            raise typer.Exit(1)
+    elif hf or model.startswith("Qwen/"):
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
         except Exception as e:
@@ -3327,7 +3646,13 @@ def code_edit(
     model: Optional[str] = typer.Option("qwen3:1.7b", '--model'),
     base_url: Optional[str] = typer.Option(None, '--base-url'),
     api_key: Optional[str] = typer.Option(None, '--api-key'),
+    show_rationale: bool = typer.Option(False, '--show-rationale/--no-show-rationale', help='Show/hide model rationales (debug)'),
+    beam_k: int = typer.Option(1, '--beam', help='Beam size for proposals'),
+    speculative: bool = typer.Option(False, '--speculative/--no-speculative', help='Use draft model for speculative pass'),
+    draft_model: Optional[str] = typer.Option(None, '--draft-model', help='Draft LM (e.g., qwen2:0.5b)'),
+    profile: Optional[str] = typer.Option(None, '--profile', help='Performance profile: fast|balanced|maxquality'),
 ):
+    _set_show_rationale(bool(show_rationale))
     lm = _maybe_configure_lm(True, ollama, model, base_url, api_key)
     if lm is None:
         console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]"); raise typer.Exit(1)
@@ -3346,12 +3671,43 @@ def code_edit(
             hints = (loc.file_candidates or "")
     except Exception:
         pass
-    ce = CodeEdit(use_cot=True)
-    out = ce(task=task, context=ctx_text[:8000], code_graph=code_graph, file_hints=hints)
+    # Apply performance profile defaults
+    key_prof = (profile or '').strip().lower()
+    if key_prof in {'fast','balanced','maxquality'}:
+        if key_prof == 'fast':
+            beam_k = max(1, beam_k or 1); speculative = True if speculative is False else speculative
+        elif key_prof == 'balanced':
+            beam_k = max(2, beam_k or 2); speculative = True if speculative is False else speculative
+        elif key_prof == 'maxquality':
+            beam_k = max(4, beam_k or 4); speculative = False if speculative is False else speculative
+        if speculative and not draft_model and ollama:
+            draft_model = 'qwen2:0.5b'
+
+    # Load persisted profile if not provided
+    if not profile:
+        try:
+            prof_path = workspace / '.dspy_profile.json'
+            if prof_path.exists():
+                import json as _json
+                profile = (_json.loads(prof_path.read_text()).get('profile') or '').strip() or None
+        except Exception:
+            pass
+    # Speculative draft pass
+    out = None
+    if speculative and draft_model:
+        from .llm import configure_lm, temporary_lm
+        draft_lm = configure_lm(provider="ollama" if ollama else None, model_name=draft_model, base_url=base_url, api_key=api_key)
+        with temporary_lm(draft_lm):
+            ce_fast = CodeEdit(use_cot=None, beam_k=max(1, int(beam_k)))
+            cand = ce_fast(task=task, context=ctx_text[:8000], code_graph=code_graph, file_hints=hints)
+        if getattr(cand, 'ok', False) and (getattr(cand, 'files', 0) <= 2) and (int(getattr(cand, 'added', 0)) + int(getattr(cand, 'removed', 0)) <= 80):
+            out = cand
+    if out is None:
+        ce = CodeEdit(use_cot=None, beam_k=max(1, int(beam_k)))
+        out = ce(task=task, context=ctx_text[:8000], code_graph=code_graph, file_hints=hints)
     _print_header("Proposed Patch")
     console.print(out.patch or "(no patch)")
-    _print_header("Rationale")
-    console.print(out.rationale or "(no rationale)")
+    _maybe_panel_rationale(getattr(out, 'rationale', None), title="Rationale")
     # Show locator output if available
     if locator_info is not None:
         _print_header("File Candidates")
@@ -3958,9 +4314,8 @@ def start_command(
                     except Exception:
                         args = {}
                     
-                    # Show rationale if available
-                    if getattr(pred, 'rationale', None):
-                        console.print(f"[dim]Rationale: {pred.rationale}[/dim]")
+                    # Show rationale if available (debug)
+                    _maybe_inline_rationale(getattr(pred, 'rationale', None))
                     
                     # Show if using cache
                     if getattr(pred, 'cached', False):
@@ -4434,7 +4789,7 @@ def start_command(
             ce = CodeEdit(use_cot=True)
             out = ce(task=task_text, context=ctx_text, code_graph=code_graph, file_hints=file_hints)
             _print_header("Proposed Patch"); console.print(out.patch or "(no patch)")
-            _print_header("Rationale"); console.print(out.rationale or "(no rationale)")
+            _maybe_panel_rationale(getattr(out, 'rationale', None), title="Rationale")
             if apply_flag and out.patch:
                 do_apply = True
                 # Always ask in manual mode; in auto mode, do not auto-apply
@@ -4701,7 +5056,7 @@ def start_command(
             ce = _CE(use_cot=True)
             out = ce(task=task_text, context=ctx_text[:8000], code_graph=code_graph, file_hints=hints)
             _print_header("Proposed Patch"); console.print(out.patch or "(no patch)")
-            _print_header("Rationale"); console.print(out.rationale or "(no rationale)")
+            _maybe_panel_rationale(getattr(out, 'rationale', None), title="Rationale")
             if apply_flag and out.patch:
                 do_apply = True
                 if approval_mode == "manual":
@@ -5064,30 +5419,49 @@ def grep(
     exclude: Optional[List[str]] = typer.Option(None, '--exclude', help="Exclude glob. Can repeat."),
     file: Optional[Path] = typer.Option(None, '--file', exists=True, help="Limit search to a single file"),
     context: int = typer.Option(0, '--context', help="Show N context lines around each match"),
+    fast: bool = typer.Option(True, '--fast/--slow', help="Use optimized search engine"),
 ):
-    """Search files in a workspace (fallback grep)."""
+    """Search files in a workspace (optimized grep with caching)."""
+    start_time = time.time()
+    
     if file:
         hits = file_search(file, query, regex=regex)
+        # Convert to dict format for consistency
+        hits = [{'path': str(h.path), 'line_no': h.line_no, 'line': h.line} for h in hits]
     else:
         inc = list(glob) if glob else None
         exc = list(exclude) if exclude else None
-        hits = search_text(workspace, query, regex=regex, include_globs=inc, exclude_globs=exc)
+        
+        if fast:
+            # Use optimized search engine
+            from .code_tools.optimized_search import search_text_fast
+            hits = search_text_fast(workspace, query, regex=regex, include_globs=inc, exclude_globs=exc)
+        else:
+            # Use original search
+            hits = search_text(workspace, query, regex=regex, include_globs=inc, exclude_globs=exc)
+            # Convert to dict format
+            hits = [{'path': str(h.path), 'line_no': h.line_no, 'line': h.line} for h in hits]
 
     if not hits:
         console.print("[yellow]No matches found.[/yellow]")
         raise typer.Exit(0)
 
+    # Show performance info
+    search_time = time.time() - start_time
+    console.print(f"[dim]Found {len(hits)} matches in {search_time:.2f}s[/dim]")
+
     for h in hits[:500]:  # soft cap to avoid flooding
         try:
-            text = h.path.read_text(errors="ignore") if context else ""
+            file_path = Path(h['path'])
+            text = file_path.read_text(errors="ignore") if context else ""
         except Exception:
             text = ""
         if context and text:
-            start, end, seg = extract_context(text, h.line_no, before=context, after=context)
-            title = f"{h.path} :{h.line_no} (lines {start}-{end})"
+            start, end, seg = extract_context(text, h['line_no'], before=context, after=context)
+            title = f"{h['path']} :{h['line_no']} (lines {start}-{end})"
             console.print(Panel(escape(seg), title=title, border_style="blue"))
         else:
-            console.print(f"{h.path}:{h.line_no}: {h.line}")
+            console.print(f"{h['path']}:{h['line_no']}: {h['line']}")
 
 
 @app.command()

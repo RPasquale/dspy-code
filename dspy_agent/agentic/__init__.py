@@ -5,6 +5,8 @@ from .memory import (
     compute_retrieval_features,
     log_retrieval_event,
     load_retrieval_events,
+    query_retrieval_events,
+    get_retrieval_statistics,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "compute_retrieval_features",
     "log_retrieval_event",
     "load_retrieval_events",
+    "query_retrieval_events",
+    "get_retrieval_statistics",
 ]

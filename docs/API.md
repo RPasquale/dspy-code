@@ -727,3 +727,42 @@ logger.addHandler(handler)
 ```
 
 This API documentation provides comprehensive coverage of DSPy Agent's core functionality. For more specific use cases and examples, refer to the test files in the `tests/` directory.
+
+## Teleprompt Training
+
+Train and compare teleprompt methods (BootstrapICL, MIPROv2) for multiple signatures.
+
+- CLI (single signature):
+  - `dspy-agent teleprompt --module codectx --train-jsonl data.jsonl --method bootstrap --shots 8`
+
+- CLI (suite across signatures):
+  - `dspy-agent teleprompt_suite --modules codectx,task --methods bootstrap,mipro --dataset-dir .dspy_data/splits --shots 8 --save-best-dir .dspy_prompts`
+
+- Dashboard API:
+  - POST `/api/teleprompt/run` with JSON `{ "modules": ["codectx","task"], "methods": ["bootstrap","mipro"], "shots": 8, "dataset_dir": ".dspy_data/splits" }`
+  - GET `/api/teleprompt/experiments` returns recent experiment summaries
+
+Datasets are expected at `<dataset_dir>/{module}_train.jsonl` (and optional `_val.jsonl`, `_test.jsonl`). Programs and results are tracked in `.dspy_prompts` and `.dspy_reports/teleprompt_experiments.jsonl` and stored in RedDB signature optimization history.
+
+## Performance Profiles
+
+Most CLI commands accept `--profile` with presets fast|balanced|maxquality:
+- fast: low-latency (beam=1, speculative on when possible)
+- balanced: moderate quality (beam=2, speculative on when possible)
+- maxquality: highest quality (beam≥4, CoT preferred, speculative off)
+
+Examples:
+- `dspy-agent codectx --path . --profile balanced --ollama --model qwen3:1.7b --draft-model qwen2:0.5b`
+- `dspy-agent edit "fix bug" --profile maxquality`
+- `dspy-agent start --profile fast --draft-model qwen2:0.5b`
+
+## RL Sweeps (Dashboard)
+
+Run native sweeps and inspect state from the dashboard server:
+- POST `/api/rl/sweep/run` JSON: `{ "method": "eprotein", "iterations": 8 }`
+- GET `/api/rl/sweep/state` JSON: current sweep state + Pareto approximation
+- GET `/api/rl/sweep/history` JSON: recent experiment summaries and best.json
+
+Env toggles for live sweeps in lightweight interactive sessions:
+- `DSPY_AUTO_SWEEP_METHOD` (default eprotein)
+- `DSPY_AUTO_SWEEP_ITERS` (default 4)

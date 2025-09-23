@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dspy-agent
+  labels:
+    app: dspy-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dspy-agent
+  template:
+    metadata:
+      labels:
+        app: dspy-agent
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: agent
+          image: ghcr.io/OWNER/dspy-lightweight:latest # replace OWNER or use CI to template
+          imagePullPolicy: IfNotPresent
+          args: ["--workspace", "/workspace"]
+          env:
+            - name: USE_OLLAMA
+              value: "true"
+            - name: OPENAI_BASE_URL
+              value: "http://ollama:11434"
+            - name: OLLAMA_MODEL
+              value: "qwen3:1.7b"
+          ports:
+            - name: http
+              containerPort: 8765
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dspy-agent
+spec:
+  selector:
+    app: dspy-agent
+  ports:
+    - name: http
+      port: 8765
+      targetPort: 8765
+

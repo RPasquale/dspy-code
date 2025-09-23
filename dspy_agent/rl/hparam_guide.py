@@ -151,3 +151,35 @@ def as_dict() -> List[Mapping[str, object]]:
             }
         )
     return result
+
+
+def suggest_from_metrics(metrics: Mapping[str, float]) -> Dict[str, float]:
+    """Lightweight, deterministic suggestions from simple metrics.
+
+    Intended as a safe fallback when Bayesian optimizers are unavailable.
+    - If pass_rate is low and variance high → raise temperature slightly.
+    - If blast_radius is high → lower clip_higher to reduce aggressive edits.
+    - If rewards stagnate → nudge target_entropy toward 0.3.
+    """
+    pr = float(metrics.get('pass_rate', 0.0))
+    br = float(metrics.get('blast_radius', 0.0))
+    avg_r = float(metrics.get('avg_reward', 0.0))
+    # Simple heuristics with safe bounds
+    out: Dict[str, float] = {}
+    # Temperature within [0.6, 1.2]
+    if pr < 0.2:
+        out['temperature'] = 0.95
+    elif pr < 0.5:
+        out['temperature'] = 0.9
+    else:
+        out['temperature'] = 0.8
+    # Clip higher based on blast radius
+    if br > 200:
+        out['clip_higher'] = 1.0
+    elif br > 50:
+        out['clip_higher'] = 1.05
+    else:
+        out['clip_higher'] = 1.15
+    # Target entropy gentle pull toward 0.3
+    out['target_entropy'] = 0.3 if avg_r < 0.2 else 0.28
+    return out

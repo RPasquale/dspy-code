@@ -118,6 +118,7 @@ class SweepOutcome:
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name('rl_default_sweep.json')
 DEFAULT_PERSIST_PATH = Path('.dspy') / 'rl' / 'best.json'
+DEFAULT_STATE_PATH = Path('.dspy') / 'rl' / 'sweep_state.json'
 
 
 def load_sweep_config(path: Optional[Path] = None) -> Dict[str, Any]:
@@ -380,6 +381,25 @@ def run_sweep(
     if base.actions:
         fill_template["actions"] = list(base.actions)
 
+    # Resume sweep state when available
+    state_path = (workspace / DEFAULT_STATE_PATH) if not DEFAULT_STATE_PATH.is_absolute() else DEFAULT_STATE_PATH
+    try:
+        if state_path.exists():
+            st = json.loads(state_path.read_text())
+            if isinstance(st, dict) and str(st.get('method','')).lower() == method.lower():
+                if hasattr(strategy, 'load_state') and isinstance(st.get('strategy'), dict):
+                    try:
+                        strategy.load_state(st.get('strategy'))  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                if isinstance(st.get('fill_template'), dict):
+                    try:
+                        fill_template.update(st.get('fill_template'))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     for idx in range(1, iterations + 1):
         suggestion, extra = strategy.suggest(fill=fill_template)
         cfg, params_record, weights = _merge_config(base, suggestion)
@@ -435,6 +455,22 @@ def run_sweep(
             best_summary = summary
             best_config = cfg
         fill_template.update(suggestion)
+
+        # Persist sweep state so live training can resume mid-sweep
+        try:
+            state_data = {
+                'method': method,
+                'metric': metric,
+                'goal': goal,
+                'iteration': idx,
+                'strategy': (strategy.state() if hasattr(strategy, 'state') else {}),
+                'fill_template': fill_template,
+                'timestamp': time.time(),
+            }
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(state_data, indent=2, default=str))
+        except Exception:
+            pass
 
     if best_config is None or best_summary is None:
         raise RuntimeError("Sweep did not produce a valid configuration")

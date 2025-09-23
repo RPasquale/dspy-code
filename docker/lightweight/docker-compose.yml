@@ -1,6 +1,7 @@
 services:
     dspy-agent:
       image: dspy-lightweight:latest
+      user: "10001:10001"
       build:
         context: .
         dockerfile: Dockerfile
@@ -22,14 +23,21 @@ services:
         - KAFKA_TOPIC_PREFIX
       entrypoint: ["/entrypoints/run_dspy_agent.sh"]
       volumes:
-        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
-        - /Users/robbiepasquale/dspy_stuff/logs:/workspace/logs:ro
-        - /Users/robbiepasquale:/host:rw
+        - ${WORKSPACE_DIR}:/workspace:rw
+        - ${WORKSPACE_DIR}/logs:/workspace/logs:ro
         - ./entrypoints:/entrypoints:ro
+        - dspy-cache:/home/agent/.dspy_cache:rw
       ports:
         - "127.0.0.1:8765:8765"
         - "127.0.0.1:18081:8081"
       restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
       deploy:
         resources:
           limits:
@@ -63,7 +71,7 @@ services:
             memory: 3G
             cpus: '2.0'
       healthcheck:
-        test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+        test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
         interval: 10s
         timeout: 5s
         retries: 20
@@ -75,12 +83,6 @@ services:
         - ALLOW_ANONYMOUS_LOGIN=yes
       ports:
         - "127.0.0.1:2181:2181"
-      healthcheck:
-        test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok || exit 1"]
-        interval: 10s
-        timeout: 3s
-        retries: 20
-        start_period: 5s
 
     kafka:
       image: bitnami/kafka:3.6
@@ -101,6 +103,68 @@ services:
         retries: 20
         start_period: 10s
 
+    infermesh:
+      image: ghcr.io/redbco/infermesh:latest
+      environment:
+        - INFER_PORT=9000
+      ports:
+        - "127.0.0.1:9000:9000"
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "curl -fsS http://localhost:9000/health || exit 1"]
+        interval: 10s
+        timeout: 3s
+        retries: 20
+        start_period: 10s
+
+    embed-worker:
+      build:
+        context: ../..
+        dockerfile: docker/lightweight/embed_worker.Dockerfile
+      depends_on:
+        kafka:
+          condition: service_healthy
+        infermesh:
+          condition: service_healthy
+      environment:
+        - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+        - EMBED_INPUT_TOPIC=embedding_input
+        - EMBED_OUTPUT_TOPIC=embeddings
+        - EMBED_GROUP=embed-worker
+        - INFERMESH_URL=http://infermesh:9000
+        - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+        - EMBED_BATCH_SIZE=64
+        - EMBED_MAX_WAIT_SEC=0.5
+        - EMBED_WRITE_PARQUET=1
+        - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings_imesh
+        - REDDB_URL
+        - REDDB_NAMESPACE=dspy
+        - REDDB_TOKEN
+        - REDDB_STREAM=embeddings
+        - REDDB_MODE=stream
+        - EMBED_METRICS_PORT=9100
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace
+        - ./scripts:/app/scripts:ro
+        - ./entrypoints:/entrypoints:ro
+      entrypoint: ["/entrypoints/run_embed_worker.sh"]
+      ports:
+        - "127.0.0.1:9101:9100"
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
+      healthcheck:
+        test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health >/dev/null 2>&1 || exit 1"]
+        interval: 20s
+        timeout: 5s
+        retries: 10
+        start_period: 15s
+
     spark:
       image: bitnami/spark:3.5
       depends_on:
@@ -115,7 +179,7 @@ services:
         - SPARK_LOCAL_DIRS=/tmp
         - SPARK_CONF_DIR=/opt/bitnami/spark/conf
       volumes:
-        - /Users/robbiepasquale/dspy_stuff:/workspace
+        - ${WORKSPACE_DIR}:/workspace
         - ./scripts:/app/scripts:ro
         - ./entrypoints:/entrypoints:ro
       entrypoint: ["/entrypoints/run_spark.sh"]
@@ -128,13 +192,23 @@ services:
 
     dspy-worker:
       image: dspy-lightweight:latest
+      user: "10001:10001"
       depends_on:
         kafka:
           condition: service_healthy
       entrypoint: ["/entrypoints/run_worker.sh", "app"]
       volumes:
-        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ${WORKSPACE_DIR}:/workspace:rw
         - ./entrypoints:/entrypoints:ro
+        - dspy-cache:/home/agent/.dspy_cache:rw
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
       healthcheck:
         test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker --topic app' >/dev/null 2>&1 || exit 1"]
         interval: 15s
@@ -144,13 +218,23 @@ services:
 
     dspy-worker-backend:
       image: dspy-lightweight:latest
+      user: "10001:10001"
       depends_on:
         kafka:
           condition: service_healthy
       entrypoint: ["/entrypoints/run_worker.sh", "backend"]
       volumes:
-        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ${WORKSPACE_DIR}:/workspace:rw
         - ./entrypoints:/entrypoints:ro
+        - dspy-cache:/home/agent/.dspy_cache:rw
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
       healthcheck:
         test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker --topic backend' >/dev/null 2>&1 || exit 1"]
         interval: 15s
@@ -160,13 +244,23 @@ services:
 
     dspy-worker-frontend:
       image: dspy-lightweight:latest
+      user: "10001:10001"
       depends_on:
         kafka:
           condition: service_healthy
       entrypoint: ["/entrypoints/run_worker.sh", "frontend"]
       volumes:
-        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ${WORKSPACE_DIR}:/workspace:rw
         - ./entrypoints:/entrypoints:ro
+        - dspy-cache:/home/agent/.dspy_cache:rw
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
       healthcheck:
         test: ["CMD-SHELL", "pgrep -f 'dspy-agent worker --topic frontend' >/dev/null 2>&1 || exit 1"]
         interval: 15s
@@ -174,8 +268,31 @@ services:
         retries: 10
         start_period: 10s
 
+    # One-off test runner for the lightweight image. Mounts your workspace and
+    # installs pytest into HOME (/workspace) to keep the image minimal.
+    agent-tests:
+      image: dspy-lightweight:latest
+      environment:
+        - HOME=/workspace
+      working_dir: /workspace
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace:rw
+      entrypoint: ["/bin/sh", "-lc"]
+      command: |
+        "python -m pip install --user -q pytest && \
+         python -m pytest -q"
+      restart: "no"
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
+
     dspy-code-watch:
       image: dspy-lightweight:latest
+      user: "10001:10001"
       depends_on:
         kafka:
           condition: service_healthy
@@ -187,7 +304,15 @@ services:
         CodeWatcher(Path('/workspace')).run()
         PY
       volumes:
-        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ${WORKSPACE_DIR}:/workspace:rw
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
       healthcheck:
         test: ["CMD-SHELL", "pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"]
         interval: 15s
@@ -197,6 +322,7 @@ services:
 
     dspy-code-indexer:
       image: dspy-lightweight:latest
+      user: "10001:10001"
       depends_on:
         kafka:
           condition: service_healthy
@@ -207,7 +333,15 @@ services:
         CodeIndexerWorker('kafka:9092').run()
         PY
       volumes:
-        - /Users/robbiepasquale/dspy_stuff:/workspace:rw
+        - ${WORKSPACE_DIR}:/workspace:rw
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
       healthcheck:
         test: ["CMD-SHELL", "pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"]
         interval: 15s
@@ -217,6 +351,7 @@ services:
 
     dspy-router:
       image: dspy-lightweight:latest
+      user: "10001:10001"
       depends_on:
         kafka:
           condition: service_healthy
@@ -230,5 +365,128 @@ services:
         retries: 10
         start_period: 10s
 
+    rl-trainer:
+      image: dspy-lightweight:latest
+      user: "10001:10001"
+      entrypoint: ["/bin/bash","-lc"]
+      command: >-
+        python -m dspy_agent.training.entrypoint \
+          --workspace /workspace \
+          --signature CodeContextSig \
+          --verifiers dspy_agent.verifiers.custom \
+          --steps 200 \
+          --env development
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace:rw
+      restart: on-failure
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
+    emb-indexer:
+      build:
+        context: ../..
+        dockerfile: docker/lightweight/embed_worker.Dockerfile
+      depends_on:
+        kafka:
+          condition: service_healthy
+      environment:
+        - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+        - EMB_INDEX_TOPIC=embeddings
+        - EMB_INDEX_GROUP=emb-indexer
+        - REDDB_URL
+        - REDDB_NAMESPACE=dspy
+        - REDDB_TOKEN
+        - REDDB_INDEX_STREAM=emb_index
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace
+        - ./scripts:/app/scripts:ro
+        - ./entrypoints:/entrypoints:ro
+      entrypoint: ["/entrypoints/run_emb_indexer.sh"]
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
+    spark-vectorizer:
+      image: bitnami/spark:3.5
+      depends_on:
+        kafka:
+          condition: service_healthy
+      user: "0:0"
+      environment:
+        - HOME=/opt/bitnami/spark
+        - USER=spark
+        - SPARK_USER=spark
+        - HADOOP_USER_NAME=spark
+        - SPARK_LOCAL_DIRS=/tmp
+        - SPARK_CONF_DIR=/opt/bitnami/spark/conf
+        - KAFKA_BOOTSTRAP=kafka:9092
+        - SPARK_KAFKA_TOPICS=agent.results
+        - VEC_OUTPUT_DIR=/workspace/vectorized/embeddings
+        - VEC_CHECKPOINT=/workspace/.dspy_checkpoints/vectorizer
+        - SINK_INPUT_TOPIC=embedding_input
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace
+        - ./scripts:/app/scripts:ro
+        - ./entrypoints:/entrypoints:ro
+      entrypoint: ["/entrypoints/run_spark_vectorizer.sh"]
+      ports:
+        - "127.0.0.1:4041:4040"
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'spark_vectorize.py' >/dev/null 2>&1 || exit 1"]
+        interval: 30s
+        timeout: 5s
+        retries: 10
+        start_period: 20s
+
+    smoke:
+      build:
+      context: ../..
+      dockerfile: docker/lightweight/embed_worker.Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      infermesh:
+        condition: service_healthy
+      spark-vectorizer:
+        condition: service_healthy
+      embed-worker:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - RESULTS_TOPIC=agent.results
+      - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings_imesh
+      - N_MESSAGES=5
+      - SLEEP_SEC=6
+    volumes:
+      - ${WORKSPACE_DIR}:/workspace
+      - ./scripts:/app/scripts:ro
+      - ./entrypoints:/entrypoints:ro
+    entrypoint: ["/entrypoints/run_smoke.sh"]
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+
 volumes:
   ollama: {}
+  dspy-cache: {}

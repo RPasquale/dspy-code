@@ -6,6 +6,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional, Tuple, Dict
+import json
+import time
+import urllib.request
+import urllib.error
 import subprocess
 import shlex
 
@@ -14,12 +18,79 @@ def _which(cmd: str) -> Optional[str]:
     return shutil.which(cmd)
 
 
+def _guardrails_endpoint() -> Optional[str]:
+    # Endpoint must be reachable from container; use DSPY_GUARDRAILS_ENDPOINT or default to host.docker.internal:8080
+    ep = os.getenv('DSPY_GUARDRAILS_ENDPOINT')
+    if ep:
+        return ep.rstrip('/')
+    # Default: try common host alias
+    return 'http://host.docker.internal:8080'
+
+
+def _guardrails_enabled() -> bool:
+    val = os.getenv('DSPY_GUARDRAILS_ACTIONS', '').strip().lower()
+    if val in {'1', 'true', 'yes', 'on'}:
+        return True
+    # Fallback: check remote state if endpoint configured/assumed
+    ep = _guardrails_endpoint()
+    try:
+        with urllib.request.urlopen(f"{ep}/api/guardrails/state", timeout=2) as r:
+            obj = json.loads(r.read().decode('utf-8'))
+            return bool(obj.get('enabled'))
+    except Exception:
+        return False
+
+
+def _propose_and_wait(kind: str, payload: Dict[str, object], timeout_sec: int = 300, poll_sec: float = 2.0) -> Tuple[bool, str]:
+    endpoint = _guardrails_endpoint()
+    if not endpoint:
+        return False, 'guardrails endpoint not configured'
+    try:
+        url = f"{endpoint}/api/guardrails/propose-action"
+        data = json.dumps({'type': kind, 'payload': payload}).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            obj = json.loads(resp.read().decode('utf-8'))
+            action_id = obj.get('id')
+    except Exception as e:
+        return False, f'guardrails propose failed: {e}'
+    # Poll status
+    t0 = time.time()
+    while time.time() - t0 < float(timeout_sec):
+        try:
+            sreq = urllib.request.Request(f"{endpoint}/api/guardrails/action-status?id={action_id}")
+            with urllib.request.urlopen(sreq, timeout=5) as r:
+                st = json.loads(r.read().decode('utf-8'))
+                status = st.get('status')
+                if status == 'approved':
+                    return True, 'approved'
+                if status == 'rejected':
+                    return False, f"rejected: {st.get('comment') or ''}"
+        except Exception:
+            pass
+        time.sleep(poll_sec)
+    return False, 'guardrails timeout waiting for approval'
+
+
 def apply_unified_patch(patch_text: str, cwd: Path) -> Tuple[bool, str]:
     """Attempt to apply a unified diff patch using git or patch.
 
     Returns (ok, message).
     """
     cwd = cwd.resolve()
+    # Guardrails: optionally require approval before applying
+    if _guardrails_enabled():
+        try:
+            summary = summarize_patch(patch_text)
+        except Exception:
+            summary = {"files": 0, "added_lines": 0, "removed_lines": 0}
+        ok, msg = _propose_and_wait('patch_apply', {
+            'workspace': str(cwd),
+            'summary': summary,
+            'patch_preview': (patch_text or '')[:5000],
+        })
+        if not ok:
+            return False, f'guardrails blocked patch: {msg}'
     git = _which("git")
     patch = _which("patch")
 

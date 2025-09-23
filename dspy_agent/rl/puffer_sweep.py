@@ -295,6 +295,23 @@ class RandomStrategy:
             "is_failure": is_failure,
         })
 
+    # Lightweight persistence API
+    def state(self) -> Dict[str, object]:  # pragma: no cover - simple JSON state
+        return {
+            "suggestion": (self.suggestion.tolist() if isinstance(self.suggestion, np.ndarray) else None),
+            "observations": [
+                {"input": list(map(float, obs.get("input", []))), "output": float(obs.get("output", 0.0)), "cost": float(obs.get("cost", 0.0)), "is_failure": bool(obs.get("is_failure", False))}
+                for obs in self.success_observations
+            ],
+        }
+
+    def load_state(self, data: Mapping[str, object]) -> None:  # pragma: no cover - simple JSON state
+        try:
+            self.suggestion = np.array(data.get("suggestion") or []) if data.get("suggestion") is not None else None
+            self.success_observations = list(data.get("observations") or [])
+        except Exception:
+            pass
+
 
 class ParetoGenetic:
     def __init__(
@@ -343,6 +360,23 @@ class ParetoGenetic:
             "cost": float(cost),
             "is_failure": is_failure,
         })
+
+    # Lightweight persistence API
+    def state(self) -> Dict[str, object]:  # pragma: no cover - simple JSON state
+        return {
+            "observations": [
+                {"input": list(map(float, obs.get("input", []))), "output": float(obs.get("output", 0.0)), "cost": float(obs.get("cost", 0.0)), "is_failure": bool(obs.get("is_failure", False))}
+                for obs in self.success_observations
+            ],
+            "suggestion": (self.suggestion.tolist() if isinstance(self.suggestion, np.ndarray) else None),
+        }
+
+    def load_state(self, data: Mapping[str, object]) -> None:  # pragma: no cover - simple JSON state
+        try:
+            self.success_observations = list(data.get("observations") or [])
+            self.suggestion = np.array(data.get("suggestion") or []) if data.get("suggestion") is not None else None
+        except Exception:
+            pass
 
 
 def _require_pyro() -> None:
@@ -603,6 +637,184 @@ class Carbs:
         self._last_input = None
         self._last_candidate = None
 
+    # Persistence hooks are no-ops for external CARBS
+    def state(self) -> Dict[str, object]:  # pragma: no cover - external
+        return {}
+    def load_state(self, data: Mapping[str, object]) -> None:  # pragma: no cover - external
+        return
+
+
+# ------------------------------
+# Native efficient strategies
+# ------------------------------
+
+class EProtein:
+    """Native, dependency-free GP-like strategy using kernel ridge regression.
+
+    Approximates GP-UCB: fits RBF kernel ridge model to normalized inputs and
+    selects suggestions that maximize mu(x) + kappa * sigma(x).
+    """
+
+    def __init__(self, sweep_config: Mapping[str, object], *, kappa: float = 1.2, l2: float = 1e-3, global_search_scale: float = 1.0, random_suggestions: int = 256) -> None:
+        self.hyperparameters = Hyperparameters(sweep_config)
+        self.kappa = float(kappa)
+        self.l2 = float(l2)
+        self.global_search_scale = float(global_search_scale)
+        self.random_suggestions = int(random_suggestions)
+        self.X: Optional[np.ndarray] = None  # shape (n, d)
+        self.y: Optional[np.ndarray] = None  # shape (n,)
+        self.alpha: Optional[np.ndarray] = None
+        self.L: Optional[np.ndarray] = None  # Cholesky of (K + l2 I)
+        self.length_scale: Optional[float] = None
+
+    def _rbf(self, A: np.ndarray, B: np.ndarray, l: float) -> np.ndarray:
+        # Pairwise squared distances
+        A2 = np.sum(A*A, axis=1)[:, None]
+        B2 = np.sum(B*B, axis=1)[None, :]
+        d2 = np.maximum(A2 + B2 - 2 * A @ B.T, 0.0)
+        return np.exp(-0.5 * d2 / (l*l))
+
+    def _fit(self) -> None:
+        if self.X is None or self.y is None or len(self.y) == 0:
+            self.alpha = None; self.L = None; return
+        X = self.X; y = self.y
+        # Median distance heuristic for length scale
+        if X.shape[0] >= 2:
+            # sample pairs for efficiency
+            idx = np.random.choice(X.shape[0], size=min(128, X.shape[0]), replace=False)
+            Xs = X[idx]
+            D = np.sqrt(np.maximum(0.0, np.sum((Xs[:, None, :] - Xs[None, :, :])**2, axis=2)))
+            med = np.median(D[D>0]) if np.any(D>0) else 1.0
+            self.length_scale = float(med) if med > 0 else 1.0
+        else:
+            self.length_scale = 1.0
+        l = float(self.length_scale)
+        K = self._rbf(X, X, l)
+        K[np.diag_indices_from(K)] += self.l2
+        try:
+            self.L = np.linalg.cholesky(K)
+            self.alpha = np.linalg.solve(self.L.T, np.linalg.solve(self.L, y))
+        except np.linalg.LinAlgError:
+            # Fallback to ridge (pinv)
+            self.alpha = np.linalg.pinv(K) @ y
+            self.L = None
+
+    def _predict(self, Xc: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Return (mu, sigma)
+        if self.X is None or self.y is None or self.alpha is None or self.length_scale is None:
+            mu = np.zeros(Xc.shape[0]); sigma = np.ones(Xc.shape[0])
+            return mu, sigma
+        k = self._rbf(Xc, self.X, float(self.length_scale))
+        mu = k @ self.alpha
+        if self.L is not None:
+            v = np.linalg.solve(self.L, k.T)
+            var = np.maximum(1.0 - np.sum(v*v, axis=0), 1e-6)
+        else:
+            # approximate variance
+            var = np.maximum(1.0 - np.sum(k*k, axis=1) / max(1, self.X.shape[0]), 1e-6)
+        return mu, np.sqrt(var)
+
+    def suggest(self, fill: Optional[MutableMapping[str, object]] = None) -> Tuple[MutableMapping[str, object], Dict[str, object]]:
+        # Candidate pool: random around centers + (optionally) around past bests
+        centers = self.hyperparameters.search_centers[None, :]
+        rs = self.hyperparameters.sample(self.random_suggestions, mu=centers, scale=self.global_search_scale)
+        self._fit()
+        mu, sigma = self._predict(rs)
+        ucb = mu + self.kappa * sigma
+        best_idx = int(np.argmax(ucb))
+        best = rs[best_idx]
+        return self.hyperparameters.to_dict(best, fill), {"method": "eprotein"}
+
+    def observe(self, hypers: Mapping[str, object], score: float, cost: float, *, is_failure: bool = False) -> None:
+        x = self.hyperparameters.from_dict(hypers)
+        y = float(score)
+        if self.X is None:
+            self.X = x[None, :]; self.y = np.array([y], dtype=float)
+        else:
+            self.X = np.vstack([self.X, x[None, :]])
+            self.y = np.concatenate([self.y, np.array([y], dtype=float)])
+
+    def state(self) -> Dict[str, object]:  # pragma: no cover - simple JSON state
+        return {
+            "X": (self.X.tolist() if self.X is not None else []),
+            "y": (self.y.tolist() if self.y is not None else []),
+            "kappa": self.kappa,
+            "l2": self.l2,
+            "gscale": self.global_search_scale,
+        }
+
+    def load_state(self, data: Mapping[str, object]) -> None:  # pragma: no cover - simple JSON state
+        try:
+            X = np.array(data.get("X") or [])
+            y = np.array(data.get("y") or [])
+            if X.size and y.size and X.shape[0] == y.shape[0]:
+                self.X = X; self.y = y
+        except Exception:
+            pass
+
+
+class ECarbs:
+    """Native, dependency-free cost-aware Pareto + local search.
+
+    Maintains a Pareto set of (score,cost) and perturbs elite points to explore
+    efficiently without external libraries.
+    """
+
+    def __init__(self, sweep_config: Mapping[str, object], *, global_search_scale: float = 1.0, elite_frac: float = 0.25, suggestions_per_round: int = 8) -> None:
+        self.hyperparameters = Hyperparameters(sweep_config)
+        self.global_search_scale = float(global_search_scale)
+        self.elite_frac = float(elite_frac)
+        self.suggestions_per_round = int(suggestions_per_round)
+        self.success_observations: List[Dict[str, object]] = []
+
+    def _elite(self) -> np.ndarray:
+        if not self.success_observations:
+            return self.hyperparameters.search_centers[None, :]
+        obs = self.success_observations
+        cand, idxs = pareto_points([{"output": float(o["output"]), "cost": float(o["cost"]) } for o in obs])
+        X = np.array([obs[i]["input"] for i in idxs])
+        # top K by output within Pareto
+        k = max(1, int(len(X) * self.elite_frac))
+        order = np.argsort([-obs[i]["output"] for i in idxs])[:k]
+        return X[order]
+
+    def suggest(self, fill: Optional[MutableMapping[str, object]] = None) -> Tuple[MutableMapping[str, object], Dict[str, object]]:
+        elite = self._elite()
+        n = max(self.suggestions_per_round, 1)
+        mu = elite if len(elite.shape) == 2 else elite[None, :]
+        cand = self.hyperparameters.sample(n, mu=mu, scale=self.global_search_scale)
+        # Heuristic: pick first for diversity; otherwise pick one with highest projection on elite mean
+        if cand.shape[0] == 1:
+            best = cand[0]
+        else:
+            center = np.mean(mu, axis=0)
+            scores = -np.linalg.norm(cand - center[None, :], axis=1)
+            best = cand[int(np.argmax(scores))]
+        return self.hyperparameters.to_dict(best, fill), {"method": "ecarbs"}
+
+    def observe(self, hypers: Mapping[str, object], score: float, cost: float, *, is_failure: bool = False) -> None:
+        x = self.hyperparameters.from_dict(hypers)
+        self.success_observations.append({
+            "input": x,
+            "output": float(score),
+            "cost": float(cost),
+            "is_failure": bool(is_failure),
+        })
+
+    def state(self) -> Dict[str, object]:  # pragma: no cover - simple JSON state
+        return {
+            "observations": [
+                {"input": list(map(float, obs.get("input", []))), "output": float(obs.get("output", 0.0)), "cost": float(obs.get("cost", 0.0)), "is_failure": bool(obs.get("is_failure", False))}
+                for obs in self.success_observations
+            ],
+        }
+
+    def load_state(self, data: Mapping[str, object]) -> None:  # pragma: no cover - simple JSON state
+        try:
+            self.success_observations = list(data.get("observations") or [])
+        except Exception:
+            pass
+
 
 def get_strategy(name: str):
     key = name.lower()
@@ -611,9 +823,21 @@ def get_strategy(name: str):
     if key in {"pareto", "pareto_genetic", "paretogenetic"}:
         return ParetoGenetic
     if key == "protein":
+        # Prefer native variant when Pyro unavailable
+        if not _HAS_PYRO:
+            return EProtein
         return Protein
     if key == "carbs":
-        return Carbs
+        try:
+            from carbs import CARBS  # type: ignore
+            _ = CARBS
+            return Carbs
+        except Exception:
+            return ECarbs
+    if key in {"eprotein", "native_protein"}:
+        return EProtein
+    if key in {"ecarbs", "native_carbs"}:
+        return ECarbs
     raise ValueError(f"Unknown sweep method: {name}")
 
 

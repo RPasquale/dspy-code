@@ -1,0 +1,46 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # nightly at 03:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  nightly-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install frontend deps
+        working-directory: frontend/react-dashboard
+        run: |
+          npm ci
+          npm run build
+      - name: Start dashboard server
+        run: |
+          nohup python -m enhanced_dashboard_server >/dev/null 2>&1 &
+          sleep 3
+      - name: Smoke test
+        run: |
+          bash scripts/smoke_test.sh || true
+      - name: Short sweeps
+        env:
+          METHOD: eprotein
+          ITER: 4
+        run: |
+          bash scripts/stress_sweeps.sh || true
+      - name: Retention audit
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+          bash scripts/retention_audit.sh || true
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dspy_reports
+          path: .dspy_reports/**
+

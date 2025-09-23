@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .rlkit import RLToolEnv, ToolAction, make_bandit, BaseBandit
 
@@ -52,6 +52,62 @@ class AsyncStats:
         return {"count": float(self.processed), "avg_reward": avg}
 
 
+class PrioritizedReplayBuffer:
+    """Tiny prioritized replay for judged packets.
+
+    Stores tuples (action_index, reward, obs_next) with a priority; samples
+    biased toward higher |reward|. This is safe for bandit updates which are
+    stateless per update.
+    """
+
+    def __init__(self, capacity: int = 1024, alpha: float = 0.6) -> None:
+        self.capacity = int(max(1, capacity))
+        self.alpha = float(alpha)
+        self._data: List[Tuple[int, float, List[float]]] = []
+        self._prior: List[float] = []
+        self._pos = 0
+
+    def push(self, action_index: int, reward: float, next_obs: List[float]) -> None:
+        p = (abs(float(reward)) + 1e-6) ** self.alpha
+        if len(self._data) < self.capacity:
+            self._data.append((action_index, float(reward), list(next_obs)))
+            self._prior.append(p)
+        else:
+            self._data[self._pos] = (action_index, float(reward), list(next_obs))
+            self._prior[self._pos] = p
+            self._pos = (self._pos + 1) % self.capacity
+
+    def sample(self, k: int) -> List[Tuple[int, float, List[float]]]:
+        if not self._data:
+            return []
+        k = max(1, min(k, len(self._data)))
+        # Weighted random by priority
+        import random as _r
+        total = sum(self._prior)
+        if total <= 0:
+            idxs = [_r.randrange(len(self._data)) for _ in range(k)]
+        else:
+            probs = [p / total for p in self._prior]
+            # cumulative distribution
+            cdf = []
+            acc = 0.0
+            for p in probs:
+                acc += p; cdf.append(acc)
+            idxs = []
+            for _ in range(k):
+                u = _r.random()
+                # binary search
+                lo, hi = 0, len(cdf) - 1
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if u <= cdf[mid]:
+                        hi = mid
+                    else:
+                        lo = mid + 1
+                idxs.append(lo)
+        return [self._data[i] for i in idxs]
+
+
 class AsyncRLTrainer:
     """Coordinate asynchronous rollout, judging, and learner updates."""
 
@@ -84,6 +140,9 @@ class AsyncRLTrainer:
         self._stop = threading.Event()
         self._stats = AsyncStats()
         self._step_counter = 0
+        # Prioritized replay buffer (opt-in lightweight)
+        self._replay = PrioritizedReplayBuffer(capacity=2048, alpha=0.6)
+        self._replay_samples = 4
 
     # Public API -----------------------------------------------------------
 
@@ -164,6 +223,11 @@ class AsyncRLTrainer:
                 step_id=pkt.step_id,
             )
             self._learn_queue.put(judged)
+            # Push to replay with priority on absolute reward
+            try:
+                self._replay.push(judged.action_index, judged.reward, judged.next_obs)
+            except Exception:
+                pass
             try:
                 self._rollout_queue.put(env, timeout=0.1)
             except queue.Full:
@@ -184,6 +248,12 @@ class AsyncRLTrainer:
             with self._policy_lock:
                 assert self._policy is not None
                 self._policy.update(judged.action_index, judged.reward, judged.next_obs)
+                # Lightweight replay updates
+                try:
+                    for a_idx, rew, nxt in self._replay.sample(self._replay_samples):
+                        self._policy.update(a_idx, rew, nxt)
+                except Exception:
+                    pass
             self._stats.add(judged.reward)
             now = time.time()
             if now - last_log >= self.log_interval:

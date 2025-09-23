@@ -1,8 +1,8 @@
-# 🚀 Streamlined Development Workflow for Blampert
+# 🚀 Streamlined Development Workflow for DSPy Code
 
 ## Overview
 
-Blampert now includes a **streamlined development workflow** that makes it super easy for human users to publish packages, push to GitHub, and update version numbers. No more complex commands or manual steps!
+DSPy Code now includes a **streamlined development workflow** that makes it super easy for human users to publish packages, push to GitHub, and update version numbers. No more complex commands or manual steps!
 
 ## 🎯 **Super Easy Commands**
 
@@ -12,7 +12,7 @@ Blampert now includes a **streamlined development workflow** that makes it super
 ./scripts/dev.sh quick "Fix bug in CLI"
 
 # Or from within the agent
-blampert> dev quick "Fix bug in CLI"
+dspy-code> dev quick "Fix bug in CLI"
 ```
 
 ### **Full Release Workflow**
@@ -23,7 +23,7 @@ blampert> dev quick "Fix bug in CLI"
 ./scripts/dev.sh release major    # 0.1.0 → 1.0.0
 
 # Or from within the agent
-blampert> release patch
+dspy-code> release patch
 ```
 
 ### **Individual Commands**
@@ -55,14 +55,14 @@ When using the enhanced coding mode, you can run all these commands directly:
 
 ```bash
 # Start the agent in coding mode
-uv run blampert --coding-mode
+uv run dspy-code --coding-mode
 
 # Then use the dev commands
-blampert> dev quick "Add new feature"
-blampert> dev test
-blampert> dev build
-blampert> release minor
-blampert> publish
+dspy-code> dev quick "Add new feature"
+dspy-code> dev test
+dspy-code> dev build
+dspy-code> release minor
+dspy-code> publish
 ```
 
 ## 📋 **Complete Workflow Examples**
@@ -160,14 +160,14 @@ The agent learns from your development patterns:
 ### **Use the Agent for Everything**
 ```bash
 # Start the agent
-uv run blampert --coding-mode
+uv run dspy-code --coding-mode
 
 # Do all your development through the agent
-blampert> dev quick "Fix bug"
-blampert> dev test
-blampert> release patch
-blampert> learn "successful patch release workflow"
-blampert> feedback 9
+dspy-code> dev quick "Fix bug"
+dspy-code> dev test
+dspy-code> release patch
+dspy-code> learn "successful patch release workflow"
+dspy-code> feedback 9
 ```
 
 ### **Automate Everything**

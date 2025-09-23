@@ -14,6 +14,8 @@ class Storage(Protocol):
     def delete(self, key: str) -> None: ...
     def append(self, stream: str, value: Any) -> None: ...
     def read(self, stream: str, start: int = 0, count: int = 100) -> Iterable[Tuple[int, Any]]: ...
+    # Optional, best-effort diagnostics
+    def health_check(self) -> dict: ...
 
 
 class RedDBStorage:
@@ -110,6 +112,40 @@ class RedDBStorage:
         req = _req.Request(self._http_url(path), headers=self._headers(), method="DELETE")
         with _req.urlopen(req, timeout=5): return None
 
+    # -----------------
+    # Health diagnostics
+    # -----------------
+    def health_check(self) -> dict:
+        result = {
+            "backend": "reddb",
+            "namespace": self.ns,
+            "mode": "http" if self._http_enabled else "memory",
+            "ok": True,
+            "details": "",
+        }
+        if not self._http_enabled:
+            result["details"] = "in-memory fallback"
+            return result
+        try:
+            try:
+                req = _req.Request(self._http_url("/health"), headers=self._headers(), method="GET")
+                with _req.urlopen(req, timeout=2) as resp:
+                    result["http_health"] = int(resp.getcode() or 0)
+            except Exception as e:
+                result["http_health_error"] = str(e)
+            key = f"health:echo:lightweight"
+            payload = {"ts": 0}
+            self._http_put(f"/api/kv/{self.ns}/{key}", payload)
+            echoed = self._http_get(f"/api/kv/{self.ns}/{key}")
+            self._http_delete(f"/api/kv/{self.ns}/{key}")
+            result["kv_echo"] = bool(echoed is not None)
+            result["ok"] = True
+            result["details"] = "http ok"
+        except Exception as e:
+            result["ok"] = False
+            result["details"] = f"http error: {e}"
+        return result
+
 
 def get_storage() -> Optional[Storage]:
     from .config import get_settings
@@ -117,4 +153,3 @@ def get_storage() -> Optional[Storage]:
     if s.db_backend.lower() == "reddb":
         return RedDBStorage(url=s.reddb_url, namespace=s.reddb_namespace or "dspy")
     return None
-

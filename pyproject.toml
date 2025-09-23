@@ -3,11 +3,11 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "blampert"
+name = "dspy-code"
 version = "0.1.0"
 description = "Blampert - A powerful coding assistant that learns and improves through reinforcement learning."
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [
     { name = "Your Name" }
@@ -21,12 +21,37 @@ dependencies = [
     "transformers>=4.51.0",
     "confluent-kafka>=2.3.0",
     "psutil>=5.9.5",
+    "websockets>=12.0",
+    "asyncio-mqtt>=0.16.1",
+    # RL extras promoted to default so advanced training is always available
+    "pufferlib>=3.0.0",
+    "gymnasium>=0.27",
+    "torch>=2.0.0",
+    # External verifiers package (best-effort; optional at runtime if unavailable)
+    "verifiers @ git+https://github.com/willccbb/verifiers.git",
 ]
 
 [project.scripts]
+# New primary entrypoints
+dspy-code = "dspy_agent.cli:app"
+dspy-code-agent = "dspy_agent.cli:app"
+dspy-code-coder = "dspy_agent.cli:app"
+dspy-code-monitor = "scripts.realtime_monitoring_server:main"
+dspy-code-dashboard = "enhanced_dashboard_server:start_enhanced_dashboard_server"
+dspy-code-train = "scripts.real_agent_trainer:main"
+dspy-code-workspace = "scripts.agent_workspace_manager:main"
+dspy-code-rl-sample = "scripts.rl_samples:main"
+dspy-code-rl-showcase = "scripts.rl_showcase:main"
+# Backward-compatible aliases (will be removed in a future release)
 blampert = "dspy_agent.cli:app"
 blampert-agent = "dspy_agent.cli:app"
 blampert-coder = "dspy_agent.cli:app"
+blampert-monitor = "scripts.realtime_monitoring_server:main"
+blampert-dashboard = "enhanced_dashboard_server:start_enhanced_dashboard_server"
+blampert-train = "scripts.real_agent_trainer:main"
+blampert-workspace = "scripts.agent_workspace_manager:main"
+blampert-rl-sample = "scripts.rl_samples:main"
+blampert-rl-showcase = "scripts.rl_showcase:main"
 
 [project.urls]
 Homepage = "https://github.com/RPasquale/dspy_stuff"
@@ -36,10 +61,6 @@ RedDB = "https://github.com/redbco/redb-open.git"
 
 [project.optional-dependencies]
 rl = [
-    "pufferlib>=3.0.0; platform_machine == \"x86_64\"",
-    "gymnasium>=0.27",
-    "torch>=2.0.0",
-    "verifiers @ git+https://github.com/willccbb/verifiers.git",
     "pyro-ppl>=1.9.0",
     "carbs>=0.2.0",
 ]
@@ -51,4 +72,7 @@ dev-dependencies = [
 package = true
 
 [tool.setuptools.packages.find]
-include = ["dspy_agent", "dspy_agent.*"]
+include = ["dspy_agent", "dspy_agent.*", "scripts", "frontend"]
+
+[tool.setuptools.package-data]
+"frontend" = ["**/*"]

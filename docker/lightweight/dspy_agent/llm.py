@@ -5,6 +5,7 @@ import os
 from typing import Optional, Tuple, List
 
 import dspy
+from .agents.adapter import StrictJSONAdapter
 
 from .config import get_settings
 
@@ -140,17 +141,47 @@ def configure_lm(
             lm_kwargs["api_base"] = effective_base_url
 
     # Instantiate the LM using DSPy v3 API (via LiteLLM)
-    _clamp_litellm_timeout(30)
+    _clamp_litellm_timeout(60)
     lm_kwargs.update({
-        "timeout": 30,            # DSPy/LiteLLM timeout
-        "request_timeout": 30,    # Some LiteLLM adapters use this key
-        "max_retries": 2,
-        "num_retries": 2,
+        "timeout": 60,            # DSPy/LiteLLM timeout - increased for better reliability
+        "request_timeout": 60,    # Some LiteLLM adapters use this key
+        "max_retries": 3,         # Increased retries
+        "num_retries": 3,
     })
     
     lm = dspy.LM(
         model=provider_model,
         **lm_kwargs,
     )
-    dspy.configure(lm=lm)
+    try:
+        dspy.configure(lm=lm, adapter=StrictJSONAdapter())
+    except TypeError:
+        dspy.configure(lm=lm)
     return lm
+
+
+class temporary_lm:
+    """Context manager to temporarily set the active DSPy LM."""
+    def __init__(self, lm: Optional[dspy.LM]) -> None:
+        self._lm = lm
+        self._prev = None
+
+    def __enter__(self):
+        try:
+            self._prev = getattr(dspy.settings, 'lm', None)
+        except Exception:
+            self._prev = None
+        try:
+            if self._lm is not None:
+                dspy.settings.configure(lm=self._lm)
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._prev is not None:
+                dspy.settings.configure(lm=self._prev)
+        except Exception:
+            pass
+        return False

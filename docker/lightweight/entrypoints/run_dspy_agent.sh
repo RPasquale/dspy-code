@@ -17,6 +17,10 @@ LOGS_DIR=${DSPY_LOGS:-${WORKSPACE}/logs}
 mkdir -p "$WORKSPACE"
 mkdir -p "$LOGS_DIR"
 
+# Ensure DSPy cache can write under workspace (root FS is read-only)
+export HOME="$WORKSPACE"
+mkdir -p "$HOME/.dspy_cache" || true
+
 dspy-agent stream-topics-create --bootstrap kafka:9092 || true
 
 AUTO=${DSPY_AUTO_START:-false}

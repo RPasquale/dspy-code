@@ -13,15 +13,63 @@ import math
 import random
 import shlex
 import time
+import logging
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
 
+logger = logging.getLogger(__name__)
+
+# Try to import PufferLib, fall back to simple RL if not available
+try:
+    import pufferlib
+    PUFFERLIB_AVAILABLE = True
+    logger.info("PufferLib available - using full RL stack")
+except ImportError:
+    PUFFERLIB_AVAILABLE = False
+    logger.warning("PufferLib not available - using fallback RL system")
+    from .fallback_rl import get_fallback_trainer, train_fallback_rl, select_fallback_action, get_fallback_stats
+
 
 # ----------------
 # RL Environment
 # ----------------
+
+def train_rl_with_fallback(state: Dict[str, Any], action: str, reward: float, 
+                          next_state: Dict[str, Any], done: bool = False) -> Dict[str, Any]:
+    """Train RL system with fallback support."""
+    if PUFFERLIB_AVAILABLE:
+        # Use full PufferLib RL system
+        # TODO: Implement PufferLib training
+        return {"status": "pufferlib_training", "reward": reward}
+    else:
+        # Use fallback RL system
+        return train_fallback_rl(state, action, reward, next_state, done)
+
+
+def select_rl_action_with_fallback(state: Dict[str, Any], available_actions: List[str]) -> str:
+    """Select RL action with fallback support."""
+    if PUFFERLIB_AVAILABLE:
+        # Use full PufferLib RL system
+        # TODO: Implement PufferLib action selection
+        return random.choice(available_actions) if available_actions else "plan"
+    else:
+        # Use fallback RL system
+        return select_fallback_action(state, available_actions)
+
+
+def get_rl_stats_with_fallback() -> Dict[str, Any]:
+    """Get RL statistics with fallback support."""
+    if PUFFERLIB_AVAILABLE:
+        # Use full PufferLib RL system
+        return {"status": "pufferlib", "available": True}
+    else:
+        # Use fallback RL system
+        stats = get_fallback_stats()
+        stats["status"] = "fallback"
+        stats["available"] = True
+        return stats
 
 class ToolAction(IntEnum):
     RUN_TESTS = 0
@@ -120,6 +168,7 @@ class RLToolEnv:
         self._episode_len = max(1, episode_len)
         self._t = 0
         self._last_obs: List[float] = []
+        self._signature_name: Optional[str] = None
         actions: List[ToolAction] = []
         seen: set[ToolAction] = set()
         if cfg.allowed_actions:
@@ -174,7 +223,9 @@ class RLToolEnv:
         self._t += 1
         terminated = self._t >= self._episode_len
         truncated = False
-        info = {"tool": self._action_names[idx], "verifier_scores": details}
+        info: Dict[str, Any] = {"tool": self._action_names[idx], "verifier_scores": details}
+        if self._signature_name:
+            info["signature_name"] = self._signature_name
         return obs, float(reward), bool(terminated), bool(truncated), info
 
     @property
@@ -190,6 +241,23 @@ class RLToolEnv:
         base = len(list(self._cfg.verifiers))
         ctx = len(self._cfg.context_provider() or []) if self._cfg.context_provider else 0
         return base + ctx
+
+    # Allow attaching external feature provider post-init (for vector feeder integration)
+    def set_context_provider(self, provider: ContextProvider) -> None:
+        self._cfg.context_provider = provider
+        # Update gym observation space if available
+        if _HAS_GYM:
+            try:
+                base = len(list(self._cfg.verifiers))
+                ctx_len = len(self._cfg.context_provider() or []) if self._cfg.context_provider else 0
+                obs_dim = max(1, base + ctx_len)
+                self.observation_space = _spaces.Box(low=-1e9, high=1e9, shape=(obs_dim,), dtype=_np.float32)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    # Optional: tag the env with a signature for analytics persistence
+    def set_signature_name(self, name: Optional[str]) -> None:
+        self._signature_name = (name or "").strip() or None
 
 
 # ------------------------
@@ -328,8 +396,10 @@ class EpisodeStats:
 
 
 class VectorRunner:
-    def __init__(self, envs: List[Any], policy: Any) -> None:
-        self.envs = envs; self.policy = policy
+    def __init__(self, envs: List[Any], policy: Any, analytics_cb: Optional[Callable[[int, Dict[str, Any], float], Optional[Dict[str, Any]]]] = None) -> None:
+        self.envs = envs
+        self.policy = policy
+        self.analytics_cb = analytics_cb
     def run(self, steps: int) -> EpisodeStats:
         obs: List[List[float]] = []; infos: List[Dict[str, Any]] = []
         for e in self.envs:
@@ -340,6 +410,21 @@ class VectorRunner:
                 a = self.policy.select(obs[i]); o2, r, done, trunc, info = e.step(a)
                 self.policy.update(a, r, o2); obs[i] = o2
                 all_rewards.append(float(r)); all_infos.append(info)
+                # Analytics hook: if info contains verifier_scores, persist using callback-provided metadata
+                try:
+                    if self.analytics_cb is not None and isinstance(info, dict):
+                        hook = self.analytics_cb(i, info, float(r)) or {}
+                        sig = hook.get('signature_name') if isinstance(hook.get('signature_name'), str) else None
+                        doc_id = hook.get('doc_id') if isinstance(hook.get('doc_id'), str) else None
+                        env = hook.get('environment') if isinstance(hook.get('environment'), str) else 'development'
+                        action_type = hook.get('action_type') if isinstance(hook.get('action_type'), str) else 'VERIFICATION'
+                        execution_time = float(hook.get('execution_time') or 0.0)
+                        query = hook.get('query') if isinstance(hook.get('query'), str) else None
+                        scores = info.get('verifier_scores') if isinstance(info.get('verifier_scores'), dict) else None
+                        if sig and scores:
+                            record_verifier_scores(sig, scores, float(r), environment=env, doc_id=doc_id, action_type=action_type, execution_time=execution_time, query=query)
+                except Exception:
+                    logger.exception("analytics_cb failed")
                 if done or trunc: obs[i], _ = e.reset()
         return EpisodeStats(rewards=all_rewards, infos=all_infos)
 
@@ -347,6 +432,70 @@ class VectorRunner:
 # ---------------
 # Trainer (bandit + neural)
 # ---------------
+
+class RewardNormalizer:
+    """Online running-mean/std normalizer for scalar rewards."""
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.eps = float(eps)
+
+    def update(self, x: float) -> None:
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / max(1, self.n)
+        delta2 = x - self.mean
+        self.m2 += delta * delta2
+
+    @property
+    def std(self) -> float:
+        if self.n < 2:
+            return 1.0
+        return max(self.eps, (self.m2 / (self.n - 1)) ** 0.5)
+
+    def normalize(self, x: float) -> float:
+        return (x - self.mean) / self.std
+
+
+class CheckpointManager:
+    """Minimal checkpoint manager for neural policy training.
+
+    Saves JSON metadata and optionally torch state_dict() if torch is present.
+    Disabled when `interval<=0`.
+    """
+
+    def __init__(self, out_dir: Path, interval: int = 0) -> None:
+        self.dir = Path(out_dir)
+        self.interval = int(interval)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._best: float = float('-inf')
+
+    def maybe_save(self, step: int, avg_reward: float, policy=None, opt=None) -> None:
+        if self.interval <= 0:
+            return
+        if step % self.interval != 0:
+            return
+        meta = {"step": int(step), "avg_reward": float(avg_reward)}
+        try:
+            (self.dir / 'latest.json').write_text(json.dumps(meta))
+        except Exception:
+            pass
+        if avg_reward > self._best:
+            self._best = float(avg_reward)
+            try:
+                (self.dir / 'best.json').write_text(json.dumps(meta))
+            except Exception:
+                pass
+        try:
+            import torch  # type: ignore
+            if policy is not None:
+                torch.save({'policy': policy.state_dict(), 'step': step}, self.dir / 'latest.pt')  # type: ignore
+            if opt is not None:
+                torch.save({'optimizer': opt.state_dict(), 'step': step}, self.dir / 'latest_opt.pt')  # type: ignore
+        except Exception:
+            pass
 
 @dataclass
 class TrainerConfig:
@@ -356,13 +505,67 @@ class TrainerConfig:
     n_envs: int = 1
 
 
-def bandit_trainer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig) -> EpisodeStats:
+def bandit_trainer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig, analytics_cb: Optional[Callable[[int, Dict[str, Any], float], Optional[Dict[str, Any]]]] = None) -> EpisodeStats:
     envs = [make_env() for _ in range(max(1, cfg.n_envs))]
     policy = make_bandit(cfg.policy, envs[0].action_dim, **dict(cfg.policy_kwargs))
-    return VectorRunner(envs, policy).run(cfg.steps)
+    return VectorRunner(envs, policy, analytics_cb=analytics_cb).run(cfg.steps)
 
 
-def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig, backend: str = "multiprocessing") -> EpisodeStats:
+# ---------------
+# Vector Feeder wiring
+# ---------------
+
+def vector_context_provider(path: str, *, batch_size: int = 128, poll_sec: float = 2.0) -> ContextProvider:
+    """Create a context provider backed by the VectorBatchFeeder.
+
+    Returns a callable that yields the next vector from the feeder, or [] if none.
+    """
+    def _make():
+        try:
+            from .vector_feeder import VectorBatchFeeder  # type: ignore
+            feeder = VectorBatchFeeder(path, batch_size=batch_size, poll_sec=poll_sec)
+            gen = feeder.iter_batches()
+            buffer: List[List[float]] = []
+            def _provider() -> List[float]:
+                nonlocal buffer
+                if not buffer:
+                    try:
+                        batch, _meta = next(gen)
+                        buffer = list(batch)
+                    except StopIteration:
+                        buffer = []
+                    except Exception:
+                        buffer = []
+                if buffer:
+                    return list(buffer.pop(0))
+                return []
+            return _provider
+        except Exception:
+            return lambda: []
+    # Instantiate once and reuse closure
+    provider = _make()
+    return provider
+
+
+def attach_vector_context(make_env: Callable[[], RLToolEnv], path: str, *, batch_size: int = 128, poll_sec: float = 2.0) -> Callable[[], RLToolEnv]:
+    """Wrap an env factory to attach vector feeder context provider.
+
+    Example:
+        make_env2 = attach_vector_context(make_env, '/workspace/vectorized/embeddings')
+        stats = bandit_trainer(make_env2, cfg)
+    """
+    provider = vector_context_provider(path, batch_size=batch_size, poll_sec=poll_sec)
+    def factory() -> RLToolEnv:
+        env = make_env()
+        try:
+            env.set_context_provider(provider)
+        except Exception:
+            pass
+        return env
+    return factory
+
+
+def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig, backend: str = "multiprocessing", analytics_cb: Optional[Callable[[int, Dict[str, Any], float], Optional[Dict[str, Any]]]] = None) -> EpisodeStats:
     try:
         try:
             import pufferlib.emulation as emulation  # type: ignore
@@ -379,16 +582,33 @@ def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig,
     for _ in range(cfg.steps):
         actions = [int(policy.select(list(obs[i]) if not isinstance(obs[i], list) else obs[i])) for i in range(len(obs))]
         obs, rewards, terms, truncs, infos = venv.step(actions)
+        # infos is a list-like of dicts
+        step_infos = list(infos) if isinstance(infos, (list, tuple)) else [infos]
         for i, a in enumerate(actions):
             r = float(rewards[i]); policy.update(a, r, list(obs[i]) if not isinstance(obs[i], list) else obs[i])
-            all_rewards.append(r); all_infos.append(infos[i] if isinstance(infos, list) else infos)
+            all_rewards.append(r); all_infos.append(step_infos[i] if i < len(step_infos) else {})
+            # analytics hook
+            try:
+                if analytics_cb is not None and i < len(step_infos) and isinstance(step_infos[i], dict):
+                    hook = analytics_cb(i, step_infos[i], float(r)) or {}
+                    sig = hook.get('signature_name') if isinstance(hook.get('signature_name'), str) else None
+                    doc_id = hook.get('doc_id') if isinstance(hook.get('doc_id'), str) else None
+                    env = hook.get('environment') if isinstance(hook.get('environment'), str) else 'development'
+                    action_type = hook.get('action_type') if isinstance(hook.get('action_type'), str) else 'VERIFICATION'
+                    execution_time = float(hook.get('execution_time') or 0.0)
+                    query = hook.get('query') if isinstance(hook.get('query'), str) else None
+                    scores = step_infos[i].get('verifier_scores') if isinstance(step_infos[i].get('verifier_scores'), dict) else None
+                    if sig and scores:
+                        record_verifier_scores(sig, scores, float(r), environment=env, doc_id=doc_id, action_type=action_type, execution_time=execution_time, query=query)
+            except Exception:
+                logger.exception('analytics_cb failed (puffer)')
         obs, infos = venv.reset()
     try: venv.close()
     except Exception: pass
     return EpisodeStats(rewards=all_rewards, infos=all_infos)
 
 
-def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000, n_envs: int = 4, lr: float = 1e-3, seed: Optional[int] = None, verbose: bool = False, log_interval: int = 10) -> EpisodeStats:
+def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000, n_envs: int = 4, lr: float = 1e-3, seed: Optional[int] = None, verbose: bool = False, log_interval: int = 10, grad_clip: float = 1.0, checkpoint_dir: Optional[str] = None, checkpoint_interval: int = 0, early_stop_patience: int = 0, entropy_coef: float = 0.01, replay_capacity: int = 2048, replay_batch: int = 128) -> EpisodeStats:
     try:
         import torch
         import torch.nn as nn
@@ -421,18 +641,54 @@ def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000,
     rewards_all: List[float] = []; infos_all: List[dict] = []
 
     if using_vec:
+        # On-policy experience buffer for auxiliary replay steps
+        from collections import deque
+        replay = deque(maxlen=int(max(1, replay_capacity)))
         for step_idx in range(1, steps + 1):
             obs, _ = venv.reset()
             import torch
             obs_t = torch.tensor(obs, dtype=torch.float32)
             logits = policy(obs_t)
             m = torch.distributions.Categorical(logits=logits)
-            actions = m.sample(); logp = m.log_prob(actions)
+            actions = m.sample(); logp = m.log_prob(actions); ent = m.entropy()
             obs2, rewards, terms, truncs, infos = venv.step(actions.tolist())
             r_t = torch.tensor(rewards, dtype=torch.float32)
             avg_r = float(r_t.mean().item()); running_mean = beta * running_mean + (1 - beta) * avg_r
-            adv = r_t - running_mean
-            loss = -(logp * adv).mean(); opt.zero_grad(); loss.backward(); opt.step()
+            _rn = RewardNormalizer(); _rn.update(avg_r); adv = (r_t - running_mean) / max(1e-6, _rn.std)
+            # Entropy regularization
+            loss = (-(logp * adv).mean()) - float(entropy_coef) * ent.mean()
+            opt.zero_grad(); loss.backward()
+            try:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+            except Exception:
+                pass
+            opt.step()
+            # Push to replay
+            try:
+                for i in range(len(obs)):
+                    replay.append((obs_t[i].detach(), int(actions[i].item()), float(r_t[i].item())))
+            except Exception:
+                pass
+            # Auxiliary replay step if buffer has enough
+            try:
+                if len(replay) >= max(8, replay_batch):
+                    idx = torch.randperm(len(replay))[: int(replay_batch)]
+                    batch = [replay[i] for i in idx.tolist()]
+                    b_obs = torch.stack([b[0] for b in batch])
+                    b_act = torch.tensor([b[1] for b in batch], dtype=torch.long)
+                    b_rew = torch.tensor([b[2] for b in batch], dtype=torch.float32)
+                    b_logits = policy(b_obs); bm = torch.distributions.Categorical(logits=b_logits)
+                    b_logp = bm.log_prob(b_act); b_ent = bm.entropy()
+                    b_adv = (b_rew - running_mean) / max(1e-6, _rn.std)
+                    aux_loss = (-(b_logp * b_adv).mean()) - float(entropy_coef) * b_ent.mean()
+                    opt.zero_grad(); aux_loss.backward()
+                    try:
+                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+                    except Exception:
+                        pass
+                    opt.step()
+            except Exception:
+                pass
             rewards_all.extend([float(x) for x in r_t.tolist()]); infos_all.extend(infos if isinstance(infos, list) else [infos])
             if verbose and (step_idx % max(1, int(log_interval)) == 0):
                 # Summarize tool usage from infos if present
@@ -446,6 +702,12 @@ def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000,
         except Exception: pass
     else:
         import torch
+        ckpt = CheckpointManager(Path(checkpoint_dir) if checkpoint_dir else Path('.dspy_checkpoints') / 'rl', interval=int(checkpoint_interval or 0))
+        rn = RewardNormalizer()
+        best_avg = float('-inf')
+        stagnant = 0
+        from collections import deque
+        replay = deque(maxlen=int(max(1, replay_capacity)))
         def select_action(o: List[float]):
             # Compute logits with grad so REINFORCE can backprop through log-prob
             obs = torch.tensor(o, dtype=torch.float32).unsqueeze(0)
@@ -458,16 +720,70 @@ def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000,
         for e in envs: o, _ = e.reset(); obses.append(o)
         for step_idx in range(1, steps + 1):
             batch_lp: List[torch.Tensor] = []; batch_r: List[float] = []
+            batch_ent: List[torch.Tensor] = []
+            batch_obs_t: List[torch.Tensor] = []
+            batch_act: List[int] = []
             for i, e in enumerate(envs):
                 a, lp = select_action(obses[i]); o2, r, done, trunc, info = e.step(a)
                 rewards_all.append(float(r)); infos_all.append(info)
                 obses[i] = o2 if not (done or trunc) else e.reset()[0]
                 batch_lp.append(lp); batch_r.append(float(r))
+                # Recompute dist to get entropy and record obs/action for replay
+                obs_t = torch.tensor(o2, dtype=torch.float32).unsqueeze(0)
+                batch_obs_t.append(obs_t.squeeze(0)); batch_act.append(a)
+                logits = policy(obs_t); m = torch.distributions.Categorical(logits=logits)
+                batch_ent.append(m.entropy().squeeze())
             avg_r = sum(batch_r) / max(1, len(batch_r)); running_mean = beta * running_mean + (1 - beta) * avg_r
-            loss = -sum(lp * (r - running_mean) for lp, r in zip(batch_lp, batch_r)) / max(1, len(batch_lp))
-            opt.zero_grad(); loss.backward(); opt.step()
+            rn.update(avg_r)
+            norm_adv = [(r - running_mean) / max(1e-6, rn.std) for r in batch_r]
+            # Add entropy regularization
+            pol_loss = -sum(lp * adv for lp, adv in zip(batch_lp, norm_adv)) / max(1, len(batch_lp))
+            ent_term = -float(entropy_coef) * (sum(batch_ent) / max(1, len(batch_ent)))
+            loss = pol_loss + ent_term
+            opt.zero_grad(); loss.backward()
+            try:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+            except Exception:
+                pass
+            opt.step()
+            # Push batch into replay buffer
+            try:
+                for obs_t, act, rew in zip(batch_obs_t, batch_act, batch_r):
+                    replay.append((obs_t.detach(), int(act), float(rew)))
+            except Exception:
+                pass
+            # Auxiliary replay pass if buffer has enough
+            try:
+                if len(replay) >= max(8, replay_batch):
+                    idx = torch.randperm(len(replay))[: int(replay_batch)]
+                    batch = [replay[i] for i in idx.tolist()]
+                    b_obs = torch.stack([b[0] for b in batch])
+                    b_act = torch.tensor([b[1] for b in batch], dtype=torch.long)
+                    b_rew = torch.tensor([b[2] for b in batch], dtype=torch.float32)
+                    b_logits = policy(b_obs); bm = torch.distributions.Categorical(logits=b_logits)
+                    b_logp = bm.log_prob(b_act); b_ent = bm.entropy().mean()
+                    b_adv = (b_rew - running_mean) / max(1e-6, rn.std)
+                    aux_loss = (-(b_logp * b_adv).mean()) - float(entropy_coef) * b_ent
+                    opt.zero_grad(); aux_loss.backward()
+                    try:
+                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+                    except Exception:
+                        pass
+                    opt.step()
+            except Exception:
+                pass
             if verbose and (step_idx % max(1, int(log_interval)) == 0):
                 print(f"[rl] step={step_idx} avg_r={avg_r:.3f}")
+            ckpt.maybe_save(step_idx, avg_r, policy=policy, opt=opt)
+            if early_stop_patience and avg_r <= best_avg + 1e-6:
+                stagnant += 1
+                if stagnant >= early_stop_patience:
+                    if verbose:
+                        print(f"[rl] early stop at step={step_idx} best_avg={best_avg:.3f}")
+                    break
+            else:
+                best_avg = max(best_avg, avg_r)
+                stagnant = 0
     return EpisodeStats(rewards=rewards_all, infos=infos_all)
 
 
@@ -554,6 +870,8 @@ class ToolchainExecutor:
 
     def __call__(self, tool: ToolAction, args: Dict[str, Any]) -> AgentResult:
         ws = self.cfg.workspace; metrics: Dict[str, Any] = {"tool": tool.name.lower()}; info: Dict[str, Any] = {}
+        # Default policy adherence score
+        metrics.setdefault("quality_policy", 1.0)
         if tool == ToolAction.RUN_TESTS:
             cmd = args.get("cmd") or self.cfg.test_cmd or ("pytest -q" if (ws / "tests").exists() else None)
             if not cmd: return AgentResult(metrics={"pass_rate": 0.0, "tests_total": 0, "tests_passed": 0, "tests_failed": 0, **metrics})
@@ -579,7 +897,18 @@ class ToolchainExecutor:
             prompt_id = args.get("prompt_id")
             if prompt_id:
                 info.update({"prompt_id": str(prompt_id)})
+            # Load quality checks from args or default file
             quality_cfg = args.get("quality_checks", {})
+            if not quality_cfg:
+                try:
+                    import json as _json
+                    qc_path = ws / '.dspy_quality.json'
+                    if qc_path.exists():
+                        content = _json.loads(qc_path.read_text())
+                        if isinstance(content, dict):
+                            quality_cfg = content
+                except Exception:
+                    pass
             quality_checks: Dict[str, str] = {}
             if isinstance(quality_cfg, Mapping):
                 for key, value in quality_cfg.items():
@@ -594,6 +923,8 @@ class ToolchainExecutor:
             start_ts = time.time()
             patch_text = ""
             summary: Dict[str, Any] = {}
+            # Ensure 'hints' exists before any early returns that use _finalize
+            hints = ""
 
             def _quality_report() -> Dict[str, Any]:
                 q = {}
@@ -641,7 +972,6 @@ class ToolchainExecutor:
             except Exception as e:
                 info.update({"error": f"patch deps unavailable: {e}"}); metrics.update({"pass_rate": 0.0, "blast_radius": 0.0}); return _finalize('error')
             # Locate files -> propose patch
-            hints = ""
             hint_list: List[str] = []
             try:
                 loc = FileLocator(); loc_out = loc(task=task, context=context, code_graph=""); hints = getattr(loc_out, 'file_candidates', '') or ''
@@ -718,6 +1048,26 @@ class ToolchainExecutor:
             metrics.update({"pass_rate": float(pr), "blast_radius": float(summary.get('added_lines', 0) + summary.get('removed_lines', 0))})
             metrics.setdefault("retrieval_precision", float(pr))
             metrics.setdefault("retrieval_coverage", float(len(hint_list)))
+            # Apply user preferences as quality gate (optional)
+            try:
+                from ..preferences import Preferences, check_patch_against_prefs
+                prefs = Preferences.load(ws)
+            except Exception:
+                prefs = None  # type: ignore
+            if prefs is not None:
+                try:
+                    violations = check_patch_against_prefs(patch_text, prefs)
+                    if prefs.max_blast_radius and float(metrics.get("blast_radius", 0.0)) > float(prefs.max_blast_radius):
+                        violations.append(f"blast_radius>{prefs.max_blast_radius}")
+                    if violations:
+                        info['preferences'] = {"violations": violations}
+                        metrics["quality_preferences"] = 0.0
+                        metrics["quality_policy"] = 0.0
+                        # Conservative: mark as failed
+                        pr = 0.0
+                        metrics["pass_rate"] = 0.0
+                except Exception:
+                    pass
             # Revert to keep training environment consistent
             if revert_always:
                 try:
@@ -902,7 +1252,25 @@ class BlastRadiusVerifier:
 
 
 def sample_get_verifiers():
-    return [PassRateVerifier(), BlastRadiusVerifier()]
+    class BuildOkVerifier:
+        kind = "build_ok"
+        def __call__(self, result: AgentResult) -> float:
+            return 1.0 if bool(result.metrics.get("build_ok")) else 0.0
+    class LintOkVerifier:
+        kind = "lint_ok"
+        def __call__(self, result: AgentResult) -> float:
+            ok = result.metrics.get("lint_ok")
+            if ok is not None: return 1.0 if bool(ok) else 0.0
+            issues = int(result.metrics.get("lint_issues", 0) or 0)
+            return 1.0 if issues == 0 else 0.0
+    class QualityAvgVerifier:
+        kind = "quality_avg"
+        def __call__(self, result: AgentResult) -> float:
+            keys = [k for k in result.metrics.keys() if str(k).startswith('quality_')]
+            if not keys: return 1.0
+            vals = [float(result.metrics.get(k, 0.0) or 0.0) for k in keys]
+            return sum(vals) / max(1, len(vals))
+    return [PassRateVerifier(), BlastRadiusVerifier(), BuildOkVerifier(), LintOkVerifier(), QualityAvgVerifier()]
 
 
 def get_verifiers():
@@ -1011,3 +1379,86 @@ __all__ = [
     # puffer shell
     'run_puffer_ppo',
 ]
+def record_verifier_scores(signature_name: str, scores: Mapping[str, float], reward: float, *, environment: str = "development", doc_id: Optional[str] = None, action_type: str = "VERIFICATION", execution_time: float = 0.0, query: Optional[str] = None) -> str:
+    """Persist an ActionRecord with per-verifier scores for analytics.
+
+    Convenience helper you can call inside training/verification loops.
+    """
+    try:
+        from dspy_agent.db import get_enhanced_data_manager, create_action_record, Environment, ActionType
+        dm = get_enhanced_data_manager()
+        try:
+            env = getattr(Environment, environment.strip().upper())
+        except Exception:
+            env = Environment.DEVELOPMENT
+        try:
+            at = ActionType[action_type.strip().upper()]
+        except Exception:
+            at = ActionType.VERIFICATION
+        rec = create_action_record(
+            action_type=at,
+            state_before={'signature_name': signature_name},
+            state_after={'signature_name': signature_name},
+            parameters={'signature_name': signature_name, 'verifier_scores': dict(scores), **({'doc_id': doc_id} if doc_id else {}), **({'query': query} if query else {})},
+            result={'signature_name': signature_name, 'verifier_scores': dict(scores)},
+            reward=float(reward),
+            confidence=0.95,
+            execution_time=float(execution_time),
+            environment=env,
+        )
+        dm.record_action(rec)
+        return rec.action_id
+    except Exception:
+        logger.exception("failed to record verifier scores")
+        return ""
+
+
+def make_default_analytics_cb(
+    signature_name: Optional[str] = None,
+    *,
+    env: str = "development",
+    action_type: str = "VERIFICATION",
+    doc_fn: Optional[Callable[[int, Dict[str, Any]], Optional[str]]] = None,
+    query_fn: Optional[Callable[[int, Dict[str, Any]], Optional[str]]] = None,
+) -> Callable[[int, Dict[str, Any], float], Optional[Dict[str, Any]]]:
+    """Create a default analytics callback for VectorRunner/Puffer that extracts metadata
+    from the info dict and persists verifier scores using record_verifier_scores.
+
+    - signature_name: static name or None to read from info['signature_name']
+    - env/action_type: defaults for ActionRecord
+    - doc_fn: optional function to derive doc_id from (env_idx, info); defaults to info.get('doc_id')
+    - query_fn: optional function to derive query text from (env_idx, info)
+    """
+    def cb(env_idx: int, info: Dict[str, Any], reward: float) -> Optional[Dict[str, Any]]:
+        try:
+            sig = signature_name or (isinstance(info.get('signature_name'), str) and info.get('signature_name')) or None
+            if not sig:
+                # also check nested dictionaries
+                for k in ('parameters', 'result', 'state', 'meta'):
+                    v = info.get(k)
+                    if isinstance(v, dict) and isinstance(v.get('signature_name'), str):
+                        sig = v.get('signature_name'); break
+            if not sig:
+                return None
+            did = None
+            if doc_fn:
+                try: did = doc_fn(env_idx, info)
+                except Exception: did = None
+            if not did:
+                did = info.get('doc_id') if isinstance(info.get('doc_id'), str) else None
+            q = None
+            if query_fn:
+                try: q = query_fn(env_idx, info)
+                except Exception: q = None
+            res = {
+                'signature_name': sig,
+                'doc_id': did,
+                'environment': env,
+                'action_type': action_type,
+                'execution_time': float(info.get('execution_time') or 0.0),
+            }
+            if q: res['query'] = q
+            return res
+        except Exception:
+            return None
+    return cb

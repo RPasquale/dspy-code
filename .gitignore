@@ -88,6 +88,16 @@ docker/lightweight/.env
 *.temp
 *.bak
 *.backup
+*.orig
+*.rej
+
+# Accidental home-ish folder checked into the repo root
+~/
+~/**
+Users/
+Users/**
+Library/
+Library/**
 
 # UV lockfile - not needed in containerized environment
 uv.lock

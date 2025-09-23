@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Tuple
+from typing import Tuple, Optional
 
 import dspy
 
@@ -82,17 +82,19 @@ def _has_unified_headers(patch_text: str) -> bool:
 
 
 class CodeEdit(dspy.Module):
-    def __init__(self, use_cot: bool = True, *, max_files: int = 4, max_lines: int = 200, attempts: int = 2):
+    def __init__(self, use_cot: Optional[bool] = None, *, max_files: int = 4, max_lines: int = 200, attempts: int = 2, beam_k: int = 1):
         super().__init__()
-        # Prefer Chain-of-Thought for code edits; fallback to Predict when unavailable
-        self.propose = dspy.ChainOfThought(CodeEditSig) if use_cot else dspy.Predict(CodeEditSig)
-        # Backward-compat: some callers expect `self.predict`
-        self.predict = self.propose
+        # Light gating: fast Predict first; escalate to CoT if malformed/low-signal
+        self.propose_fast = dspy.Predict(CodeEditSig)
+        self.propose_slow = dspy.ChainOfThought(CodeEditSig)
+        self.predict = self.propose_slow if use_cot else self.propose_fast
+        self.use_cot = use_cot
         self.critic = dspy.Predict(EditCriticSig)
         self.reviser = dspy.Predict(ReviseEditSig)
         self.max_files = int(max_files)
         self.max_lines = int(max_lines)
         self.attempts = max(1, int(attempts))
+        self.beam_k = max(1, int(beam_k))
 
     def forward(self, task: str, context: str, code_graph: str = "", file_hints: str = ""):
         constraints = (
@@ -100,10 +102,56 @@ class CodeEdit(dspy.Module):
             "Output pure unified diff (no prose), with correct headers and minimal scope."
         )
 
-        pred = self.propose(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+        if self.use_cot is True:
+            pred = self.propose_slow(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+        else:
+        pred = self.propose_fast(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
         patch = getattr(pred, 'patch', '') or ''
         rationale = getattr(pred, 'rationale', '') or ''
 
+        files, add, rem = _summarize_patch(patch)
+        total = add + rem
+        ok = bool(patch.strip()) and _has_unified_headers(patch) and (
+            (self.max_files <= 0 or files <= self.max_files) and
+            (self.max_lines <= 0 or total <= self.max_lines)
+        )
+
+        # Escalate to CoT if fast path was low-signal
+        if not ok and self.use_cot is None:
+            pred = self.propose_slow(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+            patch = getattr(pred, 'patch', '') or ''
+            rationale = getattr(pred, 'rationale', '') or rationale
+            files, add, rem = _summarize_patch(patch)
+            total = add + rem
+            ok = bool(patch.strip()) and _has_unified_headers(patch) and (
+                (self.max_files <= 0 or files <= self.max_files) and
+                (self.max_lines <= 0 or total <= self.max_lines)
+            )
+
+        # Beam over proposals
+        def _score_candidate(p: str) -> float:
+            if not (p or '').strip() or not _has_unified_headers(p):
+                return float('-inf')
+            f, a, r = _summarize_patch(p)
+            t = a + r
+            if (self.max_files > 0 and f > self.max_files) or (self.max_lines > 0 and t > self.max_lines):
+                return float('-inf')
+            return 10.0 - (f * 1.5 + t * 0.02)
+        best_patch = patch
+        best_rationale = rationale
+        best_score = _score_candidate(best_patch)
+        proposer = self.propose_slow if (self.use_cot is True or (self.use_cot is None and not ok)) else self.propose_fast
+        if self.beam_k > 1:
+            for _ in range(self.beam_k - 1):
+                cand = proposer(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+                cpatch = getattr(cand, 'patch', '') or ''
+                cscore = _score_candidate(cpatch)
+                if cscore > best_score:
+                    best_patch = cpatch
+                    best_rationale = getattr(cand, 'rationale', '') or best_rationale
+                    best_score = cscore
+        patch = best_patch
+        rationale = best_rationale
         files, add, rem = _summarize_patch(patch)
         total = add + rem
         ok = bool(patch.strip()) and _has_unified_headers(patch) and (

@@ -7,6 +7,12 @@ from typing import Optional, Tuple, List, Dict
 import dspy
 
 from .config import get_settings
+from .agents.adapter import StrictJSONAdapter  # type: ignore
+try:
+    # best-effort import of adapter circuit breaker for health reporting
+    from .agents.adapter import _CB as _ADAPTER_CB  # type: ignore
+except Exception:  # pragma: no cover - optional
+    _ADAPTER_CB = None  # type: ignore
 
 import json as _json
 import urllib.request as _req
@@ -87,6 +93,25 @@ def get_sampling_hints() -> Dict[str, float]:
     return dict(_SAMPLING_HINTS)
 
 
+def get_circuit_breaker_status() -> Dict[str, object]:
+    """Expose adapter circuit-breaker state for health endpoints.
+
+    Returns a small dict with keys: open(bool), next_retry(float seconds).
+    """
+    try:
+        if _ADAPTER_CB is None:
+            return {"open": False, "next_retry_sec": 0.0}
+        import time as _t
+        now = _t.time()
+        # Adapter exposes is_open and private _opened_until
+        opened_until = getattr(_ADAPTER_CB, "_opened_until", 0.0)
+        is_open = bool(getattr(_ADAPTER_CB, "is_open", False))
+        wait = max(0.0, float(opened_until) - now)
+        return {"open": is_open, "next_retry_sec": wait}
+    except Exception:
+        return {"open": False, "next_retry_sec": 0.0}
+
+
 def configure_lm(
     provider: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -97,6 +122,12 @@ def configure_lm(
     target_entropy: Optional[float] = None,
     clip_higher: Optional[float] = None,
 ) -> Optional[dspy.LM]:
+    # If running with the lightweight local stub, skip LM entirely
+    try:
+        if getattr(dspy, 'IS_STUB', False):
+            return None
+    except Exception:
+        pass
     settings = get_settings()
     if settings.local_mode:
         return None
@@ -153,12 +184,12 @@ def configure_lm(
             lm_kwargs["api_base"] = effective_base_url
 
     # Instantiate the LM using DSPy v3 API (via LiteLLM)
-    _clamp_litellm_timeout(30)
+    _clamp_litellm_timeout(60)
     lm_kwargs.update({
-        "timeout": 30,            # DSPy/LiteLLM timeout
-        "request_timeout": 30,    # Some LiteLLM adapters use this key
-        "max_retries": 2,
-        "num_retries": 2,
+        "timeout": 60,            # DSPy/LiteLLM timeout - increased for better reliability
+        "request_timeout": 60,    # Some LiteLLM adapters use this key
+        "max_retries": 3,         # Increased retries
+        "num_retries": 3,
     })
 
     if temperature is not None:
@@ -188,5 +219,45 @@ def configure_lm(
         model=provider_model,
         **lm_kwargs,
     )
-    dspy.configure(lm=lm)
+    # Configure DSPy with LM and a strict JSON adapter when supported.
+    try:
+        dspy.configure(lm=lm, adapter=StrictJSONAdapter())
+    except TypeError:
+        # Older DSPy versions may not accept adapter kwarg.
+        dspy.configure(lm=lm)
     return lm
+
+
+class temporary_lm:
+    """Context manager to temporarily set the active DSPy LM.
+
+    Example:
+        fast = configure_lm(provider="ollama", model_name="qwen2:0.5b")
+        with temporary_lm(fast):
+            # Calls inside use the fast LM
+            ...
+        # Restores previous LM
+    """
+    def __init__(self, lm: Optional[dspy.LM]) -> None:
+        self._lm = lm
+        self._prev = None
+
+    def __enter__(self):
+        try:
+            self._prev = getattr(dspy.settings, 'lm', None)
+        except Exception:
+            self._prev = None
+        try:
+            if self._lm is not None:
+                dspy.settings.configure(lm=self._lm)
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._prev is not None:
+                dspy.settings.configure(lm=self._prev)
+        except Exception:
+            pass
+        return False

@@ -198,6 +198,28 @@ dspy-agent --workspace $(pwd)
 
 > Tip: use `--install-source local` when iterating on the repo itself; it copies the current checkout into the Docker build context. Add `--pip-spec` to pin a specific wheel or git ref for pip installs.
 
+### Host volume permissions (non-root containers)
+
+Services run as non-root user UID/GID 10001 for security. If the agent needs to
+write into your mounted workspace on the host, the directory must be group-writable
+by GID 10001. Use the helper script to adjust:
+
+```bash
+./scripts/fix_workspace_perms.sh /absolute/path/to/your/workspace
+```
+
+This sets group ownership to GID 10001 and enables group rwX. You may need sudo
+for chgrp. Alternatively:
+
+```bash
+sudo chgrp -R 10001 /absolute/path/to/your/workspace
+chmod -R g+rwX /absolute/path/to/your/workspace
+find /absolute/path/to/your/workspace -type d -exec chmod g+s {} +
+```
+
+If you cannot change permissions on your project directory, consider a dedicated
+directory for the stack with relaxed group permissions.
+
 Space‑friendly rebuilds:
 ```bash
 export DOCKER_BUILDKIT=1

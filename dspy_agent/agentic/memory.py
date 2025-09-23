@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Mapping, Optional
 
-from ..db import get_enhanced_data_manager, create_log_entry, Environment, RetrievalEventRecord
+from ..db import get_enhanced_data_manager, create_log_entry, create_retrieval_event, Environment
 
 RETRIEVAL_LOG = '.dspy_agentic/retrieval.jsonl'
 
@@ -163,23 +163,28 @@ def log_retrieval_event(workspace: Path, query: str, hits: Iterable[Mapping[str,
     except Exception:
         pass
 
-    # Mirror to RedDB / enhanced manager when available
+    # Mirror to RedDB / enhanced manager
     try:
-        from ..db import get_enhanced_data_manager, create_log_entry, Environment
-        from ..db.data_models import RetrievalEventRecord
-
         dm = get_enhanced_data_manager()
         env_name = os.getenv('DSPY_ENVIRONMENT', 'development').upper()
-        env = Environment[env_name] if env_name in Environment.__members__ else Environment.DEVELOPMENT
-        event = RetrievalEventRecord(
-            event_id=record_id,
-            timestamp=record['timestamp'],
+        try:
+            env = Environment[env_name]
+        except KeyError:
+            env = Environment.DEVELOPMENT
+        
+        # Create retrieval event using the utility function
+        event = create_retrieval_event(
             workspace_path=str(ww),
             query=query,
             hits=record_hits,
             environment=env,
+            event_id=record_id
         )
+        
+        # Record the event in RedDB
         dm.record_retrieval_event(event)
+        
+        # Also log the event
         log_entry = create_log_entry(
             level="INFO",
             source="retrieval",
@@ -188,25 +193,130 @@ def log_retrieval_event(workspace: Path, query: str, hits: Iterable[Mapping[str,
             environment=env,
         )
         dm.log(log_entry)
-    except Exception:
+        
+    except Exception as e:
+        # Log the error but don't fail the function
+        import logging
+        logging.warning(f"Failed to record retrieval event in RedDB: {e}")
         pass
 
 
 def load_retrieval_events(workspace: Path, limit: int = 50) -> List[Dict[str, object]]:
-    log_path = workspace / RETRIEVAL_LOG
-    if not log_path.exists():
-        return []
-    try:
-        lines = log_path.read_text(encoding='utf-8').splitlines()
-    except Exception:
-        return []
+    """Load retrieval events from both file and RedDB sources."""
     events: List[Dict[str, object]] = []
-    for line in lines[-limit:]:
-        line = line.strip()
-        if not line:
+    
+    # First try to load from RedDB
+    try:
+        dm = get_enhanced_data_manager()
+        # Get recent retrieval events from RedDB
+        reddb_events = dm.get_recent_retrieval_events(limit=limit)
+        for event_record in reddb_events:
+            # Convert RetrievalEventRecord to dict format
+            if hasattr(event_record, 'to_dict'):
+                events.append(event_record.to_dict())
+            elif isinstance(event_record, dict):
+                events.append(event_record)
+    except Exception as e:
+        import logging
+        logging.warning(f"Failed to load retrieval events from RedDB: {e}")
+    
+    # If we don't have enough events from RedDB, try to load from file
+    if len(events) < limit:
+        log_path = workspace / RETRIEVAL_LOG
+        if log_path.exists():
+            try:
+                lines = log_path.read_text(encoding='utf-8').splitlines()
+                file_events: List[Dict[str, object]] = []
+                for line in lines[-limit:]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        file_events.append(json.loads(line))
+                    except Exception:
+                        continue
+                
+                # Merge file events with RedDB events, avoiding duplicates
+                existing_ids = {event.get('event_id') for event in events}
+                for file_event in file_events:
+                    if file_event.get('event_id') not in existing_ids:
+                        events.append(file_event)
+                        if len(events) >= limit:
+                            break
+                            
+            except Exception as e:
+                import logging
+                logging.warning(f"Failed to load retrieval events from file: {e}")
+    
+    # Sort by timestamp and return the most recent events
+    events.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+    return events[:limit]
+
+
+def query_retrieval_events(
+    workspace: Path,
+    query_filter: Optional[str] = None,
+    min_score: Optional[float] = None,
+    since_timestamp: Optional[float] = None,
+    limit: int = 50
+) -> List[Dict[str, object]]:
+    """Query retrieval events with filtering capabilities."""
+    events = load_retrieval_events(workspace, limit=limit * 2)  # Load more to filter
+    
+    # Apply filters
+    filtered_events = []
+    for event in events:
+        # Filter by query text
+        if query_filter and query_filter.lower() not in event.get('query', '').lower():
             continue
-        try:
-            events.append(json.loads(line))
-        except Exception:
+            
+        # Filter by minimum score
+        if min_score is not None:
+            hits = event.get('hits', [])
+            max_hit_score = max((hit.get('score', 0) for hit in hits), default=0)
+            if max_hit_score < min_score:
+                continue
+                
+        # Filter by timestamp
+        if since_timestamp is not None and event.get('timestamp', 0) < since_timestamp:
             continue
-    return events
+            
+        filtered_events.append(event)
+        if len(filtered_events) >= limit:
+            break
+    
+    return filtered_events
+
+
+def get_retrieval_statistics(workspace: Path) -> Dict[str, float]:
+    """Get statistics about retrieval events for the workspace."""
+    events = load_retrieval_events(workspace, limit=1000)  # Load more for stats
+    
+    if not events:
+        return {
+            "total_events": 0.0,
+            "avg_hits_per_query": 0.0,
+            "avg_score": 0.0,
+            "unique_queries": 0.0,
+            "unique_files": 0.0,
+        }
+    
+    total_events = len(events)
+    total_hits = sum(len(event.get('hits', [])) for event in events)
+    all_scores = []
+    unique_queries = set()
+    unique_files = set()
+    
+    for event in events:
+        unique_queries.add(event.get('query', ''))
+        for hit in event.get('hits', []):
+            all_scores.append(hit.get('score', 0))
+            unique_files.add(hit.get('path', ''))
+    
+    return {
+        "total_events": float(total_events),
+        "avg_hits_per_query": float(total_hits) / float(total_events) if total_events > 0 else 0.0,
+        "avg_score": float(sum(all_scores)) / float(len(all_scores)) if all_scores else 0.0,
+        "unique_queries": float(len(unique_queries)),
+        "unique_files": float(len(unique_files)),
+    }
