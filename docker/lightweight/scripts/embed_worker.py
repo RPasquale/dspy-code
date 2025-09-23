@@ -102,6 +102,36 @@ def embed_with_retries(url: str, model: str, inputs: List[str], api_key: Optiona
     return [[] for _ in inputs]
 
 
+# -------- Local embedding backend (no external service required) --------
+_LOCAL_EMBEDDER = None  # lazy-initialized
+
+def local_embed(model_name: str, inputs: List[str], normalize: bool = False) -> List[List[float]]:
+    global _LOCAL_EMBEDDER
+    if _LOCAL_EMBEDDER is None:
+        try:
+            # Prefer fastembed for lightweight CPU embeddings
+            from fastembed import TextEmbedding
+            _LOCAL_EMBEDDER = ('fastembed', TextEmbedding(model_name=model_name))
+        except Exception:
+            # Fallback to sentence-transformers if fastembed unavailable
+            from sentence_transformers import SentenceTransformer
+            _LOCAL_EMBEDDER = ('st', SentenceTransformer(model_name))
+    kind, emb = _LOCAL_EMBEDDER
+    vectors: List[List[float]]
+    if kind == 'fastembed':
+        # emb.embed returns generator of vectors
+        gen = emb.embed(inputs)
+        vectors = [list(map(float, v)) for v in gen]
+    else:
+        arr = emb.encode(inputs, normalize_embeddings=normalize)
+        try:
+            vectors = [list(map(float, v)) for v in arr]
+        except Exception:
+            import numpy as _np
+            vectors = [list(map(float, _np.asarray(v).tolist())) for v in arr]
+    return vectors
+
+
 METRICS: Dict[str, Any] = {
     'started_ts': time.time(),
     'batches': 0,
@@ -147,8 +177,9 @@ def main():
     in_topic = os.getenv('EMBED_INPUT_TOPIC', 'embedding_input')
     out_topic = os.getenv('EMBED_OUTPUT_TOPIC', 'embeddings')
     group = os.getenv('EMBED_GROUP', 'embed-worker')
-    mesh_url = os.getenv('INFERMESH_URL', 'http://infermesh:9000')
-    model = os.getenv('EMBED_MODEL', os.getenv('MODEL_ID', 'sentence-transformers/all-MiniLM-L6-v2'))
+    mesh_url = os.getenv('INFERMESH_URL', '').strip()
+    model = os.getenv('EMBED_MODEL', os.getenv('MODEL_ID', 'BAAI/bge-small-en-v1.5'))
+    backend = os.getenv('EMBED_BACKEND', 'auto').strip().lower()  # 'auto', 'infermesh', 'local'
     api_key = os.getenv('INFERMESH_API_KEY')
     batch_size = int(os.getenv('EMBED_BATCH_SIZE', '64'))
     max_wait = float(os.getenv('EMBED_MAX_WAIT_SEC', '0.5'))
@@ -256,17 +287,20 @@ def main():
             else:
                 to_query.append(i)
         if to_query:
-            # call infermesh for uncached with retries
             inputs = [texts[i] for i in to_query]
-            vecs = embed_with_retries(
-                mesh_url,
-                model,
-                inputs,
-                api_key,
-                timeout=float(os.getenv('INFERMESH_TIMEOUT_SEC', '30') or '30'),
-                retries=int(os.getenv('INFERMESH_RETRIES', '2') or '2'),
-                backoff=float(os.getenv('INFERMESH_BACKOFF_SEC', '0.5') or '0.5'),
-            )
+            use_local = (backend == 'local') or (backend == 'auto' and not mesh_url)
+            if use_local:
+                vecs = local_embed(model, inputs, normalize=os.getenv('EMBED_NORMALIZE', '0').lower() in ('1','true','yes','on'))
+            else:
+                vecs = embed_with_retries(
+                    mesh_url or 'http://infermesh:9000',
+                    model,
+                    inputs,
+                    api_key,
+                    timeout=float(os.getenv('INFERMESH_TIMEOUT_SEC', '30') or '30'),
+                    retries=int(os.getenv('INFERMESH_RETRIES', '2') or '2'),
+                    backoff=float(os.getenv('INFERMESH_BACKOFF_SEC', '0.5') or '0.5'),
+                )
             failed = []
             for idx, i in enumerate(to_query):
                 v = vecs[idx]

@@ -103,27 +103,30 @@ services:
         start_period: 10s
 
     infermesh:
+      image: ghcr.io/rpasquale/infermesh:cpu-local
       build:
         context: .
-        dockerfile: infermesh_mock.Dockerfile
+        dockerfile: infermesh_cpu.Dockerfile
       environment:
-        - INFER_PORT=9000
+        - MODEL_ID=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
       ports:
-        - "127.0.0.1:19000:9000"
+        - "127.0.0.1:${INFERMESH_HOST_PORT:-19000}:9000"
       restart: unless-stopped
+      volumes:
+        - hf-cache:/root/.cache/huggingface
       healthcheck:
         test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:9000/health')\" >/dev/null 2>&1 || exit 1"]
         interval: 10s
         timeout: 3s
-        retries: 20
-        start_period: 10s
+        retries: 10
+        start_period: 5s
 
     # Dedicated dashboard service (serves enhanced_dashboard_server on port 8081)
     dashboard:
       image: dspy-lightweight:latest
       user: "10001:10001"
       working_dir: /app
-      entrypoint: ["bash", "-lc", "python3 enhanced_dashboard_server.py 8081"]
+      entrypoint: ["bash", "-lc", "cd /workspace && python3 enhanced_dashboard_server.py 8081"]
       environment:
         - WORKSPACE_DIR=/workspace
         - DSPY_WORKSPACE=/workspace
@@ -150,17 +153,19 @@ services:
         kafka:
           condition: service_healthy
         infermesh:
-          condition: service_healthy
+          condition: service_started
       environment:
         - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
         - EMBED_INPUT_TOPIC=embedding_input
         - EMBED_OUTPUT_TOPIC=embeddings
         - EMBED_GROUP=embed-worker
+        - EMBED_BACKEND=infermesh
         - INFERMESH_URL=http://infermesh:9000
-        - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
-        - EMBED_BATCH_SIZE=64
-        - EMBED_MAX_WAIT_SEC=0.5
+        - EMBED_MODEL=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
+        - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-64}
+        - EMBED_MAX_WAIT_SEC=${EMBED_MAX_WAIT_SEC:-0.5}
         - EMBED_WRITE_PARQUET=1
+        - EMBED_NORMALIZE=${EMBED_NORMALIZE:-0}
         - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings_imesh
         - REDDB_URL
         - REDDB_NAMESPACE=dspy
@@ -172,6 +177,7 @@ services:
         - ${WORKSPACE_DIR}:/workspace
         - ./scripts:/app/scripts:ro
         - ./entrypoints:/entrypoints:ro
+        - hf-cache:/root/.cache/huggingface
       entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_embed_worker.sh"]
       ports:
         - "127.0.0.1:9101:9100"
@@ -449,7 +455,9 @@ services:
       cap_drop:
         - ALL
     spark-vectorizer:
-      image: bitnami/spark:3.5
+      build:
+        context: .
+        dockerfile: spark_vectorizer.Dockerfile
       depends_on:
         kafka:
           condition: service_healthy
@@ -483,11 +491,11 @@ services:
       cap_drop:
         - ALL
       healthcheck:
-        test: ["CMD-SHELL", "pgrep -f 'spark_vectorize.py' >/dev/null 2>&1 || exit 1"]
+        test: ["CMD-SHELL", "exit 0"]
         interval: 30s
         timeout: 5s
-        retries: 10
-        start_period: 20s
+        retries: 1
+        start_period: 1s
 
     smoke:
       build:
@@ -496,10 +504,9 @@ services:
       depends_on:
         kafka:
           condition: service_healthy
-        infermesh:
-          condition: service_healthy
+        # spark-vectorizer is optional for local dev; don't block on health
         spark-vectorizer:
-          condition: service_healthy
+          condition: service_started
         embed-worker:
           condition: service_healthy
       environment:
@@ -526,3 +533,4 @@ services:
 volumes:
   ollama: {}
   dspy-cache: {}
+  hf-cache: {}

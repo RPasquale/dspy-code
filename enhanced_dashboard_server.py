@@ -18,6 +18,8 @@ import urllib.error
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
+import uuid
+import itertools
 
 # Analytics utilities
 try:
@@ -99,6 +101,12 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
     _dev_cycle_running: bool = False
     _dev_cycle_log_path = _DEV_CYCLE_LOG
 
+    # Experiments (class-level state)
+    _experiments: dict[str, dict] = {}
+    _experiment_logs: dict[str, list[str]] = {}
+    _experiment_threads: dict[str, threading.Thread] = {}
+    _experiments_dir = TRACE_DIR / 'experiments'
+
     def __init__(self, *args, **kwargs):
         # Initialize data manager before calling super().__init__
         self.data_manager = get_enhanced_data_manager()
@@ -150,6 +158,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             '/api/actions/stream': self.serve_actions_stream,
             '/api/monitor/stream': self.serve_monitor_stream,
             '/api/vectorizer-metrics': self.serve_vectorizer_metrics,
+            '/api/pipeline/status': self.serve_pipeline_status,
             '/api/vectorizer/stream': self.serve_vectorizer_stream,
             '/api/signatures': self.serve_signatures,
             '/api/signature-detail': self.serve_signature_detail,
@@ -212,11 +221,19 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             # Dev cycle
             '/api/dev-cycle/status': self.serve_dev_cycle_status,
             '/api/dev-cycle/stream': self.serve_dev_cycle_stream,
+            '/api/stack/smoke': self.handle_stack_smoke_status,
+            '/api/embedding/index/status': self.serve_embedding_index_status,
             '/api/dev-cycle/logs': self.serve_dev_cycle_logs,
             # System resources
             '/api/system/resources': self.serve_system_resources,
             '/api/system/resources/stream': self.serve_system_resources_stream,
             '/api/system/workspace': self.serve_system_workspace,
+            # Experiments API
+            '/api/experiments/status': self.serve_experiment_status,
+            '/api/experiments/history': self.serve_experiment_history,
+            '/api/experiments/stream': self.serve_experiment_stream,
+            '/api/datasets/preview': self.serve_dataset_preview,
+            '/api/experiments/sweep': self.handle_experiment_sweep,
         }
 
         handler = api_routes.get(path)
@@ -330,6 +347,10 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_grpo_auto_stop()
         elif path == '/api/grpo/apply-policy':
             self.handle_grpo_apply_policy()
+        elif path == '/api/stack/smoke':
+            self.handle_stack_smoke_post()
+        elif path == '/api/embedding/index/build':
+            self.handle_embedding_index_build()
         elif path == '/api/debug/trace':
             self.handle_debug_trace_post()
         elif path == '/api/system/workspace':
@@ -344,8 +365,18 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_response({'error': 'admin only'}, 403)
                 return
             self.handle_dev_cycle_stop()
+        elif path == '/api/experiments/run':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_experiment_run()
         elif path == '/api/mesh/tail/to-grpo':
             self.handle_mesh_tail_to_grpo()
+        elif path == '/api/experiments/sweep':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_experiment_sweep()
         else:
             self.send_error(404)
 
@@ -4237,6 +4268,401 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             pass
 
+    # -------------------------
+    # Experiments API handlers
+    # -------------------------
+    def _exp_log(self, exp_id: str, text: str) -> None:
+        cls = type(self)
+        try:
+            cls._experiment_logs.setdefault(exp_id, []).append(text)
+            if len(cls._experiment_logs[exp_id]) > 500:
+                cls._experiment_logs[exp_id] = cls._experiment_logs[exp_id][-500:]
+            # persist append
+            cls._experiments_dir.mkdir(parents=True, exist_ok=True)
+            (cls._experiments_dir / f'{exp_id}.log').open('a', encoding='utf-8').write(text + '\n')
+        except Exception:
+            pass
+
+    def _exp_update(self, exp_id: str, fields: dict) -> None:
+        cls = type(self)
+        s = cls._experiments.get(exp_id, {})
+        s.update(fields)
+        cls._experiments[exp_id] = s
+        try:
+            cls._experiments_dir.mkdir(parents=True, exist_ok=True)
+            (cls._experiments_dir / 'history.jsonl').open('a', encoding='utf-8').write(json.dumps({'id': exp_id, 'ts': time.time(), **fields}) + '\n')
+        except Exception:
+            pass
+
+    def _read_jsonl(self, p: Path, limit: int = 1000) -> list:
+        out = []
+        try:
+            with p.open('r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                        if len(out) >= limit:
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return out
+
+    def _load_dataset(self, path: Path, max_count: int | None = None) -> list[str]:
+        texts: list[str] = []
+        try:
+            if path.suffix.lower() in ('.jsonl', '.json'):
+                with path.open('r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            t = obj.get('text') if isinstance(obj, dict) else None
+                            if isinstance(t, str) and t.strip():
+                                texts.append(t)
+                        except Exception:
+                            continue
+                        if max_count and len(texts) >= max_count:
+                            break
+            else:
+                with path.open('r', encoding='utf-8') as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if ln:
+                            texts.append(ln)
+                            if max_count and len(texts) >= max_count:
+                                break
+        except Exception:
+            pass
+        return texts
+
+    def handle_experiment_run(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0') or '0')
+            raw = self.rfile.read(length) if length > 0 else b'{}'
+            cfg = json.loads(raw.decode('utf-8') or '{}')
+            model = (cfg.get('model') or os.getenv('INFERMESH_MODEL') or 'BAAI/bge-small-en-v1.5').strip()
+            dataset = cfg.get('dataset_path') or ''
+            max_count = int(cfg.get('max_count') or 0) or None
+            batch_size = int(cfg.get('batch_size') or os.getenv('EMBED_BATCH_SIZE') or 64)
+            normalize = bool(cfg.get('normalize') or (os.getenv('EMBED_NORMALIZE','0').lower() in ('1','true','yes','on')))
+            url = (cfg.get('infermesh_url') or os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+            # When running outside compose, allow localhost fallback
+            if url.startswith('http://infermesh') and not os.getenv('IN_DOCKER'):
+                url = 'http://127.0.0.1:19000'
+
+            if not dataset:
+                self.send_json_response({'ok': False, 'error': 'dataset_path required'}, 400)
+                return
+
+            ds_path = (self.workspace / dataset) if not dataset.startswith('/') else Path(dataset)
+            texts = self._load_dataset(ds_path, max_count=max_count)
+            if not texts:
+                self.send_json_response({'ok': False, 'error': f'no texts loaded from {ds_path}'}, 400)
+                return
+
+            exp_id = uuid.uuid4().hex[:12]
+            cls = type(self)
+            cls._experiment_logs[exp_id] = []
+            self._exp_update(exp_id, {'status': 'starting', 'model': model, 'dataset': str(ds_path), 'batch_size': batch_size, 'normalize': normalize, 'total': len(texts)})
+            self._exp_log(exp_id, f"[exp {exp_id}] model={model} dataset={ds_path} items={len(texts)} batch={batch_size} normalize={normalize}")
+
+            def _runner():
+                t0 = time.time(); done = 0
+                try:
+                    for i in range(0, len(texts), batch_size):
+                        chunk = texts[i:i+batch_size]
+                        payload = json.dumps({'model': model, 'inputs': chunk}).encode('utf-8')
+                        req = urllib.request.Request(url.rstrip('/') + '/embed', data=payload, headers={'Content-Type': 'application/json'})
+                        try:
+                            with urllib.request.urlopen(req, timeout=60) as resp:
+                                _ = resp.read()
+                        except Exception as e:
+                            self._exp_log(exp_id, f"[error] request failed at offset={i}: {e}")
+                        done += len(chunk)
+                        if done % (batch_size*4) == 0 or done == len(texts):
+                            elapsed = time.time() - t0
+                            rate = done/elapsed if elapsed>0 else 0.0
+                            self._exp_update(exp_id, {'status': 'running', 'done': done, 'elapsed': elapsed, 'rate': rate})
+                    elapsed = time.time() - t0
+                    rate = done/elapsed if elapsed>0 else 0.0
+                    self._exp_update(exp_id, {'status': 'completed', 'done': done, 'elapsed': elapsed, 'rate': rate, 'finished_ts': time.time()})
+                    self._exp_log(exp_id, f"[done] items={done} seconds={elapsed:.3f} rate={rate:.2f}/s")
+                except Exception as e:
+                    self._exp_update(exp_id, {'status': 'error', 'error': str(e)})
+                    self._exp_log(exp_id, f"[error] {e}")
+
+            th = threading.Thread(target=_runner, daemon=True)
+            cls._experiment_threads[exp_id] = th
+            th.start()
+            self.send_json_response({'ok': True, 'id': exp_id})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    def handle_experiment_sweep(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0') or '0')
+            raw = self.rfile.read(length) if length > 0 else b'{}'
+            cfg = json.loads(raw.decode('utf-8') or '{}')
+            models = cfg.get('models') or []
+            batches = cfg.get('batch_sizes') or []
+            dataset = cfg.get('dataset_path') or ''
+            max_count = int(cfg.get('max_count') or 0) or None
+            normalize = bool(cfg.get('normalize') or (os.getenv('EMBED_NORMALIZE','0').lower() in ('1','true','yes','on')))
+            url = (cfg.get('infermesh_url') or os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+            if url.startswith('http://infermesh') and not os.getenv('IN_DOCKER'):
+                url = 'http://127.0.0.1:19000'
+
+            if not dataset:
+                self.send_json_response({'ok': False, 'error': 'dataset_path required'}, 400)
+                return
+            if not isinstance(models, list) or not models:
+                models = [os.getenv('INFERMESH_MODEL') or 'BAAI/bge-small-en-v1.5']
+            if not isinstance(batches, list) or not batches:
+                batches = [int(os.getenv('EMBED_BATCH_SIZE') or 32)]
+
+            ds_path = (self.workspace / dataset) if not dataset.startswith('/') else Path(dataset)
+            texts = self._load_dataset(ds_path, max_count=max_count)
+            if not texts:
+                self.send_json_response({'ok': False, 'error': f'no texts loaded from {ds_path}'}, 400)
+                return
+
+            sweep_id = 'sweep_' + uuid.uuid4().hex[:10]
+            cls = type(self)
+            cls._experiment_logs[sweep_id] = []
+            combos = [(m, int(b)) for m in models for b in batches]
+            result_rows: list[dict] = []
+            self._exp_update(sweep_id, {'status': 'starting', 'type': 'sweep', 'dataset': str(ds_path), 'total': len(texts), 'combos': combos})
+            self._exp_log(sweep_id, f"[sweep {sweep_id}] dataset={ds_path} items={len(texts)} combos={len(combos)}")
+
+            def _runner():
+                try:
+                    for model, batch_size in combos:
+                        t0 = time.time(); done = 0
+                        for i in range(0, len(texts), batch_size):
+                            chunk = texts[i:i+batch_size]
+                            payload = json.dumps({'model': model, 'inputs': chunk}).encode('utf-8')
+                            req = urllib.request.Request(url.rstrip('/') + '/embed', data=payload, headers={'Content-Type': 'application/json'})
+                            try:
+                                with urllib.request.urlopen(req, timeout=60) as resp:
+                                    _ = resp.read()
+                            except Exception as e:
+                                self._exp_log(sweep_id, f"[error] model={model} batch={batch_size} offset={i}: {e}")
+                            done += len(chunk)
+                        elapsed = time.time() - t0
+                        rate = done/elapsed if elapsed>0 else 0.0
+                        row = {'model': model, 'batch_size': batch_size, 'items': done, 'seconds': round(elapsed,3), 'rate_sec': round(rate,2), 'normalize': normalize}
+                        result_rows.append(row)
+                        self._exp_log(sweep_id, f"[result] {row}")
+                        self._exp_update(sweep_id, {'status': 'running', 'last': row, 'results': result_rows[-10:]})
+                    # Finalize
+                    best = None
+                    for r in result_rows:
+                        if not best or (r.get('rate_sec',0) > best.get('rate_sec',0)):
+                            best = r
+                    summary = {'status': 'completed', 'type': 'sweep', 'count': len(result_rows), 'best': best, 'results': result_rows, 'finished_ts': time.time()}
+                    self._exp_update(sweep_id, summary)
+                    self._exp_log(sweep_id, f"[done] best={best}")
+                except Exception as e:
+                    self._exp_update(sweep_id, {'status': 'error', 'error': str(e)})
+                    self._exp_log(sweep_id, f"[error] {e}")
+
+            th = threading.Thread(target=_runner, daemon=True)
+            cls._experiment_threads[sweep_id] = th
+            th.start()
+            self.send_json_response({'ok': True, 'id': sweep_id})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    def serve_experiment_status(self):
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            exp_id = (qs.get('id') or [''])[0]
+            if not exp_id:
+                self.send_json_response({'error': 'id required'}, 400)
+                return
+            s = type(self)._experiments.get(exp_id) or {}
+            s = {'id': exp_id, **s, 'logs': list(type(self)._experiment_logs.get(exp_id, [])[-50:])}
+            self.send_json_response(s)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_experiment_history(self):
+        try:
+            rows = self._read_jsonl(type(self)._experiments_dir / 'history.jsonl', limit=500)
+            self.send_json_response({'items': rows[-100:]})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_experiment_stream(self):
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            exp_id = (qs.get('id') or [''])[0]
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            pos = 0
+            for _ in range(600):
+                try:
+                    lines = type(self)._experiment_logs.get(exp_id, [])
+                    chunk = lines[pos:]
+                    pos = len(lines)
+                    for ln in chunk:
+                        self.wfile.write(f"data: {json.dumps(ln)}\n\n".encode('utf-8'))
+                        self.wfile.flush()
+                except Exception:
+                    pass
+                time.sleep(1)
+        except Exception:
+            pass
+
+    def serve_dataset_preview(self):
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            dataset = (qs.get('path') or [''])[0]
+            if not dataset:
+                self.send_json_response({'error': 'path required'}, 400)
+                return
+            p = (self.workspace / dataset) if not dataset.startswith('/') else Path(dataset)
+            texts = self._load_dataset(p, max_count=5)
+            self.send_json_response({'path': str(p), 'preview': texts})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    # Stack smoke test --------------------------------------------------------
+    def handle_stack_smoke_status(self):
+        try:
+            # Simple GET to confirm endpoint presence
+            self.send_json_response({'ok': True, 'hint': 'POST with {"n_messages":5,"topic":"agent.results.app"}'})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    def handle_stack_smoke_post(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+        except Exception:
+            data = {}
+        try:
+            try:
+                from confluent_kafka import Producer as _Producer  # type: ignore
+            except Exception:
+                self.send_json_response({'ok': False, 'error': 'confluent-kafka not available in this image'}, 500)
+                return
+            n = int(data.get('n_messages') or data.get('n') or 5)
+            topic = (data.get('topic') or 'agent.results.app').strip()
+            bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS') or os.getenv('KAFKA_BOOTSTRAP') or 'kafka:9092'
+            p = _Producer({'bootstrap.servers': bootstrap})
+            now = int(time.time())
+            sent = 0
+            for i in range(max(1, n)):
+                msg = {
+                    'text': f'Smoke test text {i} @ {now}',
+                    'doc_id': f'smoke-{now}-{i}',
+                    'topic': 'agent',
+                    'kafka_ts': time.time(),
+                }
+                try:
+                    p.produce(topic, json.dumps(msg).encode('utf-8'))
+                    sent += 1
+                except Exception:
+                    pass
+            try:
+                p.flush(2.0)
+            except Exception:
+                pass
+            # Optionally probe embed-worker metrics if configured
+            embed_metrics = None
+            try:
+                url = os.getenv('EMBED_WORKER_METRICS_URL', 'http://embed-worker:9100/metrics')
+                req = urllib.request.Request(url, method='GET')
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    embed_metrics = json.loads(resp.read().decode('utf-8'))
+            except Exception:
+                embed_metrics = None
+            self.send_json_response({'ok': True, 'produced': sent, 'topic': topic, 'bootstrap': bootstrap, 'embed_metrics': embed_metrics})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    # Embeddings index build (InferMesh-enabled) --------------------------------
+    def _emb_status_path(self) -> Path:
+        return (self.workspace / '.dspy_reports' / 'emb_index_status.json')
+
+    def _write_emb_status(self, data: dict) -> None:
+        try:
+            p = self._emb_status_path(); p.parent.mkdir(parents=True, exist_ok=True)
+            data['ts'] = time.time()
+            p.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+
+    def serve_embedding_index_status(self):
+        try:
+            p = self._emb_status_path()
+            if not p.exists():
+                self.send_json_response({'exists': False, 'status': 'idle'})
+                return
+            self.send_json_response({'exists': True, **(json.loads(p.read_text()) or {})})
+        except Exception as e:
+            self.send_json_response({'exists': False, 'error': str(e)}, 500)
+
+    def handle_embedding_index_build(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            body = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+        except Exception:
+            body = {}
+        try:
+            # Params
+            model = (body.get('model') or os.getenv('EMBED_MODEL') or 'sentence-transformers/all-MiniLM-L6-v2')
+            base = (body.get('url') or os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+            api_key = os.getenv('INFERMESH_API_KEY')
+            lines = int(body.get('lines_per_chunk') or 200)
+            use_infer = bool(body.get('infermesh', True)) or bool(os.getenv('INFERMESH_URL'))
+            # Mark status
+            self._write_emb_status({'status': 'running', 'model': model, 'url': base, 'count': 0})
+            # Run in thread to avoid blocking
+            def _run():
+                try:
+                    from dspy_agent.embedding.embeddings_index import build_emb_index, save_emb_index  # type: ignore
+                    embedder = None
+                    if use_infer:
+                        try:
+                            from dspy_agent.embedding.infermesh import InferMeshEmbedder  # type: ignore
+                            embedder = InferMeshEmbedder(base, model, api_key=api_key)
+                        except Exception:
+                            embedder = None
+                    if embedder is None:
+                        try:
+                            from sentence_transformers import SentenceTransformer  # type: ignore
+                            embedder = SentenceTransformer(model)
+                        except Exception:
+                            embedder = None
+                    if embedder is None:
+                        try:
+                            import dspy as _dspy  # type: ignore
+                            embedder = _dspy.Embeddings(model=model)
+                        except Exception as e:
+                            self._write_emb_status({'status': 'error', 'error': f'embeddings unavailable: {e}'})
+                            return
+                    items = build_emb_index(self.workspace, embedder, lines_per_chunk=lines, smart=True)
+                    out = save_emb_index(self.workspace, items, persist=False)
+                    self._write_emb_status({'status': 'done', 'model': model, 'url': base, 'count': len(items), 'out': str(out)})
+                except Exception as e:
+                    self._write_emb_status({'status': 'error', 'error': str(e)})
+            import threading as _th
+            _th.Thread(target=_run, daemon=True).start()
+            self.send_json_response({'ok': True, 'started': True, 'model': model, 'infermesh': use_infer})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
     def handle_dev_cycle_stop(self):
         cls = type(self)
         try:
@@ -5145,6 +5571,28 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
+    def serve_pipeline_status(self):
+        try:
+            stats = self._vectorizer_stats()
+            # embed-worker metrics reachability
+            embed_ok = False
+            embed_data = None
+            try:
+                url = os.getenv('EMBED_WORKER_METRICS_URL', 'http://embed-worker:9100/metrics')
+                req = urllib.request.Request(url, method='GET')
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    embed_data = json.loads(resp.read().decode('utf-8'))
+                    embed_ok = True
+            except Exception:
+                embed_ok = False
+            self.send_json_response({
+                'vectorizer': stats,
+                'embed_worker': {'ok': embed_ok, 'metrics': embed_data},
+                'timestamp': time.time(),
+            })
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
     def serve_vectorizer_stream(self):
         try:
             self.send_response(200)
@@ -5706,6 +6154,7 @@ if __name__ == "__main__":
             self.send_json_response({'success': True})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
+
 try:
     from dspy_agent.mesh.core import MeshCoreClient
 except Exception:

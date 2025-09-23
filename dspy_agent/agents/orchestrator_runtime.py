@@ -193,12 +193,24 @@ def evaluate_tool_choice(
         k = int(argd.get('k', 5))
         try:
             from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
-            import dspy as _dspy
-            # Embeddings model is required in DSPy mode; default to a small open model name or require user to provide
-            model = argd.get('model') or 'openai/text-embedding-3-small'
-            embedder = _dspy.Embeddings(model=model)
+            import os as _os
             items = load_emb_index(workspace)
-            qv = _embed_query(embedder, q)
+            # Prefer InferMesh when configured
+            try:
+                if _os.getenv('INFERMESH_URL'):
+                    from ..embedding.infermesh import InferMeshEmbedder as _IME  # type: ignore
+                    _base = (_os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                    _model = (argd.get('model') or _os.getenv('EMBED_MODEL') or 'sentence-transformers/all-MiniLM-L6-v2')
+                    _embedder = _IME(_base, _model, api_key=_os.getenv('INFERMESH_API_KEY'))
+                else:
+                    import dspy as _dspy
+                    _model = argd.get('model') or 'openai/text-embedding-3-small'
+                    _embedder = _dspy.Embeddings(model=_model)
+            except Exception:
+                import dspy as _dspy
+                _model = argd.get('model') or 'openai/text-embedding-3-small'
+                _embedder = _dspy.Embeddings(model=_model)
+            qv = _embed_query(_embedder, q)
             hits = _emb_search(qv, items, top_k=k)
         except Exception:
             hits = []
@@ -343,11 +355,23 @@ def evaluate_tool_choice(
         vretr_hits = []
         try:
             from .embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query
-            import dspy as _dspy
-            model = argd.get('model') or 'openai/text-embedding-3-small'
-            embedder = _dspy.Embeddings(model=model)
+            import os as _os
             items = load_emb_index(workspace)
-            qv = _embed_query(embedder, q)
+            try:
+                if _os.getenv('INFERMESH_URL'):
+                    from ..embedding.infermesh import InferMeshEmbedder as _IME  # type: ignore
+                    _base = (_os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                    _model = (argd.get('model') or _os.getenv('EMBED_MODEL') or 'sentence-transformers/all-MiniLM-L6-v2')
+                    _embedder = _IME(_base, _model, api_key=_os.getenv('INFERMESH_API_KEY'))
+                else:
+                    import dspy as _dspy
+                    _model = argd.get('model') or 'openai/text-embedding-3-small'
+                    _embedder = _dspy.Embeddings(model=_model)
+            except Exception:
+                import dspy as _dspy
+                _model = argd.get('model') or 'openai/text-embedding-3-small'
+                _embedder = _dspy.Embeddings(model=_model)
+            qv = _embed_query(_embedder, q)
             vretr_hits = _emb_search(qv, items, top_k=k)
         except Exception:
             vretr_hits = []

@@ -94,6 +94,49 @@ make test-docker        # runs pytest -m docker with DOCKER_TESTS=1
   - Download Logs: `GET /api/dev-cycle/logs` (text/plain attachment)
 - Compose compatibility: the script validates `docker/lightweight/docker-compose.yml` and, if your Compose requires env mappings, rewrites `environment:` list items (`- KEY=VAL` / `- KEY`) into mapping style (`KEY: "VAL"` / `KEY: ${KEY:-}`) and uses the rewritten file automatically.
 
+## Experiments (CPU‑only or with external InferMesh)
+
+- Start experiment (admin):
+  - `POST /api/experiments/run` with JSON:
+    - `model` (optional, defaults to env `INFERMESH_MODEL`)
+    - `dataset_path` (JSONL with `{ "text": str }` per line, or TXT one text per line)
+    - `max_count` (optional int)
+    - `batch_size` (optional, defaults to env `EMBED_BATCH_SIZE`)
+    - `normalize` (optional bool)
+  - Returns `{ ok: true, id }` and streams logs via `GET /api/experiments/stream?id=<id>`.
+- Status/history
+  - `GET /api/experiments/status?id=<id>` → progress, rate, logs
+  - `GET /api/experiments/history` → recent experiment entries
+  - `GET /api/datasets/preview?path=...` → first few lines
+- Storage
+  - Logs under `.dspy_reports/experiments/<id>.log`
+  - History under `.dspy_reports/experiments/history.jsonl`
+
+Local CPU InferMesh
+- Build + up: `docker compose -f docker/lightweight/docker-compose.yml --env-file docker/lightweight/.env up -d infermesh`
+- Health: `curl http://127.0.0.1:19000/health`
+- Configure cache: HuggingFace cache persisted via volume `hf-cache`.
+
 - Workspace & Guards
   - Set workspace path via the Guard Settings panel (UI) or `POST /api/system/workspace`.
   - Set guard thresholds (min_free_gb, min_ram_gb, min_vram_mb) via the Guard Settings panel or `POST /api/system/guard`.
+
+## Observability & Metrics
+
+The agent emits structured events to RedDB (and optionally Kafka) to power dashboards and training:
+
+- tool.start / tool.end: lifecycle for each command with args, session, success, score, duration_sec
+- rl.* events: rl.train.start/env_ready, rl.async.started/summary/finished, rl.ppo.start/finished, rl.neural.start/summary/finished
+- patch.apply: emitted on patch success/failure with diff stats
+- session.summary: rolling chat session summary (also stored in KV agent.session.summary)
+
+Tail streams:
+
+- RedDB: `python scripts/tail_agent_streams.py --stream agent.metrics`
+- Kafka: `python scripts/tail_agent_streams.py --kafka --stream agent.metrics --bootstrap localhost:9092`
+
+Lite dashboard:
+
+- `dspy-code-dashboard-lite` (or `python scripts/agent_dashboard_panel.py`)
+  - Shows per‑tool stats (count, success, avg_score, avg_dur), recent tool.end, and latest session summary.
+  - Flags: `--start`, `--interval`, `--workspace` to filter a specific workspace.

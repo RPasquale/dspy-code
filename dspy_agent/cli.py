@@ -149,7 +149,8 @@ from .provision.pricing import get_s3_storage_price_gb, get_gpu_hour_rate
 from .provision.aws_tf import write_terraform_bundle
 import re
 import time
-from .agents.knowledge import build_code_graph, summarize_code_graph
+from .agents.knowledge import build_code_graph, summarize_code_graph, neighbors as graph_neighbors
+from .routing.offline_router import offline_route
 # Legacy helpers rely on template assets internally
 from .stack import (
     DEFAULT_STACK_DIR,
@@ -189,6 +190,10 @@ from .preferences import PREFS_FILENAME, write_default_preferences
 from .policy import update_policy_with_feedback, POLICY_YAML, POLICY_JSON
 from .grpo.mining import mine_reddb_to_grpo
 from .grpo.trainer import GRPOConfig as _GRPOConfig, GRPOTrainer as _GRPOTrainer
+from .rl.rl_helpers import (
+    load_effective_rl_config_dict as _load_effective_rl_config_dict,
+    rl_config_from_dict as _rl_config_from_dict,
+)
 
 # Nested CLI groups (will be registered after app is created)
 rl_app = typer.Typer(no_args_is_help=True, help="Reinforcement Learning commands")
@@ -197,6 +202,7 @@ rl_config_app = typer.Typer(no_args_is_help=True, help="RL config helpers")
 rl_app.add_typer(rl_config_app, name="config")
 prefs_app = typer.Typer(no_args_is_help=True, help="Agent preference rules")
 rl_app.add_typer(prefs_app, name="prefs")
+config_app = typer.Typer(no_args_is_help=True, help="Agent config helpers (routing, embeddings)")
 stack_app = typer.Typer(no_args_is_help=True, help="Docker stack helper commands")
 feedback_app = typer.Typer(no_args_is_help=True, help="Capture feedback and scaffold tests")
 
@@ -1051,6 +1057,24 @@ def prefs_init(
         console.print(Panel(escape(str(e)), title="prefs init failed", border_style="red"))
 
 
+@config_app.command("init")
+def config_init(
+    out: Path = typer.Option(Path(".dspy_agent.json"), '--out', help="Path to write agent config JSON"),
+):
+    """Write a starter agent config file (.dspy_agent.json)."""
+    try:
+        out = out if out.is_absolute() else (Path.cwd() / out)
+        if out.exists():
+            console.print(Panel.fit(f"Config file already exists: {out}", title="config", border_style="yellow"))
+            return
+        from .agent_config import load_agent_config
+        cfg = load_agent_config(out.parent)
+        out.write_text(json.dumps(cfg, indent=2))
+        console.print(Panel.fit(f"Wrote agent config to {out}", title="config", border_style="green"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="config init failed", border_style="red"))
+
+
 # -----------------------------
 # Feedback capture & scaffolds
 # -----------------------------
@@ -1201,6 +1225,7 @@ def rl_train(
     epsilon: float = typer.Option(0.1, '--epsilon', help="Epsilon for epsilon-greedy"),
     ucb_c: float = typer.Option(2.0, '--ucb-c', help="UCB1 exploration constant"),
     neural: bool = typer.Option(False, '--neural/--no-neural', help="Use neural REINFORCE trainer"),
+    vector_path: Optional[Path] = typer.Option(None, '--vector-path', help="Attach vector feeder context from this embeddings dir (e.g., /workspace/vectorized/embeddings_imesh)"),
     puffer: bool = typer.Option(False, '--puffer/--no-puffer', help="Use PufferLib vectorization (bandits only)"),
     rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Path to RL config JSON"),
     verifiers_module: Optional[str] = typer.Option(None, '--verifiers-module', help="Override verifiers module"),
@@ -1209,95 +1234,25 @@ def rl_train(
     build_cmd: Optional[str] = typer.Option(None, '--build-cmd', help="Override build command"),
     timeout_sec: Optional[int] = typer.Option(None, '--timeout-sec', help="Per-tool timeout in seconds"),
 ):
-    """Train an RL policy over the local toolchain (tests/lint/build)."""
-    # Load config if provided
-    cfg: Optional[_RLConfig] = None
-    if rl_config:
-        try:
-            cfg = _load_rl_config(rl_config)
-        except Exception as e:
-            console.print(Panel(escape(str(e)), title="rl config load failed", border_style="red"))
-            raise typer.Exit(1)
-    else:
-        cfg_data = _load_effective_rl_config_dict(workspace)
-        if cfg_data:
-            try:
-                cfg = _rl_config_from_dict(cfg_data)
-            except Exception:
-                cfg = None
-
-    # Resolve effective parameters (CLI > config defaults)
-    eff_policy = policy or (cfg.policy if cfg else "epsilon-greedy")
-    eff_epsilon = epsilon if epsilon is not None else ((cfg.epsilon if cfg else 0.1))
-    eff_ucb_c = ucb_c if ucb_c is not None else ((cfg.ucb_c if cfg else 2.0))
-    eff_n_envs = n_envs or (cfg.n_envs if cfg else 2)
-    # Respect explicit CLI toggle for puffer; else fall back to config
-    explicit_puffer = ('--puffer' in sys.argv) or ('--no-puffer' in sys.argv)
-    eff_puffer = (puffer if explicit_puffer else (cfg.puffer if cfg else False))
-    eff_verifiers_mod = verifiers_module or ((cfg.verifiers_module if cfg else None))
-
-    eff_weights = (cfg.weights if cfg and cfg.weights else {"pass_rate": 1.0, "blast_radius": 1.0})
-    eff_pen = cfg.penalty_kinds if cfg else []
-    eff_clamp = cfg.clamp01_kinds if cfg else []
-    eff_scales = cfg.scales if cfg else {}
-    eff_test = test_cmd if test_cmd is not None else ((cfg.test_cmd if cfg else None))
-    eff_lint = lint_cmd if lint_cmd is not None else ((cfg.lint_cmd if cfg else None))
-    eff_build = build_cmd if build_cmd is not None else ((cfg.build_cmd if cfg else None))
-    eff_to = timeout_sec if timeout_sec is not None else ((cfg.timeout_sec if cfg else None))
-    eff_actions = cfg.actions if cfg and getattr(cfg, 'actions', None) else None
-
-    make_env = _rl_build_make_env(
-        workspace,
-        verifiers_module=eff_verifiers_mod,
-        weights=eff_weights,
-        penalty_kinds=eff_pen,
-        clamp01_kinds=eff_clamp,
-        scales=eff_scales,
-        test_cmd=eff_test,
-        lint_cmd=eff_lint,
-        build_cmd=eff_build,
-        timeout_sec=eff_to,
-        actions=eff_actions,
+    """Delegate to trainers module to avoid duplication."""
+    from .cli_rl_trainers import train as _train  # local import to avoid circular init
+    _train(
+        workspace=workspace,
+        steps=steps,
+        n_envs=n_envs,
+        policy=policy,
+        epsilon=epsilon,
+        ucb_c=ucb_c,
+        neural=neural,
+        vector_path=vector_path,
+        puffer=puffer,
+        rl_config=rl_config,
+        verifiers_module=verifiers_module,
+        test_cmd=test_cmd,
+        lint_cmd=lint_cmd,
+        build_cmd=build_cmd,
+        timeout_sec=timeout_sec,
     )
-
-    # Build trainer config
-    kwargs: dict[str, _typing.Any] = {}
-    pol = (eff_policy or "epsilon-greedy").lower().strip()
-    if pol in {"epsilon", "epsilon-greedy", "egreedy", "eps"}:
-        kwargs["epsilon"] = float(eff_epsilon)
-    elif pol in {"ucb", "ucb1"}:
-        kwargs["c"] = float(eff_ucb_c)
-
-    try:
-        if neural:
-            stats = _rl_train_puffer_policy(make_env=make_env, steps=int(steps), n_envs=int(eff_n_envs), verbose=True, log_interval=max(1, int(steps)//10 or 1))
-        elif eff_puffer:
-            tcfg = _RLTrainerConfig(steps=int(steps), policy=eff_policy, policy_kwargs=kwargs, n_envs=int(eff_n_envs))
-            try:
-                stats = _rl_bandit_trainer_puffer(make_env, tcfg)
-            except Exception as e:
-                # Graceful fallback if pufferlib missing
-                console.print("[yellow]PufferLib unavailable or failed; falling back to non-vectorized bandit.[/yellow]")
-                tcfg_fallback = _RLTrainerConfig(steps=int(steps), policy=eff_policy, policy_kwargs=kwargs, n_envs=1)
-                stats = _rl_bandit_trainer(make_env, tcfg_fallback)
-        else:
-            tcfg = _RLTrainerConfig(steps=int(steps), policy=eff_policy, policy_kwargs=kwargs, n_envs=1)
-            stats = _rl_bandit_trainer(make_env, tcfg)
-    except Exception as e:
-        console.print(Panel(escape(str(e)), title="rl train failed", border_style="red"))
-        raise typer.Exit(1)
-
-    # Summarize
-    r = stats.rewards or []
-    avg = (sum(r) / len(r)) if r else 0.0
-    last = r[-10:]
-    tools = Counter([str(it.get("tool", "")) for it in (stats.infos or []) if isinstance(it, dict)])
-    body = (
-        f"steps={len(r)} avg_reward={avg:.3f}\n"
-        f"last10={[round(x,3) for x in last]}\n"
-        f"tools={dict(tools)}"
-    )
-    console.print(Panel.fit(body, title="rl train result", border_style="cyan"))
 
 
 @rl_app.command("guide")
@@ -1428,70 +1383,19 @@ def rl_async_train(
     rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Optional RL config JSON"),
     wall_clock: float = typer.Option(120.0, '--wall-clock', help="Seconds to run before stopping"),
 ):
-    """Run the asynchronous rollout→judge→learner pipeline."""
-
-    cfg: Optional[_RLConfig] = None
-    if rl_config:
-        try:
-            cfg = _load_rl_config(rl_config)
-        except Exception as e:
-            console.print(Panel(escape(str(e)), title="rl config load failed", border_style="red"))
-            raise typer.Exit(1)
-    else:
-        cfg_data = _load_effective_rl_config_dict(workspace)
-        if cfg_data:
-            try:
-                cfg = _rl_config_from_dict(cfg_data)
-            except Exception:
-                cfg = None
-
-    make_env = _rl_build_make_env(
-        workspace,
-        verifiers_module=(cfg.verifiers_module if cfg else None) if cfg else None,
-        weights=(cfg.weights if cfg and cfg.weights else {"pass_rate": 1.0, "blast_radius": 1.0}),
-        penalty_kinds=(cfg.penalty_kinds if cfg else []),
-        clamp01_kinds=(cfg.clamp01_kinds if cfg else []),
-        scales=(cfg.scales if cfg else {}),
-        test_cmd=(cfg.test_cmd if cfg else None),
-        lint_cmd=(cfg.lint_cmd if cfg else None),
-        build_cmd=(cfg.build_cmd if cfg else None),
-        timeout_sec=(cfg.timeout_sec if cfg else None),
-        actions=(cfg.actions if cfg else None),
-    )
-
-    kwargs: Dict[str, float] = {}
-    pol = policy.lower().strip()
-    if pol in {"epsilon", "epsilon-greedy", "egreedy", "eps"}:
-        kwargs["epsilon"] = float(epsilon)
-    elif pol in {"ucb", "ucb1"}:
-        kwargs["c"] = float(ucb_c)
-
-    from .rl.async_loop import AsyncRLTrainer
-
-    trainer = AsyncRLTrainer(
-        make_env,
-        policy=policy,
-        policy_kwargs=kwargs,
+    """Delegate to trainers module to avoid duplication."""
+    from .cli_rl_trainers import async_train as _async_train  # local import
+    _async_train(
+        workspace=workspace,
+        steps=steps,
         rollout_workers=rollout_workers,
         judge_workers=judge_workers,
+        policy=policy,
+        epsilon=epsilon,
+        ucb_c=ucb_c,
+        rl_config=rl_config,
+        wall_clock=wall_clock,
     )
-    trainer.start()
-    console.print(Panel.fit(
-        f"Async trainer started with {rollout_workers} rollout worker(s) and {judge_workers} judge(s). Running for {wall_clock}s...",
-        title="async rl",
-        border_style="cyan",
-    ))
-    t0 = time.time()
-    try:
-        while time.time() - t0 < wall_clock and trainer.snapshot_stats().get("count", 0.0) < steps:
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        console.print("[yellow]Interrupted, stopping trainer...[/yellow]")
-    finally:
-        trainer.stop()
-        trainer.join()
-    summary = trainer.snapshot_stats()
-    console.print(Panel.fit(json.dumps(summary, indent=2), title="async stats", border_style="green"))
 
 
 @rl_app.command("ppo")
@@ -1501,36 +1405,9 @@ def rl_ppo(
     n_envs: int = typer.Option(4, '--n-envs', help="Vectorized environments"),
     total_steps: int = typer.Option(100_000, '--total-steps', help="Total PPO steps"),
 ):
-    """Run the PufferRL PPO shell with a vectorized env."""
-    cfg: Optional[_RLConfig] = None
-    if rl_config:
-        try:
-            cfg = _load_rl_config(rl_config)
-        except Exception as e:
-            console.print(Panel(escape(str(e)), title="rl config load failed", border_style="red"))
-            raise typer.Exit(1)
-
-    eff_actions = cfg.actions if cfg and getattr(cfg, 'actions', None) else None
-
-    make_env = _rl_build_make_env(
-        workspace,
-        verifiers_module=(cfg.verifiers_module if cfg else None),
-        weights=(cfg.weights if cfg else {"pass_rate": 1.0, "blast_radius": 1.0}),
-        penalty_kinds=(cfg.penalty_kinds if cfg else []),
-        clamp01_kinds=(cfg.clamp01_kinds if cfg else []),
-        scales=(cfg.scales if cfg else {}),
-        test_cmd=(cfg.test_cmd if cfg else None),
-        lint_cmd=(cfg.lint_cmd if cfg else None),
-        build_cmd=(cfg.build_cmd if cfg else None),
-        timeout_sec=(cfg.timeout_sec if cfg else None),
-        actions=eff_actions,
-    )
-
-    try:
-        _rl_run_puffer_ppo(make_env=make_env, n_envs=int(n_envs), total_steps=int(total_steps))
-    except Exception as e:
-        console.print(Panel(escape(str(e)), title="rl ppo failed", border_style="red"))
-        raise typer.Exit(1)
+    """Delegate to trainers module to avoid duplication."""
+    from .cli_rl_trainers import ppo as _ppo  # local import
+    _ppo(workspace=workspace, rl_config=rl_config, n_envs=n_envs, total_steps=total_steps)
 
 
 @rl_app.command("neural")
@@ -1547,50 +1424,21 @@ def rl_neural(
     checkpoint_interval: int = typer.Option(0, '--checkpoint-interval', help="Checkpoint interval (steps, 0=off)"),
     early_stop_patience: int = typer.Option(0, '--early-stop', help="Early stop patience (0=off)"),
 ):
-    """Neural REINFORCE trainer with stability options (torch required)."""
-    cfg_data = _load_effective_rl_config_dict(workspace)
-    cfg: Optional[_RLConfig] = None
-    if cfg_data:
-        try:
-            cfg = _rl_config_from_dict(cfg_data)
-        except Exception:
-            cfg = None
-    make_env = _rl_build_make_env(
-        workspace,
-        verifiers_module=(cfg.verifiers_module if cfg else None) if cfg else None,
-        weights=(cfg.weights if cfg and cfg.weights else {"pass_rate": 1.0, "blast_radius": 1.0}),
-        penalty_kinds=(cfg.penalty_kinds if cfg else []),
-        clamp01_kinds=(cfg.clamp01_kinds if cfg else []),
-        scales=(cfg.scales if cfg else {}),
-        test_cmd=(cfg.test_cmd if cfg else None),
-        lint_cmd=(cfg.lint_cmd if cfg else None),
-        build_cmd=(cfg.build_cmd if cfg else None),
-        timeout_sec=(cfg.timeout_sec if cfg else None),
-        actions=(cfg.actions if cfg else None),
+    """Delegate to trainers module to avoid duplication."""
+    from .cli_rl_trainers import neural as _neural  # local import
+    _neural(
+        workspace=workspace,
+        steps=steps,
+        n_envs=n_envs,
+        lr=lr,
+        entropy_coef=entropy_coef,
+        replay_capacity=replay_capacity,
+        replay_batch=replay_batch,
+        grad_clip=grad_clip,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_interval=checkpoint_interval,
+        early_stop_patience=early_stop_patience,
     )
-    try:
-        stats = _rl_train_puffer_policy(
-            make_env=make_env,
-            steps=int(steps),
-            n_envs=int(n_envs),
-            lr=float(lr),
-            verbose=True,
-            log_interval=max(1, int(steps)//10 or 1),
-            grad_clip=float(grad_clip),
-            checkpoint_dir=str(checkpoint_dir) if checkpoint_dir else None,
-            checkpoint_interval=int(checkpoint_interval),
-            early_stop_patience=int(early_stop_patience),
-            entropy_coef=float(entropy_coef),
-            replay_capacity=int(replay_capacity),
-            replay_batch=int(replay_batch),
-        )
-    except Exception as e:
-        console.print(Panel(escape(str(e)), title="rl neural failed", border_style="red"))
-        raise typer.Exit(1)
-    # Summarize
-    r = stats.rewards or []
-    avg = (sum(r) / len(r)) if r else 0.0
-    console.print(Panel.fit(f"steps={len(r)} avg_reward={avg:.3f}", title="rl neural", border_style="cyan"))
 
 
 # -----------------------------
@@ -1684,7 +1532,64 @@ CYBER_THEME = Theme({
     "dim": "dim",
 })
 app = typer.Typer(add_completion=False, help="DSPy-based local coding agent", no_args_is_help=False)
+# Console can be swapped to a plain printer at runtime (see --plain)
 console = Console(theme=CYBER_THEME)
+try:
+    # Optional grouped subcommands (gradual extraction)
+    from .cli_retrieval import retrieval_app as _retrieval_app  # type: ignore
+    app.add_typer(_retrieval_app, name="retrieval")
+except Exception:
+    pass
+try:
+    from .cli_patching import patch_app as _patch_app  # type: ignore
+    app.add_typer(_patch_app, name="patching")
+except Exception:
+    pass
+try:
+    # RL group wrapper; falls back to local rl_app if import fails
+    from .cli_rl import rl_group as _rl_group  # type: ignore
+    app.add_typer(_rl_group, name="rl")
+except Exception:
+    try:
+        app.add_typer(rl_app, name="rl")
+    except Exception:
+        pass
+try:
+    # RL trainer group wrappers
+    from .cli_rl_trainers import rl_trainers_app as _rl_trainers  # type: ignore
+    app.add_typer(_rl_trainers, name="rl-train")
+except Exception:
+    pass
+
+# Plain/CI output mode helpers ----------------------------------------------
+_PLAIN_MODE = False
+
+def _enable_plain_mode() -> None:
+    global _PLAIN_MODE, console
+    if _PLAIN_MODE:
+        return
+    _PLAIN_MODE = True
+    try:
+        # Lazy import to avoid Rich dependency if not needed
+        from .cli_output import PlainConsole  # type: ignore
+        console = PlainConsole()
+    except Exception:
+        # Fallback: basic shim
+        class _Shim:
+            def print(self, *objs, **kwargs):
+                for obj in objs:
+                    try:
+                        txt = getattr(obj, "renderable", obj)
+                    except Exception:
+                        txt = obj
+                    s = str(txt)
+                    # Strip obvious Rich color tags
+                    s = s.replace("[green]", "").replace("[/green]", "")
+                    s = s.replace("[yellow]", "").replace("[/yellow]", "")
+                    s = s.replace("[red]", "").replace("[/red]", "")
+                    s = s.replace("[cyan]", "").replace("[/cyan]", "")
+                    print(s)
+        console = _Shim()  # type: ignore
 LIGHTWEIGHT_DIR = Path('docker/lightweight')
 
 # Rationale printing controls -----------------------------------------------
@@ -1712,10 +1617,10 @@ def _maybe_inline_rationale(text: Optional[str]) -> None:
             console.print(f"[dim]Rationale: {t}[/dim]")
 
 # Register RL subcommands under main app
-app.add_typer(rl_app, name="rl")
 app.add_typer(grpo_app, name="grpo")
 app.add_typer(stack_app, name="stack")
 app.add_typer(feedback_app, name="feedback")
+app.add_typer(config_app, name="config")
 # New: provision and memory helpers
 provision_app = typer.Typer(no_args_is_help=True, help="Provisioning helpers (costs, plans)")
 memory_app = typer.Typer(no_args_is_help=True, help="Agent memory tools (status, trim, compact)")
@@ -1888,12 +1793,22 @@ def main(
     structured: bool = typer.Option(False, '--structured', help="Prefer structured outputs"),
     approval: Optional[str] = typer.Option(None, '--approval', help='Tool approval mode: auto|manual'),
     coding_mode: bool = typer.Option(False, '--coding-mode', help="Enhanced coding assistant mode with build/test integration"),
+    plain: bool = typer.Option(False, '--plain/--no-plain', help="Plain/CI output (no rich panels/colors)"),
 ):
     """DSPy Code - Coding Assistant
     
     Start an interactive session to work with your codebase.
     Enhanced with build/test capabilities and real-time learning.
     """
+    # Honor CI default for plain mode
+    try:
+        if not plain and str(os.getenv('CI', '')).lower() in {"1", "true", "yes", "on"}:
+            plain = True
+    except Exception:
+        pass
+    if plain:
+        _enable_plain_mode()
+
     if ctx.invoked_subcommand is None:
         # No subcommand provided, start interactive session
         ws = Path(workspace) if workspace else Path.cwd()
@@ -2089,40 +2004,6 @@ def _safe_read_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text())
     except Exception:
         return {}
-
-
-def _load_effective_rl_config_dict(workspace: Path) -> Dict[str, Any]:
-    best_path = workspace / '.dspy' / 'rl' / 'best.json'
-    try:
-        raw = json.loads(best_path.read_text())
-        if isinstance(raw, dict) and isinstance(raw.get('config'), dict):
-            return dict(raw['config'])
-    except Exception:
-        pass
-    return _safe_read_json(workspace / '.dspy_rl.json')
-
-
-def _rl_config_from_dict(data: Mapping[str, Any]) -> _RLConfig:
-    cfg = _RLConfig()
-    for key, value in data.items():
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
-    if isinstance(cfg.weights, dict):
-        cfg.weights = {str(k): float(v) for k, v in cfg.weights.items()}  # type: ignore[arg-type]
-    if isinstance(cfg.penalty_kinds, (list, tuple)):
-        cfg.penalty_kinds = [str(x) for x in cfg.penalty_kinds]
-    if isinstance(cfg.clamp01_kinds, (list, tuple)):
-        cfg.clamp01_kinds = [str(x) for x in cfg.clamp01_kinds]
-    if isinstance(cfg.scales, dict):
-        cfg.scales = {
-            str(k): (
-                (float(v[0]), float(v[1])) if isinstance(v, (list, tuple)) and len(v) == 2 else tuple(v) if isinstance(v, tuple) else v
-            )
-            for k, v in cfg.scales.items()
-        }
-    if isinstance(cfg.actions, (list, tuple)):
-        cfg.actions = [str(a) for a in cfg.actions]
-    return cfg
 
 
 def _render_stats_page(console: Console, workspace: Path) -> None:
@@ -4240,6 +4121,23 @@ def chat(
         }
         return aliases.get(key, key)
 
+    printed_lm_hint = False
+    # Session summary (rolling) for dashboards
+    try:
+        import uuid as _uuid
+        session_id = f"chat:{_uuid.uuid4()}"
+    except Exception:
+        session_id = f"chat:{int(time.time())}"
+    session_summary: Dict[str, Any] = {
+        'session_id': session_id,
+        'workspace': str(ws),
+        'started_at': time.time(),
+        'updated_at': time.time(),
+        'steps': 0,
+        'tools': {},
+        'last_tool': None,
+        'avg_score': 0.0,
+    }
     for step in range(1, steps + 1):
         state = f"workspace={ws}, logs={logs_path} | history: {history_summary[:4000]}"
         tool = None; args: Dict[str, Any] = {}
@@ -4280,9 +4178,20 @@ def chat(
                         _maybe_panel_rationale(getattr(pred, 'rationale', None), title="Routing Rationale")
             except Exception:
                 tool = None; args = {}
+        else:
+            # LM unavailable: route via offline heuristics
+            if not printed_lm_hint:
+                console.print("[yellow]No LM configured (start Ollama or set OPENAI_API_KEY). Falling back to offline tools.[/yellow]")
+                printed_lm_hint = True
+            tool, args = offline_route(task, ws, has_logs=logs_path.exists())
+            try:
+                _stream_action_event(ws, 'route_decision', {'mode': 'offline', 'tool': tool, 'args': dict(args)})
+            except Exception:
+                pass
         if tool:
             tool = _normalize_tool(tool)
         if not tool:
+            # Secondary fallback if routing failed
             tool = "context" if logs_path.exists() else "codectx"; args = {}
         else:
             args = dict(args or {})
@@ -4291,6 +4200,11 @@ def chat(
         if tool == "patch":
             args.setdefault("task", task)
         console.print(Panel.fit(escape(f"{tool} {args}"), title=f"Step {step}: action", border_style="yellow"))
+        t0 = time.time()
+        try:
+            _stream_metric_event(ws, 'tool.start', {'tool': tool, 'args': dict(args), 'step': int(step), 'session': session_id})
+        except Exception:
+            pass
         if last_tool == tool and last_args == args:
             console.print("[dim]No new action; stopping.[/dim]")
             break
@@ -4333,6 +4247,15 @@ def chat(
                 except FileNotFoundError:
                     meta, items = build_index(ws, smart=True); save_index(ws, meta, items)
                 q = args.get("query") or args.get("q") or task
+                try:
+                    from rich.panel import Panel as _P
+                    console.print(_P.fit("Backend: TF-IDF (token TF-IDF cosine)", title="esearch", border_style="cyan"))
+                except Exception:
+                    console.print("esearch backend: TF-IDF")
+                try:
+                    _stream_metric_event(ws, 'retrieval.esearch', {'backend': 'tfidf', 'query': q, 'k': 5})
+                except Exception:
+                    pass
                 hits = semantic_search(q, meta, items, top_k=5)
                 # Emit retrieval event for learning
                 event_hits = [{"path": str(Path(it.path)), "score": float(score), "source": "esearch"} for score, it in hits]
@@ -4350,10 +4273,28 @@ def chat(
                         seg = "(unreadable)"; s=it.start_line; e=it.end_line
                     console.print(Panel(escape(seg), title=f"{p} score={score:.3f} lines {s}-{e}", border_style="blue"))
             elif tool in {"emb-index"}:
-                # Build embeddings index using a default small model unless provided
-                model = args.get("model") or os.getenv("DSPY_EMB_MODEL", "openai/text-embedding-3-small")
+                # Build embeddings index; default to local HF when no API key, honor workspace config
+                model = args.get("model") or os.getenv("DSPY_EMB_MODEL", None)
+                openai_key = os.getenv("OPENAI_API_KEY")
+                from .agent_config import get_embedding_prefs
+                emb_cfg = get_embedding_prefs(ws)
+                backend_pref = str(emb_cfg.get("backend", "auto")).lower()
+                use_hf = (backend_pref == "hf") or (backend_pref != "dspy" and (bool(os.getenv("DSPY_EMB_HF", "").strip()) or not bool(openai_key)))
                 try:
-                    embedder = dspy.Embeddings(model=model)
+                    backend = "HF"
+                    if use_hf:
+                        try:
+                            from sentence_transformers import SentenceTransformer  # type: ignore
+                        except Exception:
+                            raise RuntimeError("HF embeddings requested but sentence-transformers not installed.")
+                        model = model or os.getenv("HF_EMB_MODEL", emb_cfg.get("hf_model") or "all-MiniLM-L6-v2")
+                        embedder = SentenceTransformer(model)
+                    else:
+                        backend = "DSPy"
+                        model = model or os.getenv("DSPY_EMB_MODEL", emb_cfg.get("dspy_model") or "openai/text-embedding-3-small")
+                        embedder = dspy.Embeddings(model=model)
+                    console.print(Panel.fit(f"Embeddings backend: {backend} | model: {model}", title="emb-index", border_style="cyan"))
+                    _stream_action_event(ws, 'embeddings.index', {'backend': backend, 'model': model})
                     items = build_emb_index(ws, embedder, lines_per_chunk=200, smart=True)
                     save_emb_index(ws, items, persist=False)
                     console.print(Panel.fit(f"Embedded {len(items)} chunks.", title="emb-index", border_style="green"))
@@ -4368,7 +4309,13 @@ def chat(
                 except Exception:
                     # Attempt to build a minimal index if missing
                     try:
-                        embedder = dspy.Embeddings(model=os.getenv("DSPY_EMB_MODEL", "openai/text-embedding-3-small"))
+                        # Respect HF fallback when no OpenAI key
+                        openai_key = os.getenv("OPENAI_API_KEY")
+                        if not openai_key:
+                            from sentence_transformers import SentenceTransformer  # type: ignore
+                            embedder = SentenceTransformer(os.getenv("HF_EMB_MODEL", "all-MiniLM-L6-v2"))
+                        else:
+                            embedder = dspy.Embeddings(model=os.getenv("DSPY_EMB_MODEL", "openai/text-embedding-3-small"))
                         items = build_emb_index(ws, embedder, lines_per_chunk=200, smart=True)
                         save_emb_index(ws, items, persist=False)
                     except Exception:
@@ -4376,7 +4323,19 @@ def chat(
                 hits = []
                 if items:
                     try:
-                        embedder = dspy.Embeddings(model=os.getenv("DSPY_EMB_MODEL", "openai/text-embedding-3-small"))
+                        openai_key = os.getenv("OPENAI_API_KEY")
+                        from .agent_config import get_embedding_prefs
+                        emb_cfg = get_embedding_prefs(ws)
+                        backend_pref = str(emb_cfg.get("backend", "auto")).lower()
+                        if not openai_key or backend_pref == "hf":
+                            from sentence_transformers import SentenceTransformer  # type: ignore
+                            backend = "HF"; model_used = os.getenv("HF_EMB_MODEL", emb_cfg.get("hf_model") or "all-MiniLM-L6-v2")
+                            embedder = SentenceTransformer(model_used)
+                        else:
+                            backend = "DSPy"; model_used = os.getenv("DSPY_EMB_MODEL", emb_cfg.get("dspy_model") or "openai/text-embedding-3-small")
+                            embedder = dspy.Embeddings(model=model_used)
+                        console.print(Panel.fit(f"Embeddings backend: {backend} | model: {model_used}", title="vretr", border_style="cyan"))
+                        _stream_action_event(ws, 'embeddings.search', {'backend': backend, 'model': model_used, 'k': k})
                         qv = embed_query(embedder, q)
                         hits = emb_search_fn(qv, items, top_k=k)
                     except Exception:
@@ -4432,7 +4391,19 @@ def chat(
                 hits = []
                 try:
                     items = load_emb_index(ws)
-                    embedder = dspy.Embeddings(model=os.getenv("DSPY_EMB_MODEL", "openai/text-embedding-3-small"))
+                    openai_key = os.getenv("OPENAI_API_KEY")
+                    from .agent_config import get_embedding_prefs
+                    emb_cfg = get_embedding_prefs(ws)
+                    backend_pref = str(emb_cfg.get("backend", "auto")).lower()
+                    if not openai_key or backend_pref == "hf":
+                        from sentence_transformers import SentenceTransformer  # type: ignore
+                        backend = "HF"; model_used = os.getenv("HF_EMB_MODEL", emb_cfg.get("hf_model") or "all-MiniLM-L6-v2")
+                        embedder = SentenceTransformer(model_used)
+                    else:
+                        backend = "DSPy"; model_used = os.getenv("DSPY_EMB_MODEL", emb_cfg.get("dspy_model") or "openai/text-embedding-3-small")
+                        embedder = dspy.Embeddings(model=model_used)
+                    console.print(Panel.fit(f"Embeddings backend: {backend} | model: {model_used}", title="intel", border_style="cyan"))
+                    _stream_action_event(ws, 'embeddings.intel', {'backend': backend, 'model': model_used, 'k': k})
                     qv = embed_query(embedder, q)
                     hits = emb_search_fn(qv, items, top_k=k)
                 except Exception:
@@ -4493,12 +4464,40 @@ def chat(
                         f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
                         title="patch metrics", border_style="accent"
                     ))
+                    try:
+                        _stream_action_event(ws, 'patch.apply', {'files': int(summ['files']), 'added': int(summ['added_lines']), 'removed': int(summ['removed_lines'])})
+                    except Exception:
+                        pass
                 else:
                     console.print(Panel(msg, title="patch failed", border_style="err"))
+                    try:
+                        _stream_action_event(ws, 'patch.apply', {'error': str(msg)})
+                    except Exception:
+                        pass
                 patch_done = True
             elif tool == "edit":
                 tool_metrics, tool_info = _run_edit_tool(args)
                 patch_done = True
+            elif tool == "neighbors":
+                import re as _re
+                file_arg = args.get("file") if isinstance(args, dict) else None
+                target = None
+                if isinstance(file_arg, str):
+                    target = (ws / file_arg).resolve()
+                else:
+                    m = _re.search(r"([\w/\\.-]+\.py)", task)
+                    if m:
+                        target = (ws / m.group(1)).resolve()
+                if target and target.exists():
+                    graph = build_code_graph(ws)
+                    nb = graph_neighbors(graph, str(target))
+                    from rich.panel import Panel as _P
+                    console.print(_P("\n".join(nb.get('imports_out', [])[:50]), title="Imports →", border_style="blue"))
+                    console.print(_P("\n".join(nb.get('imports_in', [])[:50]), title="← Imported By", border_style="blue"))
+                    console.print(_P("\n".join(nb.get('calls_out', [])[:50]), title="Calls →", border_style="blue"))
+                    console.print(_P("\n".join(nb.get('calls_in', [])[:50]), title="← Called By", border_style="blue"))
+                else:
+                    console.print("[yellow]neighbors: specify a Python file (e.g., 'neighbors of dspy_agent/cli.py').[/yellow]")
             else:
                 # default to context snapshot
                 bundle, _ = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""; console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
@@ -4537,7 +4536,28 @@ def chat(
                     feedback=outcome.evidence
                 )
                 memory.add_tool_result(tool_result)
-                
+                # Stream tool end lifecycle metric and update session summary
+                try:
+                    dur = max(0.0, time.time() - t0)
+                    _stream_metric_event(ws, 'tool.end', {'tool': tool, 'args': dict(args), 'step': int(step), 'success': bool(success), 'score': float(outcome.score), 'duration_sec': float(dur), 'session': session_id})
+                except Exception:
+                    pass
+                try:
+                    # Update summary
+                    session_summary['steps'] = int(session_summary.get('steps', 0)) + 1
+                    session_summary['last_tool'] = tool
+                    session_summary['updated_at'] = time.time()
+                    tools_map = session_summary.get('tools') or {}
+                    tools_map[tool] = int(tools_map.get(tool, 0)) + 1
+                    session_summary['tools'] = tools_map
+                    n = float(session_summary['steps'])
+                    prev_avg = float(session_summary.get('avg_score', 0.0))
+                    session_summary['avg_score'] = ((prev_avg * (n - 1.0)) + float(outcome.score)) / max(1.0, n)
+                    from .db.factory import get_storage as _get_storage
+                    st = _get_storage();  st.put('agent.session.summary', session_summary)  # type: ignore
+                    _stream_metric_event(ws, 'session.summary', {'session': session_id, 'steps': int(session_summary['steps']), 'last_tool': tool, 'avg_score': float(session_summary['avg_score'])})
+                except Exception:
+                    pass
         except Exception:
             piece=f"{tool}: done"
             # Still record the tool result even if evaluation failed
@@ -4553,6 +4573,11 @@ def chat(
                     feedback="Tool execution completed but evaluation failed"
                 )
                 memory.add_tool_result(tool_result)
+                try:
+                    dur = max(0.0, time.time() - t0)
+                    _stream_metric_event(ws, 'tool.end', {'tool': tool, 'args': dict(args), 'step': int(step), 'success': False, 'score': 0.0, 'duration_sec': float(dur), 'session': session_id, 'error': 'evaluation_failed'})
+                except Exception:
+                    pass
         history_summary = (history_summary + " | " + piece).strip()
         if step >= 2 and ("score=" in piece and float(piece.split("score=")[1].split(";")[0]) >= 1.2):
             break
@@ -4586,6 +4611,7 @@ def run(
         _print_header("Heuristic Context")
         console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
         console.print("[yellow]LOCAL_MODE or --no-lm: cannot generate a plan.[/yellow]")
+        console.print("Hint: try offline tools: grep, index, esearch, neighbors")
         raise typer.Exit(0)
 
     lm = _maybe_configure_lm(use_lm, ollama, model, base_url, api_key, workspace=ws)
@@ -4593,6 +4619,7 @@ def run(
         _print_header("Heuristic Context")
         console.print(Panel.fit(escape(key or "(no logs)"), title="Key Events", border_style="magenta"))
         console.print("[yellow]No LM configured; cannot generate a plan.[/yellow]")
+        console.print("Hint: start Ollama or set OPENAI_API_KEY. Offline options: grep, index, esearch.")
         raise typer.Exit(1)
 
     builder = ContextBuilder()
@@ -4622,9 +4649,28 @@ def index(
     inc = list(glob) if glob else None
     exc = list(exclude) if exclude else None
     _print_header("Building index")
-    meta, items = build_index(workspace, include_globs=inc, exclude_globs=exc, lines_per_chunk=lines, smart=smart)
-    out_dir = save_index(workspace, meta, items)
-    console.print(f"[green]Indexed {len(items)} chunks from {workspace}. Saved to {out_dir}[/green]")
+    t0 = time.time(); sess = f"cli:{int(t0)}"; _args = {'workspace': str(workspace), 'glob': inc, 'exclude': exc, 'lines': int(lines), 'smart': bool(smart)}
+    try:
+        _stream_metric_event(workspace, 'tool.start', {'tool': 'index', 'args': _args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
+    try:
+        meta, items = build_index(workspace, include_globs=inc, exclude_globs=exc, lines_per_chunk=lines, smart=smart)
+        out_dir = save_index(workspace, meta, items)
+        console.print(f"[green]Indexed {len(items)} chunks from {workspace}. Saved to {out_dir}[/green]")
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(workspace, 'tool.end', {'tool': 'index', 'args': _args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+        except Exception:
+            pass
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="index failed", border_style="red"))
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(workspace, 'tool.end', {'tool': 'index', 'args': _args, 'step': 0, 'success': False, 'score': 0.0, 'duration_sec': float(dur), 'session': sess, 'error': str(e)})
+        except Exception:
+            pass
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -4634,7 +4680,21 @@ def esearch(
     k: int = typer.Option(5, '--k', help="Top-K results"),
     context: int = typer.Option(4, '--context', help="Lines of context to show around chunk bounds"),
 ):
+    t0 = time.time(); sess = f"cli:{int(t0)}"; ev_args = {'query': query, 'workspace': str(workspace), 'k': int(k), 'context': int(context)}
+    try:
+        _stream_metric_event(workspace, 'tool.start', {'tool': 'esearch', 'args': ev_args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
     meta, items = load_index(workspace)
+    try:
+        from rich.panel import Panel as _P
+        console.print(_P.fit("Backend: TF-IDF (token TF-IDF cosine)", title="esearch", border_style="cyan"))
+    except Exception:
+        console.print("esearch backend: TF-IDF")
+    try:
+        _stream_action_event(workspace, 'retrieval.esearch', {'backend': 'tfidf', 'query': query, 'k': int(k)})
+    except Exception:
+        pass
     hits = semantic_search(query, meta, items, top_k=k)
     if not hits:
         console.print("[yellow]No results.[/yellow]")
@@ -4656,6 +4716,11 @@ def esearch(
             end = it.end_line
         title = f"{p}  score={score:.3f}  lines {start}-{end}"
         console.print(Panel(escape(seg), title=title, border_style="blue"))
+    try:
+        dur = time.time() - t0
+        _stream_metric_event(workspace, 'tool.end', {'tool': 'esearch', 'args': ev_args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+    except Exception:
+        pass
 
 
 @app.command()
@@ -4673,7 +4738,31 @@ def emb_index(
     infermesh_url: Optional[str] = typer.Option(None, '--infermesh-url', help="Use InferMesh embedding service at this base URL (overrides other embed options)"),
     infermesh_model: Optional[str] = typer.Option(None, '--infermesh-model', help="InferMesh model id (defaults to --model)"),
     infermesh_api_key: Optional[str] = typer.Option(None, '--infermesh-api-key', help="Bearer token for InferMesh (optional)"),
+    force: bool = typer.Option(False, '--force/--no-force', help="Override config if embeddings are disabled"),
 ):
+    t0 = time.time(); sess = f"cli:{int(t0)}"
+    ev_args = {'workspace': str(workspace), 'model': model, 'hf': bool(hf), 'persist': bool(persist), 'infermesh': bool(bool(infermesh_url))}
+    try:
+        _stream_metric_event(workspace, 'tool.start', {'tool': 'emb_index', 'args': ev_args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
+    # Respect workspace config; stop unless forced when disabled
+    try:
+        from .agent_config import get_embedding_prefs
+        cfg = get_embedding_prefs(workspace)
+        if not bool(cfg.get('enabled', False)) and not bool(force):
+            console.print(Panel.fit("Embeddings disabled in .dspy_agent.json (embeddings.enabled=false). Use --force to run anyway.", title="emb-index", border_style="yellow"))
+            try:
+                _stream_action_event(workspace, 'embeddings.index.blocked', {'reason': 'disabled_by_config'})
+            except Exception:
+                pass
+            raise typer.Exit(1)
+    except Exception:
+        pass
+    try:
+        _stream_action_event(workspace, 'embeddings.index.start', {'model': model, 'hf': bool(hf)})
+    except Exception:
+        pass
     # Prefer InferMesh if configured
     if infermesh_url:
         try:
@@ -4686,7 +4775,8 @@ def emb_index(
         except Exception as e:
             console.print(Panel(escape(str(e)), title="InferMesh init failed", border_style="red"))
             raise typer.Exit(1)
-    elif hf or model.startswith("Qwen/"):
+    # Auto-select HF when no API key present
+    elif hf or (not (api_key or os.getenv("OPENAI_API_KEY")) or model.startswith("Qwen/")):
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
         except Exception as e:
@@ -4699,12 +4789,14 @@ def emb_index(
         if device:
             model_kwargs["device_map"] = device
         try:
+            console.print(Panel.fit(f"Embeddings backend: HF | model: {model}", title="emb-index", border_style="cyan"))
             embedder = SentenceTransformer(model, model_kwargs=model_kwargs or None, tokenizer_kwargs=tok_kwargs or None)
         except Exception as e:
             console.print(Panel(escape(str(e)), title="Failed to load HF model", border_style="red"))
             raise typer.Exit(1)
     else:
         try:
+            console.print(Panel.fit(f"Embeddings backend: DSPy | model: {model}", title="emb-index", border_style="cyan"))
             embedder = dspy.Embeddings(model=model, api_base=base_url, api_key=api_key)
         except Exception as e:
             console.print(Panel(escape(str(e)), title="Failed to init DSPy Embeddings", border_style="red"))
@@ -4712,6 +4804,58 @@ def emb_index(
     items = build_emb_index(workspace, embedder, lines_per_chunk=lines, smart=smart)
     out_dir = save_emb_index(workspace, items, persist=persist)
     console.print(f"[green]Embedded {len(items)} chunks. Saved to {out_dir}[/green]")
+    try:
+        _stream_action_event(workspace, 'embeddings.index.finished', {'count': len(items)})
+    except Exception:
+        pass
+    try:
+        dur = time.time() - t0
+        _stream_metric_event(workspace, 'tool.end', {'tool': 'emb_index', 'args': ev_args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+    except Exception:
+        pass
+
+
+@app.command("neighbors")
+def neighbors_cmd(
+    path: Path = typer.Argument(..., help="File to inspect neighbors for"),
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+):
+    """Show import/call neighbors for a file in the repository."""
+    t0 = time.time(); sess = f"cli:{int(t0)}"; ev_args = {'path': str(path), 'workspace': str(workspace)}
+    try:
+        _stream_metric_event(workspace, 'tool.start', {'tool': 'neighbors', 'args': ev_args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
+    ws = workspace.resolve()
+    target = (ws / path).resolve() if not path.is_absolute() else path.resolve()
+    graph = build_code_graph(ws)
+    nb = graph_neighbors(graph, str(target))
+    from rich.panel import Panel as _P
+    def _block(title: str, items: list[str]):
+        if not items:
+            console.print(f"[dim]{title}: (none)[/dim]")
+        else:
+            console.print(_P("\n".join(items[:50]), title=title, border_style="blue"))
+    console.print(f"[accent]Neighbors for {target}[/accent]")
+    _block("Imports →", nb.get("imports_out", []))
+    _block("← Imported By", nb.get("imports_in", []))
+    _block("Calls →", nb.get("calls_out", []))
+    _block("← Called By", nb.get("calls_in", []))
+    try:
+        _stream_action_event(ws, 'code.neighbors', {
+            'path': str(target),
+            'imports_out': len(nb.get('imports_out', [])),
+            'imports_in': len(nb.get('imports_in', [])),
+            'calls_out': len(nb.get('calls_out', [])),
+            'calls_in': len(nb.get('calls_in', [])),
+        })
+    except Exception:
+        pass
+    try:
+        dur = time.time() - t0
+        _stream_metric_event(workspace, 'tool.end', {'tool': 'neighbors', 'args': ev_args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+    except Exception:
+        pass
 
 
 @app.command("embeddings_inspect")
@@ -4724,6 +4868,11 @@ def embeddings_inspect(
     Requires REDDB_URL to be configured and emb_index persisted with --persist
     or the compaction job to have run.
     """
+    t0 = time.time(); sess = f"cli:{int(t0)}"; ev_args = {'start': int(start), 'count': int(count)}
+    try:
+        _stream_metric_event(Path.cwd(), 'tool.start', {'tool': 'embeddings_inspect', 'args': ev_args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
     try:
         from .db.factory import get_storage as _get_storage
         import hashlib as _h
@@ -4735,6 +4884,11 @@ def embeddings_inspect(
     rows = list(st.read('emb.index', start=start, count=count))  # type: ignore
     if not rows:
         console.print("[yellow]No embeddings in stream (persist with emb_index --persist).[/yellow]")
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'embeddings_inspect', 'args': ev_args, 'step': 0, 'success': True, 'score': 0.0, 'duration_sec': float(dur), 'session': sess})
+        except Exception:
+            pass
         raise typer.Exit(0)
     for off, rec in rows:
         path = rec.get('path'); s = rec.get('start_line'); e = rec.get('end_line')
@@ -4743,6 +4897,11 @@ def embeddings_inspect(
         title = f"off={off} {path}:{s}-{e} vec_len={len(rec.get('vector', []) or [])}"
         text = (chunk or {}).get('text') if isinstance(chunk, dict) else None
         console.print(Panel(text or "(no KV chunk; run chunks_compact or emb_index --persist)", title=title, border_style="cyan"))
+    try:
+        dur = time.time() - t0
+        _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'embeddings_inspect', 'args': ev_args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+    except Exception:
+        pass
 
 
 @app.command("chunks_compact")
@@ -4751,6 +4910,11 @@ def chunks_compact(
     count: int = typer.Option(1000, '--count', help="Number of records to scan"),
 ):
     """Deduplicate code.chunks into KV cache keyed by hash for fast lookup."""
+    t0 = time.time(); sess = f"cli:{int(t0)}"; ev_args = {'start': int(start), 'count': int(count)}
+    try:
+        _stream_metric_event(Path.cwd(), 'tool.start', {'tool': 'chunks_compact', 'args': ev_args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
     try:
         from .db.factory import get_storage as _get_storage
     except Exception as e:
@@ -4760,7 +4924,13 @@ def chunks_compact(
         console.print(Panel("No storage configured (set REDDB_URL).", title="chunks", border_style="yellow")); raise typer.Exit(1)
     rows = list(st.read('code.chunks', start=start, count=count))  # type: ignore
     if not rows:
-        console.print("[yellow]No code.chunks entries found.[/yellow]"); raise typer.Exit(0)
+        console.print("[yellow]No code.chunks entries found.[/yellow]")
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'chunks_compact', 'args': ev_args, 'step': 0, 'success': True, 'score': 0.0, 'duration_sec': float(dur), 'session': sess})
+        except Exception:
+            pass
+        raise typer.Exit(0)
     written = 0
     for off, rec in rows:
         h = rec.get('hash');
@@ -4772,6 +4942,11 @@ def chunks_compact(
         st.put(key, rec)  # type: ignore
         written += 1
     console.print(f"[green]Compacted {written} chunk(s) into KV cache.[/green]")
+    try:
+        dur = time.time() - t0
+        _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'chunks_compact', 'args': ev_args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+    except Exception:
+        pass
 
 
 @app.command("ast_cache")
@@ -4938,6 +5113,11 @@ def emb_search(
     k: int = typer.Option(5, '--k'),
     context: int = typer.Option(4, '--context'),
 ):
+    t0 = time.time(); sess = f"cli:{int(t0)}"; ev_args = {'query': query, 'workspace': str(workspace), 'model': model, 'hf': bool(hf), 'k': int(k)}
+    try:
+        _stream_metric_event(workspace, 'tool.start', {'tool': 'emb_search', 'args': ev_args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
     if hf or model.startswith("Qwen/"):
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
@@ -4954,18 +5134,33 @@ def emb_search(
             embedder = SentenceTransformer(model, model_kwargs=model_kwargs or None, tokenizer_kwargs=tok_kwargs or None)
         except Exception as e:
             console.print(Panel(escape(str(e)), title="Failed to load HF model", border_style="red"))
+            dur = time.time() - t0
+            try:
+                _stream_metric_event(workspace, 'tool.end', {'tool': 'emb_search', 'args': ev_args, 'step': 0, 'success': False, 'score': 0.0, 'duration_sec': float(dur), 'session': sess, 'error': str(e)})
+            except Exception:
+                pass
             raise typer.Exit(1)
     else:
         try:
             embedder = dspy.Embeddings(model=model, api_base=base_url, api_key=api_key)
         except Exception as e:
             console.print(Panel(escape(str(e)), title="Failed to init DSPy Embeddings", border_style="red"))
+            dur = time.time() - t0
+            try:
+                _stream_metric_event(workspace, 'tool.end', {'tool': 'emb_search', 'args': ev_args, 'step': 0, 'success': False, 'score': 0.0, 'duration_sec': float(dur), 'session': sess, 'error': str(e)})
+            except Exception:
+                pass
             raise typer.Exit(1)
     items = load_emb_index(workspace)
     qv = embed_query(embedder, query)
     hits = emb_search_fn(qv, items, top_k=k)
     if not hits:
         console.print("[yellow]No results.[/yellow]")
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(workspace, 'tool.end', {'tool': 'emb_search', 'args': ev_args, 'step': 0, 'success': True, 'score': 0.0, 'duration_sec': float(dur), 'session': sess})
+        except Exception:
+            pass
         raise typer.Exit(0)
     for score, it in hits:
         p = Path(it.path)
@@ -4981,6 +5176,12 @@ def emb_search(
             end = it.end_line
         title = f"{p}  score={score:.3f}  lines {start}-{end}"
         console.print(Panel(escape(seg), title=title, border_style="cyan"))
+    try:
+        _stream_action_event(workspace, 'embeddings.search', {'model': model, 'hf': bool(hf), 'k': int(k)})
+        dur = time.time() - t0
+        _stream_metric_event(workspace, 'tool.end', {'tool': 'emb_search', 'args': ev_args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+    except Exception:
+        pass
 
 
 @app.command()
@@ -5402,10 +5603,18 @@ def code_edit(
     draft_model: Optional[str] = typer.Option(None, '--draft-model', help='Draft LM (e.g., qwen2:0.5b)'),
     profile: Optional[str] = typer.Option(None, '--profile', help='Performance profile: fast|balanced|maxquality'),
 ):
+    # Metrics: tool.start for non-chat command
+    _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _args = {'task': task, 'workspace': str(workspace), 'apply': bool(apply), 'beam_k': int(beam_k), 'speculative': bool(speculative)}
+    try:
+        _stream_metric_event(workspace, 'tool.start', {'tool': 'code_edit', 'args': _args, 'step': 0, 'session': _sess})
+    except Exception:
+        pass
     _set_show_rationale(bool(show_rationale))
     lm = _maybe_configure_lm(True, ollama, model, base_url, api_key, workspace=workspace)
     if lm is None:
-        console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]"); raise typer.Exit(1)
+        console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]")
+        console.print("Hint: isolate target files with grep/esearch/neighbors, then craft a diff and apply with 'patch --file'.")
+        raise typer.Exit(1)
     bundle = _build_patch_context_bundle(workspace, workspace / 'logs', task)
     _render_recent_fixes(console, bundle)
     ctx_text = context or bundle.get('combined_context', '')
@@ -5508,6 +5717,11 @@ def code_edit(
                     pass
             else:
                 console.print(Panel(msg, title="apply failed", border_style="red"))
+    try:
+        _dur = time.time() - _t0
+        _stream_metric_event(workspace, 'tool.end', {'tool': 'code_edit', 'args': _args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(_dur), 'session': _sess})
+    except Exception:
+        pass
 
 
 @app.command()
@@ -5819,11 +6033,49 @@ def open_cmd(
 
 
 @app.command()
+def export_run(
+    out: Path = typer.Option(Path("run_export.json"), '--out', help="Output JSON file"),
+    actions_stream: str = typer.Option('agent.actions', '--actions-stream', help="Actions stream name"),
+    metrics_stream: str = typer.Option('agent.metrics', '--metrics-stream', help="Metrics stream name"),
+    start: int = typer.Option(0, '--start', help="Start offset for streams"),
+    count: int = typer.Option(10000, '--count', help="Max records to read from each stream"),
+):
+    """Export a snapshot of agent actions and metrics to a JSON file."""
+    try:
+        from .db.factory import get_storage as _get_storage
+        st = _get_storage()
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="export", border_style="red")); raise typer.Exit(1)
+    if st is None:
+        console.print(Panel("No storage available.", title="export", border_style="red")); raise typer.Exit(1)
+    data = {"actions": [], "metrics": []}
+    try:
+        for off, rec in st.read(actions_stream, start=start, count=count):  # type: ignore
+            data["actions"].append({"offset": int(off), "value": rec})
+        for off, rec in st.read(metrics_stream, start=start, count=count):  # type: ignore
+            data["metrics"].append({"offset": int(off), "value": rec})
+        out.write_text(json.dumps(data, indent=2))
+        console.print(Panel.fit(f"Exported actions={len(data['actions'])} metrics={len(data['metrics'])} → {out}", title="export", border_style="green"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="export failed", border_style="red")); raise typer.Exit(1)
+
+
+@app.command()
 def patch(
     patch_file: Optional[Path] = typer.Option(None, '--file', exists=True, help="Unified diff file"),
 ):
+    t0 = time.time(); sess = f"cli:{int(t0)}"; args = {'file': str(patch_file) if patch_file else None}
+    try:
+        _stream_metric_event(Path.cwd(), 'tool.start', {'tool': 'patch', 'args': args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
     if not patch_file:
         console.print("[yellow]Usage: dspy-coder patch --file <PATCHFILE>[/yellow]")
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'patch', 'args': args, 'step': 0, 'success': False, 'score': 0.0, 'duration_sec': float(dur), 'session': sess, 'error': 'missing_file'})
+        except Exception:
+            pass
         raise typer.Exit(2)
     text = patch_file.read_text(errors="ignore")
     ok, msg = apply_unified_patch(text, Path.cwd())
@@ -5834,8 +6086,26 @@ def patch(
             f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
             title="patch metrics", border_style="accent"
         ))
+        try:
+            _stream_action_event(Path.cwd(), 'patch.apply', {'files': int(summ['files']), 'added': int(summ['added_lines']), 'removed': int(summ['removed_lines'])})
+        except Exception:
+            pass
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'patch', 'args': args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+        except Exception:
+            pass
     else:
         console.print(Panel(msg, title="patch failed", border_style="err"))
+        try:
+            _stream_action_event(Path.cwd(), 'patch.apply', {'error': str(msg)})
+        except Exception:
+            pass
+        dur = time.time() - t0
+        try:
+            _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'patch', 'args': args, 'step': 0, 'success': False, 'score': 0.0, 'duration_sec': float(dur), 'session': sess, 'error': str(msg)})
+        except Exception:
+            pass
 
 
 @app.command()
@@ -5845,6 +6115,11 @@ def diff(
     unified: int = typer.Option(3, '--unified', help="Context lines in diff"),
     out: Optional[Path] = typer.Option(None, '--out', help="Write patch to this file"),
 ):
+    t0 = time.time(); sess = f"cli:{int(t0)}"; args = {'file': str(file), 'new': str(new) if new else None, 'unified': int(unified), 'out': str(out) if out else None}
+    try:
+        _stream_metric_event(Path.cwd(), 'tool.start', {'tool': 'diff', 'args': args, 'step': 0, 'session': sess})
+    except Exception:
+        pass
     if new is not None:
         new_text = new.read_text(errors="ignore")
     else:
@@ -5852,6 +6127,11 @@ def diff(
             new_text = sys.stdin.read()
         except Exception:
             console.print("[yellow]No input provided for --new or STDIN.[/yellow]")
+            dur = time.time() - t0
+            try:
+                _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'diff', 'args': args, 'step': 0, 'success': False, 'score': 0.0, 'duration_sec': float(dur), 'session': sess, 'error': 'missing_new'})
+            except Exception:
+                pass
             raise typer.Exit(2)
     from .code_tools.diffutil import unified_diff_from_texts
     old_text = file.read_text(errors="ignore") if file.exists() else ""
@@ -5861,6 +6141,11 @@ def diff(
         console.print(f"[green]Wrote patch to {out}[/green]")
     else:
         console.print(patch_text or "(no differences)")
+    try:
+        dur = time.time() - t0
+        _stream_metric_event(Path.cwd(), 'tool.end', {'tool': 'diff', 'args': args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(dur), 'session': sess})
+    except Exception:
+        pass
 
 
 @app.command(name="start")
@@ -6510,11 +6795,17 @@ def start_command(
         elif t == "ls":
             console.print(Panel("\n".join(p.name+("/" if p.is_dir() else "") for p in sorted(ws.iterdir())[:500]), title=str(ws), border_style="blue"))
         elif t == "emb-index":
-            # Build embeddings index for semantic search
-            model = args.get("model") or "all-MiniLM-L6-v2"
-            hf = bool(args.get("hf", True))
+            # Build embeddings index for semantic search (supports InferMesh)
+            model = args.get("model") or os.getenv('EMBED_MODEL') or "sentence-transformers/all-MiniLM-L6-v2"
+            use_infermesh = bool(args.get("infermesh", False)) or bool(os.getenv('INFERMESH_URL'))
+            hf = bool(args.get("hf", not use_infermesh))
             try:
-                if hf:
+                if use_infermesh:
+                    from .embedding.infermesh import InferMeshEmbedder  # type: ignore
+                    base = (args.get("url") or os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                    api_key = args.get("api_key") or os.getenv('INFERMESH_API_KEY')
+                    embedder = InferMeshEmbedder(base, model, api_key=api_key)
+                elif hf:
                     from sentence_transformers import SentenceTransformer  # type: ignore
                     embedder = SentenceTransformer(model)
                 else:
@@ -6684,10 +6975,17 @@ def start_command(
                     console.print(Panel(escape(str(e)), title="HF embeddings missing", border_style="red")); return
             else:
                 try:
-                    embedder_obj = dspy.Embeddings(model=model)
-                    def _emb(text): return embedder_obj.embed(text)  # type: ignore
+                    if bool(args.get("infermesh", False)) or bool(os.getenv('INFERMESH_URL')):
+                        from .embedding.infermesh import InferMeshEmbedder  # type: ignore
+                        base = (args.get("url") or os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                        api_key = args.get("api_key") or os.getenv('INFERMESH_API_KEY')
+                        embedder_obj = InferMeshEmbedder(base, model, api_key=api_key)
+                        def _emb(text): return embedder_obj.embed(text)  # type: ignore
+                    else:
+                        embedder_obj = dspy.Embeddings(model=model)
+                        def _emb(text): return embedder_obj.embed(text)  # type: ignore
                 except Exception as e:
-                    console.print(Panel(escape(str(e)), title="DSPy embeddings missing", border_style="red")); return
+                    console.print(Panel(escape(str(e)), title="Embeddings setup failed", border_style="red")); return
             try:
                 from .embedding.embeddings_index import load_emb_index, emb_search as _emb_search, embed_query as _embed_query, build_emb_index as _build_emb_index, save_emb_index as _save_emb_index
                 items = load_emb_index(ws)
@@ -6820,11 +7118,32 @@ def start_command(
             if err.strip(): console.print(Panel(err, title="ast-grep stderr", border_style="red"))
             if out.strip(): console.print(out)
         elif t == "run_tests":
+            _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _a = dict(args)
+            try: _stream_metric_event(ws, 'tool.start', {'tool': 'run_tests', 'args': _a, 'step': 0, 'session': _sess})
+            except Exception: pass
             tool_metrics, tool_info = _execute_toolchain(ToolAction.RUN_TESTS, dict(args))
+            _dur = time.time() - _t0
+            _score = float(tool_metrics.get('pass_rate', 1.0) if isinstance(tool_metrics, dict) else 1.0)
+            try: _stream_metric_event(ws, 'tool.end', {'tool': 'run_tests', 'args': _a, 'step': 0, 'success': True, 'score': _score, 'duration_sec': float(_dur), 'session': _sess})
+            except Exception: pass
         elif t == "lint":
+            _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _a = dict(args)
+            try: _stream_metric_event(ws, 'tool.start', {'tool': 'lint', 'args': _a, 'step': 0, 'session': _sess})
+            except Exception: pass
             tool_metrics, tool_info = _execute_toolchain(ToolAction.LINT, dict(args))
+            _dur = time.time() - _t0
+            _ok = bool(tool_metrics) and (float(tool_metrics.get('error_count', 0)) <= 0 if isinstance(tool_metrics, dict) else True)
+            try: _stream_metric_event(ws, 'tool.end', {'tool': 'lint', 'args': _a, 'step': 0, 'success': bool(_ok), 'score': float(1.0 if _ok else 0.0), 'duration_sec': float(_dur), 'session': _sess})
+            except Exception: pass
         elif t == "build":
+            _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _a = dict(args)
+            try: _stream_metric_event(ws, 'tool.start', {'tool': 'build', 'args': _a, 'step': 0, 'session': _sess})
+            except Exception: pass
             tool_metrics, tool_info = _execute_toolchain(ToolAction.BUILD, dict(args))
+            _dur = time.time() - _t0
+            _ok = bool(tool_metrics)
+            try: _stream_metric_event(ws, 'tool.end', {'tool': 'build', 'args': _a, 'step': 0, 'success': bool(_ok), 'score': float(1.0 if _ok else 0.0), 'duration_sec': float(_dur), 'session': _sess})
+            except Exception: pass
         elif t == "patch":
             pf = args.get("file")
             if pf:
@@ -6833,6 +7152,9 @@ def start_command(
                     console.print("[yellow]patch needs --file[/yellow]")
                     return
                 text = p.read_text(errors="ignore")
+                _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _a = {'file': str(p)}
+                try: _stream_metric_event(ws, 'tool.start', {'tool': 'patch', 'args': _a, 'step': 0, 'session': _sess})
+                except Exception: pass
                 ok, msg = apply_unified_patch(text, ws)
                 tool_metrics = {"applied": bool(ok)}
                 if ok:
@@ -6844,8 +7166,18 @@ def start_command(
                         f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
                         title="patch metrics", border_style="accent"
                     ))
+                    try: _stream_action_event(ws, 'patch.apply', {'files': int(summ['files']), 'added': int(summ['added_lines']), 'removed': int(summ['removed_lines'])})
+                    except Exception: pass
+                    _dur = time.time() - _t0
+                    try: _stream_metric_event(ws, 'tool.end', {'tool': 'patch', 'args': _a, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(_dur), 'session': _sess})
+                    except Exception: pass
                 else:
                     console.print(Panel(msg, title="patch failed", border_style="err"))
+                    try: _stream_action_event(ws, 'patch.apply', {'error': str(msg)})
+                    except Exception: pass
+                    _dur = time.time() - _t0
+                    try: _stream_metric_event(ws, 'tool.end', {'tool': 'patch', 'args': _a, 'step': 0, 'success': False, 'score': 0.0, 'duration_sec': float(_dur), 'session': _sess, 'error': str(msg)})
+                    except Exception: pass
             else:
                 patch_args = dict(args)
                 patch_task = patch_args.get("task") or "Fix workspace issues"
@@ -6855,7 +7187,13 @@ def start_command(
                 combined = bundle.get('combined_context') or bundle.get('text') or ''
                 patch_args.setdefault("task", patch_task)
                 patch_args.setdefault("context", combined)
+                _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _a = dict(patch_args)
+                try: _stream_metric_event(ws, 'tool.start', {'tool': 'patch', 'args': _a, 'step': 0, 'session': _sess})
+                except Exception: pass
                 tool_metrics, tool_info = _execute_toolchain(ToolAction.PATCH, patch_args)
+                _dur = time.time() - _t0
+                try: _stream_metric_event(ws, 'tool.end', {'tool': 'patch', 'args': _a, 'step': 0, 'success': True, 'score': float(tool_metrics.get('pass_rate', 1.0) if isinstance(tool_metrics, dict) else 1.0), 'duration_sec': float(_dur), 'session': _sess})
+                except Exception: pass
         elif t == "diff":
             if not last_extract: console.print("[yellow]No extract buffer. Run extract first.[/yellow]"); return
             file = args.get("file"); p=(ws / file).resolve() if file else None
@@ -7552,7 +7890,16 @@ def _handle_build_command(args: List[str], ws: Path):
                 console.print(f"[yellow]Clean command failed (exit code: {result})[/yellow]")
         
         console.print(f"[dim]Running: {cmd}[/dim]")
+        try:
+            _stream_metric_event(ws, 'tool.start', {'tool': 'build', 'system': system, 'cmd': cmd})
+        except Exception:
+            pass
+        t0 = time.time()
         result = os.system(f"cd {ws} && {cmd}")
+        try:
+            _stream_metric_event(ws, 'tool.end', {'tool': 'build', 'system': system, 'cmd': cmd, 'success': (result == 0), 'duration_sec': float(max(0.0, time.time() - t0))})
+        except Exception:
+            pass
         
         if result == 0:
             console.print(f"[green]✅ Build successful with {system}![/green]")
@@ -7607,7 +7954,16 @@ def _handle_test_command(args: List[str], ws: Path):
     for cmd, system in test_commands:
         console.print(f"[cyan]Running tests with {system}...[/cyan]")
         console.print(f"[dim]Running: {cmd}[/dim]")
+        try:
+            _stream_metric_event(ws, 'tool.start', {'tool': 'run_tests', 'system': system, 'cmd': cmd})
+        except Exception:
+            pass
+        t0 = time.time()
         result = os.system(f"cd {ws} && {cmd}")
+        try:
+            _stream_metric_event(ws, 'tool.end', {'tool': 'run_tests', 'system': system, 'cmd': cmd, 'success': (result == 0), 'duration_sec': float(max(0.0, time.time() - t0))})
+        except Exception:
+            pass
         
         if result == 0:
             console.print(f"[green]✅ All tests passed with {system}![/green]")
@@ -7661,7 +8017,16 @@ def _handle_lint_command(args: List[str], ws: Path):
     for cmd, linter in lint_commands:
         console.print(f"[cyan]Running {linter}...[/cyan]")
         console.print(f"[dim]Running: {cmd}[/dim]")
+        try:
+            _stream_metric_event(ws, 'tool.start', {'tool': 'lint', 'linter': linter, 'cmd': cmd})
+        except Exception:
+            pass
+        t0 = time.time()
         result = os.system(f"cd {ws} && {cmd}")
+        try:
+            _stream_metric_event(ws, 'tool.end', {'tool': 'lint', 'linter': linter, 'cmd': cmd, 'success': (result == 0), 'duration_sec': float(max(0.0, time.time() - t0))})
+        except Exception:
+            pass
         
         if result == 0:
             console.print(f"[green]✅ {linter} passed![/green]")
@@ -8586,3 +8951,50 @@ def grpo_apply_policy(
 
 if __name__ == "__main__":
     app()
+# Streaming helpers -----------------------------------------------------------
+def _stream_action_event(workspace: Path, action: str, payload: Dict[str, Any]) -> None:
+    """Send an action event to RedDB stream and Kafka topic (best-effort)."""
+    evt = {
+        'ts': time.time(),
+        'workspace': str((workspace or Path.cwd()).resolve()),
+        'action': action,
+        'payload': payload,
+    }
+    # RedDB
+    try:
+        from .db.factory import get_storage as _get_storage
+        st = _get_storage()
+        if st is not None:
+            st.append('agent.actions', evt)  # type: ignore
+    except Exception:
+        pass
+    # Kafka
+    try:
+        kl = get_kafka_logger()
+        if kl is not None:
+            kl.send('agent.actions', evt)
+    except Exception:
+        pass
+
+
+def _stream_metric_event(workspace: Path, name: str, payload: Dict[str, Any]) -> None:
+    """Send a metric event to RedDB and Kafka."""
+    evt = {
+        'ts': time.time(),
+        'workspace': str((workspace or Path.cwd()).resolve()),
+        'metric': name,
+        'data': payload,
+    }
+    try:
+        from .db.factory import get_storage as _get_storage
+        st = _get_storage()
+        if st is not None:
+            st.append('agent.metrics', evt)  # type: ignore
+    except Exception:
+        pass
+    try:
+        kl = get_kafka_logger()
+        if kl is not None:
+            kl.send('agent.metrics', evt)
+    except Exception:
+        pass

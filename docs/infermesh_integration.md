@@ -71,6 +71,12 @@ Security
 Examples
 --------
 - Compose (excerpt): see `docker/lightweight/docker-compose.yml` services `infermesh`, `spark-vectorizer`, and `embed-worker`.
+- Configure image:
+  - Set a valid InferMesh image in `docker/lightweight/.env`:
+    - `INFERMESH_IMAGE=ghcr.io/<org>/infermesh:<tag>` (CPU/GPU tag per your environment)
+  - Optional: change host port via `INFERMESH_HOST_PORT` (default 19000).
 - Quick start:
-  - `docker compose up -d zookeeper kafka infermesh spark-vectorizer embed-worker`
-  - Monitor: UI → Monitoring → InferMesh panel.
+  - `docker compose -f docker/lightweight/docker-compose.yml --env-file docker/lightweight/.env up -d infermesh`
+  - Validate: `curl -fsS http://127.0.0.1:$INFERMESH_HOST_PORT/health`
+  - Start pipeline: `docker compose -f docker/lightweight/docker-compose.yml --env-file docker/lightweight/.env up -d spark-vectorizer embed-worker`
+  - Monitor: UI → Monitoring → InferMesh panel and `/api/infermesh/stream`.

@@ -25,6 +25,18 @@ stack-logs:
 stack-ps:
 	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) ps
 
+# Convenience targets for the auto-started dashboard service
+.PHONY: dashboard-up dashboard-logs dashboard-down
+
+dashboard-up: stack-env
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) up -d dashboard
+
+dashboard-logs:
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) logs -f dashboard
+
+dashboard-down:
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) stop dashboard
+
 test-lightweight: stack-build
 	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) run --rm agent-tests
 
@@ -34,7 +46,9 @@ smoke: stack-build stack-up
 
 health-check:
 	@echo "[health] InferMesh"; \
-	  (curl -fsS http://127.0.0.1:9000/health || echo "unreachable") && echo
+	  (curl -fsS http://127.0.0.1:19000/health || echo "unreachable") && echo
+	@echo "[health] Dashboard"; \
+	  (curl -fsS http://127.0.0.1:18081/api/status || echo "unreachable") && echo
 	@echo "[health] embed-worker metrics"; \
 	  (curl -fsS http://127.0.0.1:9101/metrics || echo "unreachable") && echo
 	@echo "[health] spark-vectorizer UI"; \
@@ -57,3 +71,26 @@ test-docker:
 
 dev-cycle:
 	bash scripts/dev_cycle.sh
+
+.PHONY: infermesh-build infermesh-push infermesh-bench
+infermesh-build: stack-env
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) build infermesh
+
+# Push built image to registry (requires docker login and INFERMESH_IMAGE in env/.env)
+infermesh-push:
+	@if [ -z "$(shell grep '^INFERMESH_IMAGE=' $(STACK_ENV) | cut -d= -f2)" ]; then \
+		echo "Set INFERMESH_IMAGE in $(STACK_ENV)"; exit 1; \
+	fi
+	IMAGE=$(shell grep '^INFERMESH_IMAGE=' $(STACK_ENV) | cut -d= -f2); \
+	docker tag lightweight-infermesh:latest $$IMAGE; \
+	echo "Pushing $$IMAGE"; \
+	docker push $$IMAGE
+
+infermesh-bench:
+	python3 scripts/benchmark_infermesh.py --url http://127.0.0.1:$${INFERMESH_HOST_PORT:-19000} --model $${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
+
+.PHONY: stack-smoke
+stack-smoke: stack-up
+	# Run end-to-end smoke (Kafka → vectorizer → embed-worker)
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) run --rm smoke || true
+	$(MAKE) health-check

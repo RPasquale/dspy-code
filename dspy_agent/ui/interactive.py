@@ -383,11 +383,11 @@ class InteractiveShell:
     # ------------------------------------------------------------------
     def _load_rl_config(self) -> Optional[RLConfig]:
         try:
-            from ..cli import _load_effective_rl_config_dict, _rl_config_from_dict
-            data = _load_effective_rl_config_dict(self.workspace)
+            from ..rl.rl_helpers import load_effective_rl_config_dict, rl_config_from_dict
+            data = load_effective_rl_config_dict(self.workspace)
             if not data:
                 return None
-            return _rl_config_from_dict(data)
+            return rl_config_from_dict(data)
         except Exception:
             return None
 

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -24,3 +25,32 @@ jobs:
         run: |
           pytest -q -k "not docker and not e2e_server and not server_feature_and_gepa"
 
+  container-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build lightweight images
+        run: |
+          docker compose -f docker/lightweight/docker-compose.yml build dspy-agent infermesh embed-worker emb-indexer
+      - name: Start minimal stack
+        run: |
+          docker compose -f docker/lightweight/docker-compose.yml up -d zookeeper kafka infermesh embed-worker
+          docker compose -f docker/lightweight/docker-compose.yml up -d dashboard
+      - name: Health probe
+        run: |
+          sleep 10
+          curl -fsS http://127.0.0.1:18081/api/status || (docker compose -f docker/lightweight/docker-compose.yml logs dashboard && exit 1)
+      - name: Run smoke
+        run: |
+          docker compose -f docker/lightweight/docker-compose.yml run --rm smoke
+      - name: Logs snapshot
+        if: always()
+        run: |
+          docker compose -f docker/lightweight/docker-compose.yml logs --tail=120
+      - name: Stop
+        if: always()
+        run: |
+          docker compose -f docker/lightweight/docker-compose.yml down -v
