@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import urllib.request
 import urllib.error
+import urllib.parse
 
 
 @dataclass
@@ -65,4 +66,3 @@ class MeshCoreClient:
             return {'error': str(e)}
 
 __all__ = ['MeshCoreClient']
-

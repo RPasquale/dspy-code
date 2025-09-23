@@ -84,6 +84,16 @@ make test-docker        # runs pytest -m docker with DOCKER_TESTS=1
   - Clear trace via `POST /api/debug/trace` with `{ "clear": true }`.
   - Trace file: `.dspy_reports/server_trace.log`.
 
+## Dev Cycle (One‑Button)
+
+- CLI: `make dev-cycle` runs the end‑to‑end script `scripts/dev_cycle.sh`.
+- Frontend/API:
+  - Start: `POST /api/dev-cycle/start` (admin only; set `X-Admin-Key` if configured)
+  - Stop: `POST /api/dev-cycle/stop` (admin only)
+  - Status: `GET /api/dev-cycle/status` (JSON), Stream: `GET /api/dev-cycle/stream` (SSE)
+  - Download Logs: `GET /api/dev-cycle/logs` (text/plain attachment)
+- Compose compatibility: the script validates `docker/lightweight/docker-compose.yml` and, if your Compose requires env mappings, rewrites `environment:` list items (`- KEY=VAL` / `- KEY`) into mapping style (`KEY: "VAL"` / `KEY: ${KEY:-}`) and uses the rewritten file automatically.
+
 - Workspace & Guards
   - Set workspace path via the Guard Settings panel (UI) or `POST /api/system/workspace`.
   - Set guard thresholds (min_free_gb, min_ram_gb, min_vram_mb) via the Guard Settings panel or `POST /api/system/guard`.

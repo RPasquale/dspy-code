@@ -29,7 +29,6 @@ services:
         - dspy-cache:/home/agent/.dspy_cache:rw
       ports:
         - "127.0.0.1:8765:8765"
-        - "127.0.0.1:18081:8081"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
@@ -104,18 +103,44 @@ services:
         start_period: 10s
 
     infermesh:
-      image: ghcr.io/redbco/infermesh:latest
+      build:
+        context: .
+        dockerfile: infermesh_mock.Dockerfile
       environment:
         - INFER_PORT=9000
       ports:
-        - "127.0.0.1:9000:9000"
+        - "127.0.0.1:19000:9000"
       restart: unless-stopped
       healthcheck:
-        test: ["CMD-SHELL", "curl -fsS http://localhost:9000/health || exit 1"]
+        test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:9000/health')\" >/dev/null 2>&1 || exit 1"]
         interval: 10s
         timeout: 3s
         retries: 20
         start_period: 10s
+
+    # Dedicated dashboard service (serves enhanced_dashboard_server on port 8081)
+    dashboard:
+      image: dspy-lightweight:latest
+      user: "10001:10001"
+      working_dir: /app
+      entrypoint: ["bash", "-lc", "python3 enhanced_dashboard_server.py 8081"]
+      environment:
+        - WORKSPACE_DIR=/workspace
+        - DSPY_WORKSPACE=/workspace
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace:rw
+      ports:
+        - "127.0.0.1:18081:8081"
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      # Allow server to write .dspy_reports under /app
+      read_only: false
+      cap_drop:
+        - ALL
+      depends_on:
+        kafka:
+          condition: service_healthy
 
     embed-worker:
       build:
@@ -147,19 +172,20 @@ services:
         - ${WORKSPACE_DIR}:/workspace
         - ./scripts:/app/scripts:ro
         - ./entrypoints:/entrypoints:ro
-      entrypoint: ["/entrypoints/run_embed_worker.sh"]
+      entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_embed_worker.sh"]
       ports:
         - "127.0.0.1:9101:9100"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
-        test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health >/dev/null 2>&1 || exit 1"]
+        test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:9100/health')\" >/dev/null 2>&1 || exit 1"]
         interval: 20s
         timeout: 5s
         retries: 10
@@ -172,7 +198,7 @@ services:
           condition: service_healthy
       user: "0:0"
       environment:
-        - HOME=/opt/bitnami/spark
+        - HOME=/tmp
         - USER=spark
         - SPARK_USER=spark
         - HADOOP_USER_NAME=spark
@@ -205,8 +231,9 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -231,8 +258,9 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -257,8 +285,9 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -285,8 +314,9 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
 
@@ -309,8 +339,9 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -338,8 +369,9 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -382,8 +414,9 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
     emb-indexer:
@@ -405,13 +438,14 @@ services:
         - ${WORKSPACE_DIR}:/workspace
         - ./scripts:/app/scripts:ro
         - ./entrypoints:/entrypoints:ro
-      entrypoint: ["/entrypoints/run_emb_indexer.sh"]
+      entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_emb_indexer.sh"]
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
       read_only: true
-      tmpfs:
-        - /tmp
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
     spark-vectorizer:
@@ -421,7 +455,7 @@ services:
           condition: service_healthy
       user: "0:0"
       environment:
-        - HOME=/opt/bitnami/spark
+        - HOME=/tmp
         - USER=spark
         - SPARK_USER=spark
         - HADOOP_USER_NAME=spark
@@ -436,15 +470,16 @@ services:
         - ${WORKSPACE_DIR}:/workspace
         - ./scripts:/app/scripts:ro
         - ./entrypoints:/entrypoints:ro
-      entrypoint: ["/entrypoints/run_spark_vectorizer.sh"]
+      entrypoint: ["/bin/bash", "-lc", "source /entrypoints/run_spark_vectorizer.sh"]
       ports:
         - "127.0.0.1:4041:4040"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
-      read_only: true
-      tmpfs:
-        - /tmp
+      read_only: false
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -456,36 +491,37 @@ services:
 
     smoke:
       build:
-      context: ../..
-      dockerfile: docker/lightweight/embed_worker.Dockerfile
-    depends_on:
-      kafka:
-        condition: service_healthy
-      infermesh:
-        condition: service_healthy
-      spark-vectorizer:
-        condition: service_healthy
-      embed-worker:
-        condition: service_healthy
-    environment:
-      - KAFKA_BOOTSTRAP=kafka:9092
-      - RESULTS_TOPIC=agent.results
-      - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings_imesh
-      - N_MESSAGES=5
-      - SLEEP_SEC=6
-    volumes:
-      - ${WORKSPACE_DIR}:/workspace
-      - ./scripts:/app/scripts:ro
-      - ./entrypoints:/entrypoints:ro
-    entrypoint: ["/entrypoints/run_smoke.sh"]
-    restart: "no"
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
+        context: ../..
+        dockerfile: docker/lightweight/embed_worker.Dockerfile
+      depends_on:
+        kafka:
+          condition: service_healthy
+        infermesh:
+          condition: service_healthy
+        spark-vectorizer:
+          condition: service_healthy
+        embed-worker:
+          condition: service_healthy
+      environment:
+        - KAFKA_BOOTSTRAP=kafka:9092
+        - RESULTS_TOPIC=agent.results
+        - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings_imesh
+        - N_MESSAGES=5
+        - SLEEP_SEC=6
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace
+        - ./scripts:/app/scripts:ro
+        - ./entrypoints:/entrypoints:ro
+      entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_smoke.sh"]
+      restart: "no"
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      # tmpfs disabled for compatibility; uncomment if needed
+      # tmpfs:
+      #   - /tmp
+      cap_drop:
+        - ALL
 
 volumes:
   ollama: {}

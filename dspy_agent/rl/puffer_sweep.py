@@ -49,16 +49,26 @@ def _unroll_nested_dict(mapping: Mapping[str, object], prefix: Tuple[str, ...] =
         else:
             yield ".".join(path), value
 
-try:  # Pyro is only required for Gaussian Process based strategies
-    import torch
-    import pyro
-    from pyro.contrib import gp as _gp  # type: ignore
-    _HAS_PYRO = True
-except Exception:  # pragma: no cover - optional dependency
-    _HAS_PYRO = False
-    torch = None  # type: ignore
-    pyro = None  # type: ignore
-    _gp = None  # type: ignore
+# Pyro/torch are optional; import lazily only when required by Protein strategy
+_HAS_PYRO = False
+torch = None  # type: ignore
+pyro = None  # type: ignore
+_gp = None  # type: ignore
+
+def _ensure_pyro_optional_imports() -> None:
+    global _HAS_PYRO, torch, pyro, _gp
+    if _HAS_PYRO:
+        return
+    try:  # pragma: no cover - environment dependent
+        import torch as _torch  # type: ignore
+        import pyro as _pyro  # type: ignore
+        from pyro.contrib import gp as _gp_mod  # type: ignore
+        torch = _torch
+        pyro = _pyro
+        _gp = _gp_mod
+        _HAS_PYRO = True
+    except Exception:
+        _HAS_PYRO = False
 
 
 class Space:
@@ -380,6 +390,7 @@ class ParetoGenetic:
 
 
 def _require_pyro() -> None:
+    _ensure_pyro_optional_imports()
     if not _HAS_PYRO:
         raise RuntimeError("Pyro / torch not available. Install 'pyro-ppl' to use Protein sweeps.")
 

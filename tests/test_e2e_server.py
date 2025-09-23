@@ -5,6 +5,9 @@ import time
 from urllib import request, error
 
 import pytest
+import importlib, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def _get(url: str, timeout: float = 3.0):
@@ -55,9 +58,6 @@ def _sse_lines(url: str, timeout: float = 5.0, max_lines: int = 5):
 @pytest.mark.integration
 def test_end_to_end_server_trace_and_endpoints():
     # Start server in-thread on ephemeral port
-import importlib, sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     srv = importlib.import_module('enhanced_dashboard_server')
 
     class ThreadedHTTPServer(srv.socketserver.ThreadingMixIn, srv.socketserver.TCPServer):

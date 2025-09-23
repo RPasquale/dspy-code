@@ -1,32 +1,48 @@
 from __future__ import annotations
 
-import dspy
+try:
+    import dspy  # type: ignore
+except Exception:  # pragma: no cover - allow runtime without dspy installed
+    dspy = None  # type: ignore
 import re
 from typing import Tuple, Optional
 
 
-class BuildContextSig(dspy.Signature):
+class BuildContextSig((dspy.Signature if dspy is not None else object)):
     """Summarize logs into actionable context for a coding task.
 
     Extract key errors, likely causes, and concrete hints. Keep summary tight, then
     provide bullets and any missing info that would unblock next steps.
     """
 
-    task: str = dspy.InputField()
-    logs_preview: str = dspy.InputField()
+    task: str = (dspy.InputField() if dspy is not None else None)  # type: ignore
+    logs_preview: str = (dspy.InputField() if dspy is not None else None)  # type: ignore
 
-    context: str = dspy.OutputField(desc="Concise context and key findings")
-    key_points: str = dspy.OutputField(desc="Bulleted list of errors and clues")
-    missing_info: str = dspy.OutputField(desc="What info would help next", default="")
-    next_steps: str = dspy.OutputField(desc="Immediate next steps", default="")
-    rationale: str = dspy.OutputField(desc="Brief reasoning behind the summary", default="")
+    context: str = (dspy.OutputField(desc="Concise context and key findings") if dspy is not None else "")  # type: ignore
+    key_points: str = (dspy.OutputField(desc="Bulleted list of errors and clues") if dspy is not None else "")  # type: ignore
+    missing_info: str = (dspy.OutputField(desc="What info would help next", default="") if dspy is not None else "")  # type: ignore
+    next_steps: str = (dspy.OutputField(desc="Immediate next steps", default="") if dspy is not None else "")  # type: ignore
+    rationale: str = (dspy.OutputField(desc="Brief reasoning behind the summary", default="") if dspy is not None else "")  # type: ignore
 
 
-class ContextBuilder(dspy.Module):
+class ContextBuilder((dspy.Module if dspy is not None else object)):
     def __init__(self, use_cot: Optional[bool] = None):
-        super().__init__()
-        self.fast = dspy.Predict(BuildContextSig)
-        self.slow = dspy.ChainOfThought(BuildContextSig)
+        if dspy is not None:
+            super().__init__()
+            self.fast = dspy.Predict(BuildContextSig)
+            # Use ChainOfThought when available; otherwise fall back to Predict
+            cot = getattr(dspy, 'ChainOfThought', None)
+            self.slow = (cot or dspy.Predict)(BuildContextSig)
+        else:
+            # Minimal no-dspy fallback stubs
+            class _Predict:
+                def __init__(self, *a, **k): pass
+                def __call__(self, **kwargs):
+                    # Return a simple object with expected fields
+                    from types import SimpleNamespace
+                    return SimpleNamespace(context="", key_points="", missing_info="", next_steps="", rationale="")
+            self.fast = _Predict()
+            self.slow = _Predict()
         self.use_cot = use_cot
 
     def forward(self, task: str, logs_preview: str):

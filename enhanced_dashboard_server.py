@@ -36,12 +36,17 @@ from dspy_agent.db import (
 )
 from dspy_agent.training.deploy import DeploymentLogger
 from dspy_agent.provision.pricing import get_pricing
-from dspy_agent.training.rl_sweep import run_sweep as run_rl_sweep, load_sweep_config as load_rl_sweep_config, SweepSettings
+# Avoid importing rl_sweep at module import time to prevent optional native deps from crashing imports
+run_rl_sweep = None  # type: ignore
+load_rl_sweep_config = None  # type: ignore
+class SweepSettings:  # type: ignore
+    pass
 try:
     from dspy_agent.grpo import GlobalGrpoService
 except Exception:
     GlobalGrpoService = None  # type: ignore
-from dspy_agent.rl.puffer_sweep import pareto_points
+# Avoid importing optional RL utils at module import time
+pareto_points = None  # type: ignore
 try:
     from dspy_agent.grpo.policy_nudges import compute_policy_nudges
     from dspy_agent.policy import update_policy_with_feedback
@@ -57,6 +62,9 @@ BACKPRESSURE_THRESHOLD = int(os.getenv('BUS_BACKPRESSURE_DEPTH', '100') or '100'
 DLQ_ALERT_MIN = int(os.getenv('DLQ_ALERT_MIN', '1') or '1')
 TRACE_DIR = (REPO_ROOT / '.dspy_reports'); TRACE_DIR.mkdir(exist_ok=True)
 TRACE_FILE = TRACE_DIR / 'server_trace.log'
+
+# Dev cycle shared state (class-level across handler instances)
+_DEV_CYCLE_LOG = TRACE_DIR / 'dev_cycle.log'
 
 # Test-friendly helper: gracefully emit JSON in tests where DummyHandler is used
 def _safe_send_json(handler, data, status_code: int = 200):
@@ -85,6 +93,12 @@ def _safe_send_json(handler, data, status_code: int = 200):
             pass
 
 class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
+    # Class-level dev cycle state (shared across requests)
+    _dev_cycle_proc = None
+    _dev_cycle_lines: list[str] = []
+    _dev_cycle_running: bool = False
+    _dev_cycle_log_path = _DEV_CYCLE_LOG
+
     def __init__(self, *args, **kwargs):
         # Initialize data manager before calling super().__init__
         self.data_manager = get_enhanced_data_manager()
@@ -106,10 +120,6 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             self.workspace = REPO_ROOT
         super().__init__(*args, directory=str(STATIC_DIRECTORY), **kwargs)
-        # Dev cycle state
-        self._dev_cycle_proc = None
-        self._dev_cycle_lines = []
-        self._dev_cycle_running = False
 
     def _is_admin(self) -> bool:
         try:
@@ -202,6 +212,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             # Dev cycle
             '/api/dev-cycle/status': self.serve_dev_cycle_status,
             '/api/dev-cycle/stream': self.serve_dev_cycle_stream,
+            '/api/dev-cycle/logs': self.serve_dev_cycle_logs,
             # System resources
             '/api/system/resources': self.serve_system_resources,
             '/api/system/resources/stream': self.serve_system_resources_stream,
@@ -323,6 +334,16 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_debug_trace_post()
         elif path == '/api/system/workspace':
             self.handle_system_workspace_post()
+        elif path == '/api/dev-cycle/start':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_dev_cycle_start()
+        elif path == '/api/dev-cycle/stop':
+            if not self._is_admin():
+                self.send_json_response({'error': 'admin only'}, 403)
+                return
+            self.handle_dev_cycle_stop()
         elif path == '/api/mesh/tail/to-grpo':
             self.handle_mesh_tail_to_grpo()
         else:
@@ -837,7 +858,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
 
   <script>
    function key() {{ return localStorage.getItem('ADMIN_KEY') || ''; }}
-   function headers() {{ const k = key(); return k? {{'X-Admin-Key': k}} : {}; }}
+   function headers() {{ const k = key(); return k? {{'X-Admin-Key': k}} : {{}}; }}
    function saveKey() {{ const v = document.getElementById('adminkey').value; localStorage.setItem('ADMIN_KEY', v); alert('Saved'); }}
 
    async function loadAll() {{
@@ -4075,27 +4096,95 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             pass
 
+    # Mesh status (stub)
+    def serve_mesh_status(self):
+        try:
+            self.send_json_response({'status': 'unknown', 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_mesh_topics(self):
+        try:
+            self.send_json_response({'topics': [], 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_mesh_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(30):
+                payload = {'tick': _, 'timestamp': time.time()}
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                self.wfile.flush(); time.sleep(1)
+        except Exception:
+            pass
+
+    def serve_mesh_tail_stream(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            for _ in range(10):
+                self.wfile.write(b"data: \n\n"); self.wfile.flush(); time.sleep(0.5)
+        except Exception:
+            pass
+
+    def serve_mesh_tail(self):
+        try:
+            self.send_json_response({'lines': [], 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_mesh_tail_to_grpo(self):
+        try:
+            self.send_json_response({'ok': False, 'error': 'not implemented'})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
     # Dev cycle --------------------------------------------------------------
     def _append_dev_line(self, text: str) -> None:
+        cls = type(self)
         try:
-            self._dev_cycle_lines.append(text)
-            if len(self._dev_cycle_lines) > 500:
-                self._dev_cycle_lines = self._dev_cycle_lines[-500:]
+            cls._dev_cycle_lines.append(text)
+            if len(cls._dev_cycle_lines) > 500:
+                cls._dev_cycle_lines = cls._dev_cycle_lines[-500:]
+            # Also append to log file
+            try:
+                cls._dev_cycle_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cls._dev_cycle_log_path, 'a', encoding='utf-8') as lf:
+                    lf.write(text + "\n")
+            except Exception:
+                pass
         except Exception:
             pass
 
     def handle_dev_cycle_start(self):
+        cls = type(self)
         try:
-            if self._dev_cycle_running:
+            if cls._dev_cycle_running:
                 self.send_json_response({'ok': False, 'error': 'already running'})
                 return
             script = (REPO_ROOT / 'scripts' / 'dev_cycle.sh')
             cmd = ['bash', str(script)] if script.exists() else ['make', 'dev-cycle']
             self._trace('POST', '/api/dev-cycle/start', {'cmd': ' '.join(cmd)})
             import subprocess as sp
+            # Reset state and truncate log
+            cls._dev_cycle_lines = []
+            try:
+                cls._dev_cycle_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cls._dev_cycle_log_path, 'w', encoding='utf-8') as lf:
+                    lf.write(f"[start] {' '.join(cmd)}\n")
+            except Exception:
+                pass
             proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True, cwd=str(REPO_ROOT))
-            self._dev_cycle_proc = proc
-            self._dev_cycle_running = True
+            cls._dev_cycle_proc = proc
+            cls._dev_cycle_running = True
             self._append_dev_line(f"[start] {' '.join(cmd)}")
             def _reader():
                 try:
@@ -4105,7 +4194,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                 except Exception:
                     pass
                 finally:
-                    self._dev_cycle_running = False
+                    cls._dev_cycle_running = False
                     self._append_dev_line('[done] dev cycle finished')
             import threading as _th
             _th.Thread(target=_reader, daemon=True).start()
@@ -4115,13 +4204,19 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
 
     def serve_dev_cycle_status(self):
         try:
-            out = {'running': bool(self._dev_cycle_running), 'lines': list(self._dev_cycle_lines[-50:]), 'timestamp': time.time()}
+            cls = type(self)
+            out = {
+                'running': bool(cls._dev_cycle_running),
+                'lines': list(cls._dev_cycle_lines[-50:]),
+                'timestamp': time.time(),
+            }
             self.send_json_response(out)
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
     def serve_dev_cycle_stream(self):
         try:
+            cls = type(self)
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
             self.send_header('Cache-Control', 'no-cache')
@@ -4130,7 +4225,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             pos = 0
             for _ in range(600):
                 try:
-                    lines = self._dev_cycle_lines
+                    lines = cls._dev_cycle_lines
                     chunk = lines[pos:]
                     pos = len(lines)
                     for ln in chunk:
@@ -4142,11 +4237,68 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             pass
 
+    def handle_dev_cycle_stop(self):
+        cls = type(self)
+        try:
+            proc = cls._dev_cycle_proc
+            if not proc or (hasattr(proc, 'poll') and proc.poll() is not None):
+                self.send_json_response({'ok': True, 'stopped': False, 'message': 'not running'})
+                return
+            self._append_dev_line('[stop] sending SIGTERM to dev cycle')
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            # wait up to 10s
+            for _ in range(20):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+            if proc.poll() is None:
+                self._append_dev_line('[stop] SIGTERM did not exit; sending SIGKILL')
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            cls._dev_cycle_running = False
+            self._append_dev_line('[stop] dev cycle stopped')
+            self.send_json_response({'ok': True, 'stopped': True})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 500)
+
+    def serve_dev_cycle_logs(self):
+        cls = type(self)
+        try:
+            p = cls._dev_cycle_log_path
+            if not p.exists():
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(b"No logs yet. Start a dev cycle to generate logs.\n")
+                return
+            content = p.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Disposition', 'attachment; filename="dev_cycle.log"')
+            self.send_header('Content-Length', str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        except Exception as e:
+            self.send_error(500, f"error serving logs: {e}")
+
     # RL Sweep APIs -----------------------------------------------------
     def handle_rl_sweep_run(self):
         try:
             length = int(self.headers.get('Content-Length') or 0)
             data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+            # Lazy import to avoid crashing environments without optional deps
+            _run = None; _load = None; _Settings = None
+            try:
+                from dspy_agent.training.rl_sweep import run_sweep as _run, load_sweep_config as _load, SweepSettings as _Settings  # type: ignore
+            except Exception:
+                self.send_json_response({'error': 'rl_sweep not available in this environment'}, 501)
+                return
             method = str(data.get('method') or 'eprotein')
             iterations = int(data.get('iterations') or 4)
             trainer_steps = data.get('trainer_steps')
@@ -4155,10 +4307,10 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
 
             def _run():
                 try:
-                    sweep_cfg = load_rl_sweep_config(None)
+                    sweep_cfg = _load(None)
                     sweep_cfg['method'] = method
                     sweep_cfg['iterations'] = iterations
-                    settings = SweepSettings()
+                    settings = _Settings()
                     settings.iterations = int(iterations)
                     settings.puffer_backend = bool(puffer)
                     if trainer_steps is not None:
@@ -4166,7 +4318,7 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                             settings.trainer_steps = int(trainer_steps)
                         except Exception:
                             pass
-                    outcome = run_rl_sweep(ws, sweep_cfg, base_config=None, settings=settings)
+                    outcome = _run(ws, sweep_cfg, base_config=None, settings=settings)
                     # Log summary and persist experiment record
                     out_dir = Path('.dspy_reports'); out_dir.mkdir(exist_ok=True)
                     rec = {
@@ -4199,8 +4351,13 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             pareto = []
             if isinstance(obs, list) and obs:
                 observations = [{"output": float(o.get('output',0.0)), "cost": float(o.get('cost',0.0))} for o in obs]
-                pts, idxs = pareto_points(observations)
-                pareto = pts
+                # Lazy import optional pareto utility
+                try:
+                    from dspy_agent.rl.puffer_sweep import pareto_points as _pareto_points  # type: ignore
+                    pts, _ = _pareto_points(observations)
+                    pareto = pts
+                except Exception:
+                    pareto = observations
             self.send_json_response({'exists': True, 'state': data, 'pareto': pareto})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)

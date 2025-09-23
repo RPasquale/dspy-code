@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+          # Install package in editable mode without heavy extras
+          python -m pip install -e . --no-deps
+          # Light test deps; avoid heavy torch/pufferlib for fast CI
+          python -m pip install pytest dspy-ai psutil websockets numpy<2
+      - name: Run tests (filtered)
+        run: |
+          pytest -q -k "not docker and not e2e_server and not server_feature_and_gepa"
+

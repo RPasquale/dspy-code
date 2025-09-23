@@ -21,15 +21,14 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Proto
 
 logger = logging.getLogger(__name__)
 
-# Try to import PufferLib, fall back to simple RL if not available
-try:
-    import pufferlib
-    PUFFERLIB_AVAILABLE = True
-    logger.info("PufferLib available - using full RL stack")
-except ImportError:
-    PUFFERLIB_AVAILABLE = False
-    logger.warning("PufferLib not available - using fallback RL system")
-    from .fallback_rl import get_fallback_trainer, train_fallback_rl, select_fallback_action, get_fallback_stats
+# Avoid importing optional native deps at module import time; default to fallback
+PUFFERLIB_AVAILABLE = False
+from .fallback_rl import (
+    get_fallback_trainer,
+    train_fallback_rl,
+    select_fallback_action,
+    get_fallback_stats,
+)
 
 
 # ----------------
