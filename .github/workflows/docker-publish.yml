@@ -34,7 +34,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Trivy image scan (latest)
-        uses: aquasecurity/trivy-action@0.20.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: 'ghcr.io/${{ github.repository_owner }}/dspy-lightweight:latest'
           severity: 'CRITICAL,HIGH'
@@ -42,7 +42,7 @@ jobs:
           output: 'trivy-publish-latest.sarif'
           exit-code: '0'
       - name: Trivy image scan (tag)
-        uses: aquasecurity/trivy-action@0.20.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: 'ghcr.io/${{ github.repository_owner }}/dspy-lightweight:${{ github.ref_name }}'
           severity: 'CRITICAL,HIGH'
