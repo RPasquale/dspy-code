@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dspy-agent
+description: Helm chart for DSPy coding agent components (vLLM + SparkApplications)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

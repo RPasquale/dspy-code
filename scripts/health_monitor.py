@@ -78,24 +78,58 @@ class HealthMonitor:
         }
     
     async def check_system_resources(self) -> HealthStatus:
-        """Check system resource usage."""
+        """Check system resource usage with enhanced performance metrics."""
         try:
-            # CPU usage
+            # CPU usage with detailed metrics
             cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count()
+            cpu_freq = psutil.cpu_freq()
             
-            # Memory usage
+            # Memory usage with detailed breakdown
             memory = psutil.virtual_memory()
             memory_percent = memory.percent
             memory_available_gb = memory.available / (1024**3)
+            memory_used_gb = memory.used / (1024**3)
+            memory_total_gb = memory.total / (1024**3)
             
-            # Disk usage
+            # Disk usage with I/O metrics
             disk = psutil.disk_usage(str(self.workspace))
             disk_percent = disk.percent
             disk_free_gb = disk.free / (1024**3)
+            disk_used_gb = disk.used / (1024**3)
             
-            # Determine status
+            # Network I/O
+            net_io = psutil.net_io_counters()
+            net_bytes_sent = net_io.bytes_sent
+            net_bytes_recv = net_io.bytes_recv
+            
+            # Process-specific metrics
+            current_process = psutil.Process()
+            process_memory = current_process.memory_info()
+            process_cpu = current_process.cpu_percent()
+            
+            # Enhanced metrics collection
+            metrics = {
+                'cpu_percent': cpu_percent,
+                'cpu_count': cpu_count,
+                'cpu_freq_current': cpu_freq.current if cpu_freq else None,
+                'memory_percent': memory_percent,
+                'memory_available_gb': memory_available_gb,
+                'memory_used_gb': memory_used_gb,
+                'memory_total_gb': memory_total_gb,
+                'disk_percent': disk_percent,
+                'disk_free_gb': disk_free_gb,
+                'disk_used_gb': disk_used_gb,
+                'net_bytes_sent': net_bytes_sent,
+                'net_bytes_recv': net_bytes_recv,
+                'process_memory_mb': process_memory.rss / (1024**2),
+                'process_cpu_percent': process_cpu
+            }
+            
+            # Enhanced status determination with performance recommendations
             status = "healthy"
             message = "System resources normal"
+            recommendations = []
             
             if cpu_percent > 90:
                 status = "critical"

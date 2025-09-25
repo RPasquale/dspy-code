@@ -1,0 +1,60 @@
+{{- if .Values.ingest.parquet.enabled }}
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: file-ingest-parquet
+  namespace: {{ .Values.namespace }}
+spec:
+  type: Python
+  mode: cluster
+  image: {{ .Values.image.spark }}
+  imagePullPolicy: IfNotPresent
+  sparkConf:
+    spark.sql.adaptive.enabled: "true"
+    spark.dynamicAllocation.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+    spark.dynamicAllocation.shuffleTracking.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+    spark.dynamicAllocation.minExecutors: "{{ .Values.dynamicAllocation.minExecutors }}"
+    spark.dynamicAllocation.maxExecutors: "{{ .Values.dynamicAllocation.maxExecutors }}"
+    spark.dynamicAllocation.initialExecutors: "{{ .Values.dynamicAllocation.initialExecutors }}"
+  mainApplicationFile: local:///opt/app/streaming/topics/file_ingest_parquet.py
+  sparkVersion: 3.5.1
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: {{ .Values.serviceAccount }}
+    env:
+      - name: INGEST_PARQUET_SRC
+        value: "/landing/parquet"
+      - name: WAREHOUSE_BASE
+        value: {{ .Values.warehouseBase | quote }}
+  executor:
+    instances: 2
+    cores: 2
+    memory: 4g
+  volumes:
+    - name: warehouse
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.warehouse.claim }}
+    - name: checkpoints
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.checkpoints.claim }}
+    - name: landing
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.landing.claim }}
+  driver:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+      - name: checkpoints
+        mountPath: {{ .Values.checkpointsBase }}
+      - name: landing
+        mountPath: /landing
+  executor:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+      - name: checkpoints
+        mountPath: {{ .Values.checkpointsBase }}
+      - name: landing
+        mountPath: /landing
+{{- end }}

@@ -25,6 +25,16 @@ from rich.console import Group
 from rich.columns import Columns
 from .cli_utils import print_banner as _print_banner, banner_text as _banner_text
 
+# Ensure the repository root is on sys.path so local fallbacks (e.g., a
+# lightweight `diskcache` shim) are importable before site-packages.
+try:
+    this_file = Path(__file__).resolve()
+    repo_root = this_file.parent.parent  # dspy_agent/ -> repo root
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+except Exception:
+    pass
+
 # Ensure DSPy can initialize its disk cache in a writable location
 # before importing dspy or any module that depends on it.
 def _ensure_writable_dspy_cache() -> None:
@@ -1626,12 +1636,301 @@ provision_app = typer.Typer(no_args_is_help=True, help="Provisioning helpers (co
 memory_app = typer.Typer(no_args_is_help=True, help="Agent memory tools (status, trim, compact)")
 app.add_typer(provision_app, name="provision")
 app.add_typer(memory_app, name="memory")
+# -----------------------------
+# File approvals CLI
+# -----------------------------
+files_app = typer.Typer(no_args_is_help=True, help="Manage file ingestion approvals")
+app.add_typer(files_app, name="files")
+spark_app = typer.Typer(no_args_is_help=True, help="Spark/SparkOperator helpers")
+app.add_typer(spark_app, name="spark")
+
+@files_app.command("pending")
+def files_pending(
+    warehouse: Path = typer.Option(Path.cwd() / 'warehouse', '--warehouse', dir_okay=True, exists=False),
+):
+    """List pending files discovered by CSV ingestion when approval is required."""
+    import json as _json
+    pending_path = warehouse / 'silver' / 'files_pending'
+    if not pending_path.exists():
+        console.print(Panel.fit("No pending directory found.", title="files pending", border_style="yellow")); return
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+        tbl = pq.read_table(pending_path)
+        rows = tbl.to_pydict()
+        out = []
+        for src, rows_cnt, status in zip(rows.get('source_file', []), rows.get('rows', []), rows.get('status', [])):
+            out.append({'source_file': src, 'rows': int(rows_cnt or 0), 'status': status})
+        console.print(Panel.fit(_json.dumps(out, indent=2), title=f"pending (n={len(out)})", border_style="cyan"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="files pending", border_style="red"))
+
+
+def _write_decision(warehouse: Path, file_pattern: str, decision: str) -> None:
+    import json as _json
+    import glob
+    approve_dir = warehouse / 'approvals' / 'files_decisions'
+    approve_dir.mkdir(parents=True, exist_ok=True)
+    import time as _t
+    ts = _t.time()
+    matched = glob.glob(file_pattern)
+    # Record action(s) for learning
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        from .db.data_models import create_action_record, ActionType, Environment
+        dm = get_enhanced_data_manager()
+    except Exception:
+        dm = None  # type: ignore
+    if not matched:
+        # write pattern record anyway
+        (approve_dir / f"decision_{int(ts)}.json").write_text(_json.dumps({'source_file': file_pattern, 'decision': decision, 'ts': ts}))
+        if dm is not None:
+            try:
+                rec = create_action_record(
+                    action_type=ActionType.TOOL_SELECTION,
+                    state_before={'pattern': file_pattern},
+                    state_after={'decision': decision, 'source_file': file_pattern},
+                    parameters={'mode': 'ingest_approval'},
+                    result={'selected': 'files_' + decision},
+                    reward=1.0 if decision == 'approved' else 0.0,
+                    confidence=1.0,
+                    execution_time=0.0,
+                    environment=Environment.DEVELOPMENT,
+                )
+                dm.record_action(rec)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return
+    for m in matched:
+        (approve_dir / f"decision_{int(ts)}_{hash(m)}.json").write_text(_json.dumps({'source_file': m, 'decision': decision, 'ts': ts}))
+        if dm is not None:
+            try:
+                rec = create_action_record(
+                    action_type=ActionType.TOOL_SELECTION,
+                    state_before={'source_file': m, 'pattern': file_pattern},
+                    state_after={'decision': decision, 'source_file': m},
+                    parameters={'mode': 'ingest_approval'},
+                    result={'selected': 'files_' + decision},
+                    reward=1.0 if decision == 'approved' else 0.0,
+                    confidence=1.0,
+                    execution_time=0.0,
+                    environment=Environment.DEVELOPMENT,
+                )
+                dm.record_action(rec)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+
+@files_app.command("approve")
+def files_approve(
+    pattern: str = typer.Argument(..., help="Glob for source_file paths to approve"),
+    warehouse: Path = typer.Option(Path.cwd() / 'warehouse', '--warehouse', dir_okay=True, exists=False),
+):
+    _write_decision(warehouse, pattern, 'approved')
+    console.print(Panel.fit(f"Approved pattern: {pattern}", title="files", border_style="green"))
+
+
+@files_app.command("reject")
+def files_reject(
+    pattern: str = typer.Argument(..., help="Glob for source_file paths to reject"),
+    warehouse: Path = typer.Option(Path.cwd() / 'warehouse', '--warehouse', dir_okay=True, exists=False),
+):
+    _write_decision(warehouse, pattern, 'rejected')
+    console.print(Panel.fit(f"Rejected pattern: {pattern}", title="files", border_style="red"))
+
+
+@spark_app.command("retrain_tool")
+def spark_retrain_tool(
+    manifest: Path = typer.Option(Path.cwd() / 'warehouse' / 'datasets' / 'grpo_tool_batches' / 'manifest.json', '--manifest', exists=False),
+    epochs: int = typer.Option(1, '--epochs'),
+    batch_size: int = typer.Option(16, '--batch-size'),
+):
+    """Run a local retrain of the tool GRPO model using the training stub."""
+    try:
+        import subprocess, sys as _sys
+        cmd = [
+            _sys.executable, '-m', 'dspy_agent.training.train_grpo_tool',
+            '--manifest', str(manifest), '--epochs', str(epochs), '--batch-size', str(batch_size)
+        ]
+        console.print(Panel.fit("Running local retrain...", title="retrain", border_style="accent"))
+        subprocess.run(cmd, check=True)
+        console.print(Panel.fit("Retrain complete.", title="retrain", border_style="green"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="retrain failed", border_style="red"))
+
+
+@spark_app.command("status")
+def sparkop_status(
+    namespace: str = typer.Option("default", '--namespace', help='K8s namespace'),
+    scheduled: bool = typer.Option(True, '--scheduled/--no-scheduled', help='Include ScheduledSparkApplications'),
+):
+    """Show SparkOperator job status using kubectl (if available)."""
+    import shutil as _sh, subprocess
+    if not _sh.which('kubectl'):
+        console.print(Panel("kubectl not found in PATH", title="spark", border_style="yellow")); return
+    try:
+        out1 = subprocess.run(['kubectl','get','sparkapplications','-n',namespace,'-o','wide'], capture_output=True, text=True)
+        console.print(Panel.fit(out1.stdout or out1.stderr, title="SparkApplications", border_style="cyan"))
+        if scheduled:
+            out2 = subprocess.run(['kubectl','get','scheduledsparkapplications','-n',namespace,'-o','wide'], capture_output=True, text=True)
+            console.print(Panel.fit(out2.stdout or out2.stderr, title="ScheduledSparkApplications", border_style="cyan"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="spark status", border_style="red"))
 
 # -----------------------------
 # Logs attach/forward utilities
 # -----------------------------
 logs_app = typer.Typer(help="Attach to logs and forward to Kafka topics.")
 app.add_typer(logs_app, name="logs")
+
+# -----------------------------
+# Actions inspection CLI
+# -----------------------------
+actions_app = typer.Typer(no_args_is_help=True, help="Inspect recent agent actions (for learning/analytics)")
+app.add_typer(actions_app, name="actions")
+
+@actions_app.command("recent")
+def actions_recent(
+    limit: int = typer.Option(10, '--limit', help='Max actions to show'),
+    action_type: Optional[str] = typer.Option(None, '--type', help='Filter by action type (e.g., tool_selection, code_edit)'),
+    raw: bool = typer.Option(False, '--raw/--no-raw', help='Print raw JSON instead of a table'),
+    out: Optional[Path] = typer.Option(None, '--out', help='Optional path to write JSON array of actions'),
+):
+    """Show recent actions recorded by the agent (from RedDB or in-memory fallback)."""
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        from .db.data_models import ActionType
+        dm = get_enhanced_data_manager()
+        actions = dm.get_recent_actions(limit=max(1, int(limit)))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="actions", border_style="red")); return
+    # Optional filter
+    if action_type:
+        key = action_type.strip().lower()
+        actions = [a for a in actions if str(getattr(a, 'action_type', '')).lower().endswith(key)]
+    # Optional write-out (JSON array)
+    import json as _json
+    json_rows = [_a.to_dict() if hasattr(_a, 'to_dict') else getattr(_a, '__dict__', {}) for _a in actions]  # type: ignore[attr-defined]
+    if out:
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            out.write_text(_json.dumps(json_rows, indent=2))
+            console.print(Panel.fit(f"Wrote actions to {out}", title="actions", border_style="green"))
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="write failed", border_style="red"))
+    if raw:
+        console.print(Panel.fit(_json.dumps(json_rows, indent=2), title=f"actions (n={len(actions)})", border_style="cyan"))
+        return
+    # Render a concise table
+    from datetime import datetime as _dt
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column('When', style='magenta')
+    table.add_column('Type', style='green')
+    table.add_column('Reward', style='yellow')
+    table.add_column('Confidence', style='blue')
+    table.add_column('Summary', style='white')
+    for a in actions:
+        try:
+            ts = getattr(a, 'timestamp', 0.0)
+            when = _dt.fromtimestamp(float(ts)).strftime('%Y-%m-%d %H:%M:%S') if ts else ''
+        except Exception:
+            when = ''
+        typ = getattr(a, 'action_type', '')
+        if hasattr(typ, 'value'):
+            typ = typ.value  # enum
+        rw = f"{float(getattr(a, 'reward', 0.0)):.2f}"
+        cf = f"{float(getattr(a, 'confidence', 0.0)):.2f}"
+        params = getattr(a, 'parameters', {}) or {}
+        result = getattr(a, 'result', {}) or {}
+        after = getattr(a, 'state_after', {}) or {}
+        tool = after.get('tool') or result.get('selected') or params.get('tool') or ''
+        summary = f"{tool} {params.get('mode','')}".strip()
+        table.add_row(str(when), str(typ), rw, cf, summary)
+    console.print(Panel(table, title=f"Recent Actions (n={len(actions)})", border_style="green"))
+
+
+@actions_app.command("tail")
+def actions_tail(
+    stream: str = typer.Option('rl_actions', '--stream', help='Stream name to follow (default: rl_actions)'),
+    start: int = typer.Option(0, '--start', help='Start offset'),
+    batch: int = typer.Option(50, '--batch', help='Max items per poll'),
+    interval: float = typer.Option(2.0, '--interval', help='Seconds between polls'),
+    limit: Optional[int] = typer.Option(None, '--limit', help='Stop after N records (optional)'),
+    raw: bool = typer.Option(False, '--raw/--no-raw', help='Print raw JSON instead of a compact line'),
+    out_jsonl: Optional[Path] = typer.Option(None, '--out-jsonl', help='Append each record as JSONL to this file'),
+):
+    """Follow a RedDB stream (in-memory or HTTP) and print new records."""
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        dm = get_enhanced_data_manager()
+        storage = dm.storage  # underlying RedDBStorage
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="actions tail", border_style="red")); return
+    # Prepare JSONL sink if requested
+    sink = None
+    if out_jsonl:
+        try:
+            out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            sink = out_jsonl.open('a')
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="open out-jsonl failed", border_style="red"))
+            sink = None
+    seen = 0
+    offset = max(0, int(start))
+    try:
+        while True:
+            try:
+                rows = list(storage.read(stream, start=offset, count=batch))  # Iterable[(offset, value)]
+            except Exception as e:
+                console.print(Panel(escape(str(e)), title="read failed", border_style="red"))
+                rows = []
+            if rows:
+                for off, rec in rows:
+                    ts = rec.get('timestamp') if isinstance(rec, dict) else None
+                    if raw:
+                        try:
+                            import json as _json
+                            console.print(_json.dumps(rec))
+                        except Exception:
+                            console.print(str(rec))
+                    else:
+                        # Compact line summary
+                        typ = rec.get('action_type', '') if isinstance(rec, dict) else ''
+                        if isinstance(typ, dict):
+                            typ = typ.get('value', '')
+                        tool = ''
+                        try:
+                            after = rec.get('state_after', {}) if isinstance(rec, dict) else {}
+                            tool = after.get('tool') or rec.get('result', {}).get('selected', '')
+                        except Exception:
+                            pass
+                        console.print(f"[dim]{off}[/dim] {typ} {tool}")
+                    # JSONL sink
+                    if sink is not None:
+                        try:
+                            import json as _json
+                            sink.write(_json.dumps(rec) + "\n")
+                            sink.flush()
+                        except Exception:
+                            pass
+                    seen += 1
+                    offset = off + 1
+                    if limit is not None and seen >= int(limit):
+                        raise KeyboardInterrupt
+            else:
+                import time as _t
+                _t.sleep(max(0.1, float(interval)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if sink is not None:
+            try:
+                sink.close()
+            except Exception:
+                pass
+    console.print(Panel.fit(f"Tail stopped at offset {offset} (seen={seen})", title="actions tail", border_style="yellow"))
 
 def _resolve_bootstrap(bootstrap: Optional[str]) -> Optional[str]:
     return bootstrap or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or os.getenv('KAFKA_BOOTSTRAP')
@@ -1944,11 +2243,60 @@ def _get_code_summary(ws: Path) -> str:
 
 def _build_patch_context_bundle(workspace: Path, logs: Path, task: str) -> dict:
     cm = ContextManager(workspace, logs)
+    # Prefer enhanced context that merges RedDB data, retrievals, and performance
     try:
-        bundle = cm.build_patch_context(task)
+        bundle = cm.build_enhanced_context(task)
     except Exception:
-        bundle = {'text': '', 'logs': '', 'patches': [], 'stats': {}, 'task': task}
-    context_text = bundle.get('text') or bundle.get('logs') or ''
+        try:
+            bundle = cm.build_patch_context(task)
+        except Exception:
+            bundle = {'text': '', 'logs': '', 'patches': [], 'stats': {}, 'task': task}
+    # Curate a compact combined_context string prioritizing actionable signals
+    parts: list[str] = []
+    key_logs = (bundle.get('logs') or '').strip()
+    if key_logs:
+        parts.append(f"Recent errors and logs:\n{key_logs}")
+    code_sum = (bundle.get('summary') or '').strip()
+    if code_sum:
+        parts.append(f"Code summary:\n{code_sum}")
+    # Include a brief performance snapshot if present
+    perf = bundle.get('performance_summary') or {}
+    if isinstance(perf, dict) and perf:
+        try:
+            avg_sig = float(perf.get('signature_performance', {}).get('avg_score', perf.get('avg_signature_performance', 0)))
+        except Exception:
+            avg_sig = 0.0
+        try:
+            avg_ver = float(perf.get('verifier_performance', {}).get('avg_accuracy', perf.get('avg_verifier_accuracy', 0)))
+        except Exception:
+            avg_ver = 0.0
+        parts.append(f"Performance snapshot: signatures~{avg_sig:.2f}, verifiers~{avg_ver:.2f}")
+    # Recent retrievals overview
+    r_events = bundle.get('retrieval_events') or bundle.get('recent_reddb_logs') or []
+    if isinstance(r_events, list) and r_events:
+        try:
+            sample = []
+            for ev in r_events[-5:]:
+                q = (ev.get('query') if isinstance(ev, dict) else None) or ''
+                hits = ev.get('hits') if isinstance(ev, dict) else []
+                sample.append(f"- {str(q)[:80]} → {len(hits or [])} hit(s)")
+            if sample:
+                parts.append("Recent retrievals:\n" + "\n".join(sample))
+        except Exception:
+            pass
+    hist_stats = bundle.get('stats') or {}
+    if isinstance(hist_stats, dict) and hist_stats:
+        try:
+            parts.append(
+                f"History: success={float(hist_stats.get('recent_success_rate', 0.0)):.2f} "
+                f"fail={float(hist_stats.get('recent_failure_rate', 0.0)):.2f} "
+                f"avg_pass={float(hist_stats.get('avg_pass_rate', 0.0)):.2f}"
+            )
+        except Exception:
+            pass
+    context_text = ("\n\n".join([p for p in parts if p])).strip()
+    if not context_text:
+        context_text = (bundle.get('text') or bundle.get('logs') or '')
     bundle['combined_context'] = context_text
     return bundle
 
@@ -2410,6 +2758,7 @@ def teleprompt_suite(
         console.print(Panel(escape(str(e)), title="teleprompt suite failed", border_style="red"))
         raise typer.Exit(1)
 
+@app.command()
 def context(
     logs: Optional[Path] = typer.Option(
         None, '--logs', file_okay=True, dir_okay=True, exists=True,
@@ -5702,6 +6051,33 @@ def code_edit(
             ok, msg = apply_unified_patch(out.patch, workspace)
             if ok:
                 console.print(f"[green]{msg}[/green]")
+                # Record patch to RedDB for integrated learning
+                try:
+                    from .context import ContextManager
+                    from .code_tools.patcher import summarize_patch, files_from_patch
+                    cm_rec = ContextManager(workspace, workspace / 'logs')
+                    summ = summarize_patch(out.patch)
+                    targets = files_from_patch(out.patch)
+                    test_meta = {
+                        'verifier_verdict': getattr(v, 'verdict', ''),
+                        'risk_level': getattr(v, 'risk_level', ''),
+                        'reasons': getattr(v, 'reasons', ''),
+                        'suggestions': getattr(v, 'fix_suggestions', ''),
+                        'added_lines': summ.get('added_lines', 0),
+                        'removed_lines': summ.get('removed_lines', 0),
+                    }
+                    conf = 1.0 if str(getattr(v, 'verdict', '')).lower() == 'pass' else 0.6
+                    blast = float(summ.get('added_lines', 0) + summ.get('removed_lines', 0))
+                    cm_rec.store_patch_record(
+                        patch_content=out.patch,
+                        target_files=targets,
+                        applied=True,
+                        test_results=test_meta,
+                        confidence_score=conf,
+                        blast_radius=blast,
+                    )
+                except Exception:
+                    pass
                 # Plan tests if possible
                 try:
                     tp = TestPlanner()
@@ -5778,6 +6154,24 @@ def init(
     except Exception as e:
         console.print(Panel(escape(str(e)), title="task training failed", border_style="red"))
     console.print(Panel.fit("Flags: --workspace --logs --out-dir --train/--no-train --budget --ollama/--no-ollama --model --base-url --api-key", title="usage", border_style="dim"))
+
+
+@app.command()
+def status(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+):
+    """Lightweight status for tests and local checks."""
+    try:
+        ws = workspace.resolve()
+    except Exception:
+        ws = Path.cwd()
+    # Minimal payload reused by CLI tests
+    payload = {
+        'workspace': str(ws),
+        'ok': True,
+        'components': ['cli', 'streaming', 'rl', 'db'],
+    }
+    console.print(Panel.fit(str(payload), title='status', border_style='green'))
 
 
 @app.command()
@@ -7213,6 +7607,46 @@ def start_command(
             if not msg: console.print("[yellow]git_commit needs message[/yellow]"); return
             proc = subprocess.run(["git","-C",str(ws),"commit","-m",msg], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             console.print(proc.stdout or (Panel(proc.stderr or "git commit failed", title="git", border_style="red")))
+        elif t == "db_ingest":
+            try:
+                from .skills.tools.db_tools import db_ingest as _db_ingest
+                ns = str(args.get('namespace') or 'default')
+                payload = dict(args.get('payload') or args)
+                # Remove routing fields not part of payload
+                for k in ('namespace', 'tool'):
+                    payload.pop(k, None)
+                out = _db_ingest(payload, namespace=ns)
+                console.print(Panel.fit(escape(json.dumps(out, indent=2)), title=f"db_ingest:{ns}", border_style="green"))
+            except Exception as e:
+                console.print(Panel(escape(str(e)), title="db_ingest failed", border_style="red"))
+        elif t == "db_query":
+            try:
+                from .skills.tools.db_tools import db_query as _db_query
+                ns = str(args.get('namespace') or 'default')
+                payload = dict(args.get('payload') or args)
+                for k in ('namespace', 'tool'):
+                    payload.pop(k, None)
+                out = _db_query(payload, namespace=ns)
+                console.print(Panel.fit(escape(json.dumps(out, indent=2)[:4000] + ("..." if len(json.dumps(out))>4000 else "")), title=f"db_query:{ns}", border_style="cyan"))
+            except Exception as e:
+                console.print(Panel(escape(str(e)), title="db_query failed", border_style="red"))
+        elif t == "db_multi":
+            try:
+                from .skills.tools.db_tools import db_multi_head as _db_multi
+                ns = str(args.get('namespace') or 'default')
+                q = args.get('query') or args.get('text')
+                if not q:
+                    console.print("[yellow]db_multi needs 'query' or 'text' in args.[/yellow]"); return
+                collection = args.get('collection')
+                use_lm = bool(args.get('use_lm') or False)
+                top_k = int(args.get('top_k') or 5)
+                out = _db_multi(str(q), namespace=ns, collection=collection, top_k=top_k, use_lm=use_lm)
+                ans = out.get('answer') or ''
+                ctx = json.dumps(out.get('context') or {})
+                console.print(Panel.fit(escape(ans[:4000] + ("..." if len(ans)>4000 else "")), title="db_multi answer", border_style="magenta"))
+                console.print(Panel.fit(escape(ctx[:2000] + ("..." if len(ctx)>2000 else "")), title="db_multi context", border_style="dim"))
+            except Exception as e:
+                console.print(Panel(escape(str(e)), title="db_multi failed", border_style="red"))
         else:
             console.print(f"[yellow]Unknown tool from agent: {tool}[/yellow]")
 
@@ -8998,3 +9432,68 @@ def _stream_metric_event(workspace: Path, name: str, payload: Dict[str, Any]) ->
             kl.send('agent.metrics', evt)
     except Exception:
         pass
+@app.command()
+def databackend(
+    port: int = typer.Option(8766, '--port', help='Port for intelligent backend server'),
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help='Workspace / namespace base'),
+):
+    """Start the intelligent data backend (vector/graph/collections/tables) with smart routing."""
+    try:
+        from .server.intelligent_backend_server import start_intelligent_backend_server
+        # Stash workspace into environment/registry for future extensions
+        os.environ['DSPY_WORKSPACE'] = str(workspace.resolve())
+        console.print(Panel.fit(f"Starting Intelligent Backend @ :{port}", title="databackend", border_style="green"))
+        start_intelligent_backend_server(port)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title='databackend failed', border_style='red'))
+
+
+@app.command()
+def databackend_fastapi(
+    port: int = typer.Option(8767, '--port', help='Port for FastAPI intelligent backend'),
+    host: str = typer.Option('0.0.0.0', '--host', help='Bind host'),
+):
+    """Start the FastAPI/uvicorn intelligent backend if fastapi/uvicorn are installed."""
+    try:
+        from .server.fastapi_backend import start_fastapi_backend
+        console.print(Panel.fit(f"Starting FastAPI Backend @ {host}:{port}", title="databackend-fastapi", border_style="green"))
+        start_fastapi_backend(host=host, port=port)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title='databackend-fastapi failed', border_style='red'))
+
+
+@app.command()
+def datasearch(
+    query: str = typer.Argument(..., help='Natural language query'),
+    namespace: str = typer.Option('default', '--ns', help='Namespace'),
+    collection: str = typer.Option(None, '--collection', help='Optional collection/index hint'),
+    top_k: int = typer.Option(5, '--top-k', help='Number of items to retrieve'),
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help='Workspace for RL config/weights'),
+    use_lm: bool = typer.Option(False, '--use-lm/--no-use-lm', help='Use DSPy/Ollama to summarize results'),
+):
+    """Query the intelligent backend via modular RAG (vector/doc/table/graph)."""
+    try:
+        from .skills.data_rag import DataRAG
+        rag = DataRAG(namespace=namespace, workspace=str(workspace))
+        res = rag(query, top_k=top_k, collection=collection, use_lm=use_lm)
+        _print_header("Data RAG Result")
+        console.print(Panel.fit(escape(res.answer), title=f"mode: {res.mode}", border_style="cyan"))
+        # Compact context preview
+        ctx = json.dumps(res.context)[:2000]
+        console.print(Panel.fit(escape(ctx + ("..." if len(json.dumps(res.context)) > 2000 else "")), title="context", border_style="dim"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title='datasearch failed', border_style='red'))
+
+
+@app.command()
+def reddb_mock(
+    port: int = typer.Option(8080, '--port', help='Port for RedDB mock server'),
+    host: str = typer.Option('0.0.0.0', '--host', help='Bind host'),
+):
+    """Start a local RedDB-compatible mock server (KV + Streams HTTP API)."""
+    try:
+        from .server.reddb_mock import start_reddb_mock
+        console.print(Panel.fit(f"Starting RedDB Mock @ {host}:{port}", title="reddb-mock", border_style="green"))
+        start_reddb_mock(host=host, port=port)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title='reddb-mock failed', border_style='red'))

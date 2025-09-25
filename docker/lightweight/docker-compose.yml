@@ -8,11 +8,11 @@ services:
       environment:
         - LOCAL_MODE=false
         - USE_OLLAMA=true
-        - DB_BACKEND=auto
+        - DB_BACKEND=reddb
         - DSPY_AUTO_APPLY_PATCHES=0
-        - REDDB_URL
+        - REDDB_URL=http://reddb:8080
         - REDDB_NAMESPACE=dspy
-        - REDDB_TOKEN
+        - REDDB_TOKEN=${REDDB_ADMIN_TOKEN}
         - MODEL_NAME=qwen3:1.7b
         - OPENAI_API_KEY=
         - OPENAI_BASE_URL=http://ollama:11434
@@ -21,6 +21,11 @@ services:
         - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
         - KAFKA_CLIENT_ID=dspy-agent
         - KAFKA_TOPIC_PREFIX
+        # Advanced features
+        - DSPY_ENABLE_AUTO_SCALING=true
+        - DSPY_PERFORMANCE_MODE=optimized
+        - DSPY_INTELLIGENT_CACHING=true
+        - DSPY_ADAPTIVE_LEARNING=true
       entrypoint: ["/entrypoints/run_dspy_agent.sh"]
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
@@ -45,8 +50,15 @@ services:
           reservations:
             memory: 2G
             cpus: '1.0'
+        restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
       depends_on:
         kafka:
+          condition: service_healthy
+        reddb:
           condition: service_healthy
 
     ollama:
@@ -69,6 +81,11 @@ services:
           reservations:
             memory: 3G
             cpus: '2.0'
+        restart_policy:
+          condition: on-failure
+          delay: 10s
+          max_attempts: 3
+          window: 300s
       healthcheck:
         test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
         interval: 10s
@@ -101,6 +118,62 @@ services:
         timeout: 3s
         retries: 20
         start_period: 10s
+
+    reddb:
+      image: dspy-lightweight:latest
+      container_name: reddb-mock
+      working_dir: /app
+      entrypoint: ["bash", "-lc", "python -m dspy_agent.server.reddb_mock"]
+      restart: unless-stopped
+      ports:
+        - "127.0.0.1:8082:8080"
+      environment:
+        - REDB_ADMIN_TOKEN=${REDDB_ADMIN_TOKEN}
+      healthcheck:
+        test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8080/health')\" >/dev/null 2>&1 || exit 1"]
+        interval: 30s
+        timeout: 10s
+        retries: 5
+        start_period: 5s
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
+
+    fastapi-backend:
+      image: dspy-lightweight:latest
+      user: "10001:10001"
+      working_dir: /app
+      entrypoint: ["/bin/sh", "-lc", "python -m dspy_agent.server.fastapi_backend"]
+      environment:
+        - REDDB_URL=http://reddb:8080
+        - REDDB_NAMESPACE=dspy
+        - REDDB_TOKEN=${REDDB_ADMIN_TOKEN}
+        - DSPY_WORKSPACE=/workspace
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace:rw
+      ports:
+        - "127.0.0.1:8767:8767"
+      depends_on:
+        reddb:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request as u, sys\ntry:\n u.urlopen('http://localhost:8767/api/db/health')\n sys.exit(0)\nexcept Exception:\n sys.exit(1)\nPY"]
+        interval: 20s
+        timeout: 5s
+        retries: 10
+        start_period: 5s
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: false
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
 
     infermesh:
       image: ghcr.io/rpasquale/infermesh:cpu-local
@@ -530,7 +603,70 @@ services:
       cap_drop:
         - ALL
 
+    test-suite:
+      build:
+        context: .
+        dockerfile: test_suite.Dockerfile
+      environment:
+        - WORKSPACE_DIR=${WORKSPACE_DIR}
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace
+        - ./logs:/workspace/logs
+      depends_on:
+        - dspy-agent
+        - dashboard
+      profiles:
+        - testing
+
+    # Intelligent auto-scaling service
+    auto-scaler:
+      image: dspy-lightweight:latest
+      user: "10001:10001"
+      working_dir: /app
+      entrypoint: ["/bin/bash", "-lc"]
+      command: >-
+        python - <<'PY'
+        from dspy_agent.monitor.auto_scaler import AutoScaler
+        import os
+        scaler = AutoScaler(
+            workspace=os.getenv('WORKSPACE_DIR', '/workspace'),
+            kafka_bootstrap=os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092'),
+            reddb_url=os.getenv('REDDB_URL', 'http://reddb:8080')
+        )
+        scaler.start_monitoring()
+        PY
+      environment:
+        - WORKSPACE_DIR=/workspace
+        - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+        - REDDB_URL=http://reddb:8080
+        - REDDB_TOKEN=${REDDB_ADMIN_TOKEN}
+        - AUTO_SCALER_INTERVAL=30
+        - AUTO_SCALER_CPU_THRESHOLD=80
+        - AUTO_SCALER_MEMORY_THRESHOLD=85
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
+      depends_on:
+        kafka:
+          condition: service_healthy
+        reddb:
+          condition: service_healthy
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
+      tmpfs:
+        - /tmp
+      cap_drop:
+        - ALL
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'auto_scaler' >/dev/null 2>&1 || exit 1"]
+        interval: 30s
+        timeout: 5s
+        retries: 5
+        start_period: 10s
 volumes:
   ollama: {}
   dspy-cache: {}
   hf-cache: {}
+  reddb_data: {}

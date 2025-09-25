@@ -105,7 +105,7 @@ class CodeEdit(dspy.Module):
         if self.use_cot is True:
             pred = self.propose_slow(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
         else:
-        pred = self.propose_fast(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+            pred = self.propose_fast(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
         patch = getattr(pred, 'patch', '') or ''
         rationale = getattr(pred, 'rationale', '') or ''
 

@@ -1,0 +1,50 @@
+name: Build and Push Spark Train Image
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+    paths:
+      - 'dspy_agent/**'
+      - 'streaming/**'
+      - 'docker/spark-train/**'
+  pull_request:
+    paths:
+      - 'dspy_agent/**'
+      - 'streaming/**'
+      - 'docker/spark-train/**'
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push train image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/spark-train/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/dspy-spark-train:latest
+            ghcr.io/${{ github.repository_owner }}/dspy-spark-train:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/dspy-spark-train:${{ github.ref_name }}

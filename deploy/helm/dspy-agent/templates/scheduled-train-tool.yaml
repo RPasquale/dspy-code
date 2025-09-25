@@ -1,0 +1,46 @@
+{{- if .Values.sparkApps.trainSchedule.enabled }}
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: ScheduledSparkApplication
+metadata:
+  name: train-grpo-tool-schedule
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.sparkApps.trainSchedule.schedule | default "0 3 * * *" | quote }}
+  concurrencyPolicy: Forbid
+  template:
+    type: Python
+    mode: cluster
+    image: {{ .Values.image.train }}
+    imagePullPolicy: IfNotPresent
+    sparkConf:
+      spark.sql.adaptive.enabled: "true"
+    mainApplicationFile: local:///opt/app/dspy_agent/training/train_grpo_tool.py
+    sparkVersion: 3.5.1
+    arguments:
+      - "--manifest"
+      - "{{ printf "%s/datasets/grpo_tool_batches/manifest.json" .Values.warehouseBase }}"
+      - "--epochs"
+      - "1"
+      - "--batch-size"
+      - "16"
+    driver:
+      cores: 1
+      memory: 2g
+      serviceAccount: {{ .Values.serviceAccount }}
+    executor:
+      instances: 1
+      cores: 1
+      memory: 2g
+    volumes:
+      - name: warehouse
+        persistentVolumeClaim:
+          claimName: {{ .Values.pvc.warehouse.claim }}
+    driver:
+      volumeMounts:
+        - name: warehouse
+          mountPath: {{ .Values.warehouseBase }}
+    executor:
+      volumeMounts:
+        - name: warehouse
+          mountPath: {{ .Values.warehouseBase }}
+{{- end }}

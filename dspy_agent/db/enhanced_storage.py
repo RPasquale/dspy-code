@@ -49,13 +49,30 @@ class CacheEntry:
 
 
 class LRUCache:
-    """Thread-safe LRU cache with TTL support"""
+    """Enhanced thread-safe LRU cache with TTL support and performance optimization"""
     
     def __init__(self, max_size: int = 1000, default_ttl: float = 3600):
         self.max_size = max_size
         self.default_ttl = default_ttl
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._lock = threading.RLock()
+        
+        # Performance metrics
+        self._metrics = {
+            'hits': 0,
+            'misses': 0,
+            'evictions': 0,
+            'expired_evictions': 0,
+            'total_requests': 0,
+            'avg_access_time': 0.0,
+            'peak_size': 0
+        }
+        
+        # Batch processing optimization
+        self._batch_operations = []
+        self._batch_size = 10
+        self._last_batch_time = time.time()
+        self._batch_timeout = 0.05  # 50ms
     
     def get(self, key: str) -> Optional[Any]:
         """Get item from cache"""

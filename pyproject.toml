@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dspy-code"
-version = "0.1.0"
+version = "0.1.1"
 description = "Blampert - A powerful coding assistant that learns and improves through reinforcement learning."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,16 +23,13 @@ dependencies = [
     "psutil>=5.9.5",
     "websockets>=12.0",
     "asyncio-mqtt>=0.16.1",
-    # RL extras promoted to default so advanced training is always available
-    "pufferlib>=3.0.0",
-    "gymnasium>=0.27",
-    "torch>=2.0.0",
     # External verifiers package (best-effort; optional at runtime if unavailable)
     "verifiers @ git+https://github.com/willccbb/verifiers.git",
 ]
 
 [project.scripts]
 # New primary entrypoints
+dspy-agent = "dspy_agent.cli:app"
 dspy-code = "dspy_agent.cli:app"
 dspy-code-agent = "dspy_agent.cli:app"
 dspy-code-coder = "dspy_agent.cli:app"
@@ -62,6 +59,9 @@ RedDB = "https://github.com/redbco/redb-open.git"
 
 [project.optional-dependencies]
 rl = [
+    "pufferlib>=3.0.0",
+    "gymnasium>=0.27",
+    "torch>=2.0.0",
     "pyro-ppl>=1.9.0",
     "carbs>=0.2.0",
 ]

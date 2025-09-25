@@ -15,6 +15,8 @@ import shlex
 import time
 import logging
 from dataclasses import dataclass, field
+import sys
+import shutil
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
@@ -147,15 +149,21 @@ class EnvConfig:
     allowed_actions: Optional[Iterable[str]] = None
 
 
-try:  # optional gymnasium for PufferLib
-    import gymnasium as _gym  # type: ignore
-    from gymnasium import spaces as _spaces  # type: ignore
-    import numpy as _np  # type: ignore
-    _HAS_GYM = True
-except Exception:  # pragma: no cover - optional
-    _HAS_GYM = False
-    _spaces = None  # type: ignore
-    _np = None  # type: ignore
+# Optional gym/numpy are disabled by default in restricted environments to avoid
+# import-time crashes from native extensions. Enable via DSPY_ENABLE_GYM=1.
+_HAS_GYM = False
+_spaces = None  # type: ignore
+_np = None  # type: ignore
+if os.getenv("DSPY_ENABLE_GYM", "0").lower() in {"1", "true", "yes"}:
+    try:  # optional gymnasium for vectorized env compatibility
+        import gymnasium as _gym  # type: ignore
+        from gymnasium import spaces as _spaces  # type: ignore
+        import numpy as _np  # type: ignore
+        _HAS_GYM = True
+    except Exception:  # pragma: no cover - optional
+        _HAS_GYM = False
+        _spaces = None  # type: ignore
+        _np = None  # type: ignore
 
 
 class RLToolEnv:
@@ -205,6 +213,7 @@ class RLToolEnv:
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[List[float], Dict[str, Any]]:
         self._t = 0
         ctx = self._cfg.context_provider() if self._cfg.context_provider else []
+        # Default to context-only observation on reset for compatibility
         self._last_obs = list(ctx)
         return self._last_obs, {"t": self._t}
 
@@ -564,7 +573,13 @@ def attach_vector_context(make_env: Callable[[], RLToolEnv], path: str, *, batch
     return factory
 
 
-def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig, backend: str = "multiprocessing", analytics_cb: Optional[Callable[[int, Dict[str, Any], float], Optional[Dict[str, Any]]]] = None) -> EpisodeStats:
+def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig, backend: str = "Serial", analytics_cb: Optional[Callable[[int, Dict[str, Any], float], Optional[Dict[str, Any]]]] = None) -> EpisodeStats:
+    # Allow a deterministic fallback when backend is Serial or explicitly disabled
+    try:
+        if str(backend).strip().lower() in {"serial", "none", "fallback"}:
+            return bandit_trainer(make_env, cfg, analytics_cb=analytics_cb)
+    except Exception:
+        pass
     try:
         try:
             import pufferlib.emulation as emulation  # type: ignore
@@ -574,37 +589,43 @@ def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig,
     except Exception as e:  # pragma: no cover - optional
         raise RuntimeError("PufferLib not available. Install with 'pip install .[rl]'") from e
     tmp_env = make_env(); n_actions = tmp_env.action_dim
-    def creator(): return emulation.GymnasiumPufferEnv(make_env())
-    venv = pvector.make(creator, num_envs=max(1, cfg.n_envs), backend=backend)
-    obs, infos = venv.reset(); policy = make_bandit(cfg.policy, n_actions, **dict(cfg.policy_kwargs))
-    all_rewards: List[float] = []; all_infos: List[dict] = []
-    for _ in range(cfg.steps):
-        actions = [int(policy.select(list(obs[i]) if not isinstance(obs[i], list) else obs[i])) for i in range(len(obs))]
-        obs, rewards, terms, truncs, infos = venv.step(actions)
-        # infos is a list-like of dicts
-        step_infos = list(infos) if isinstance(infos, (list, tuple)) else [infos]
-        for i, a in enumerate(actions):
-            r = float(rewards[i]); policy.update(a, r, list(obs[i]) if not isinstance(obs[i], list) else obs[i])
-            all_rewards.append(r); all_infos.append(step_infos[i] if i < len(step_infos) else {})
-            # analytics hook
-            try:
-                if analytics_cb is not None and i < len(step_infos) and isinstance(step_infos[i], dict):
-                    hook = analytics_cb(i, step_infos[i], float(r)) or {}
-                    sig = hook.get('signature_name') if isinstance(hook.get('signature_name'), str) else None
-                    doc_id = hook.get('doc_id') if isinstance(hook.get('doc_id'), str) else None
-                    env = hook.get('environment') if isinstance(hook.get('environment'), str) else 'development'
-                    action_type = hook.get('action_type') if isinstance(hook.get('action_type'), str) else 'VERIFICATION'
-                    execution_time = float(hook.get('execution_time') or 0.0)
-                    query = hook.get('query') if isinstance(hook.get('query'), str) else None
-                    scores = step_infos[i].get('verifier_scores') if isinstance(step_infos[i].get('verifier_scores'), dict) else None
-                    if sig and scores:
-                        record_verifier_scores(sig, scores, float(r), environment=env, doc_id=doc_id, action_type=action_type, execution_time=execution_time, query=query)
-            except Exception:
-                logger.exception('analytics_cb failed (puffer)')
-        obs, infos = venv.reset()
-    try: venv.close()
-    except Exception: pass
-    return EpisodeStats(rewards=all_rewards, infos=all_infos)
+    try:
+        # Use a top-level creator to avoid pickling closures when using multiprocessing
+        def _make_wrapped_env(*_args, **_kwargs):
+            return emulation.GymnasiumPufferEnv(make_env())
+        venv = pvector.make(_make_wrapped_env, num_envs=max(1, cfg.n_envs), backend=backend)
+        obs, infos = venv.reset(); policy = make_bandit(cfg.policy, n_actions, **dict(cfg.policy_kwargs))
+        all_rewards: List[float] = []; all_infos: List[dict] = []
+        for _ in range(cfg.steps):
+            actions = [int(policy.select(list(obs[i]) if not isinstance(obs[i], list) else obs[i])) for i in range(len(obs))]
+            obs, rewards, terms, truncs, infos = venv.step(actions)
+            # infos is a list-like of dicts
+            step_infos = list(infos) if isinstance(infos, (list, tuple)) else [infos]
+            for i, a in enumerate(actions):
+                r = float(rewards[i]); policy.update(a, r, list(obs[i]) if not isinstance(obs[i], list) else obs[i])
+                all_rewards.append(r); all_infos.append(step_infos[i] if i < len(step_infos) else {})
+                # analytics hook
+                try:
+                    if analytics_cb is not None and i < len(step_infos) and isinstance(step_infos[i], dict):
+                        hook = analytics_cb(i, step_infos[i], float(r)) or {}
+                        sig = hook.get('signature_name') if isinstance(hook.get('signature_name'), str) else None
+                        doc_id = hook.get('doc_id') if isinstance(hook.get('doc_id'), str) else None
+                        env = hook.get('environment') if isinstance(hook.get('environment'), str) else 'development'
+                        action_type = hook.get('action_type') if isinstance(hook.get('action_type'), str) else 'VERIFICATION'
+                        execution_time = float(hook.get('execution_time') or 0.0)
+                        query = hook.get('query') if isinstance(hook.get('query'), str) else None
+                        scores = step_infos[i].get('verifier_scores') if isinstance(step_infos[i].get('verifier_scores'), dict) else None
+                        if sig and scores:
+                            record_verifier_scores(sig, scores, float(r), environment=env, doc_id=doc_id, action_type=action_type, execution_time=execution_time, query=query)
+                except Exception:
+                    logger.exception('analytics_cb failed (puffer)')
+            obs, infos = venv.reset()
+        try: venv.close()
+        except Exception: pass
+        return EpisodeStats(rewards=all_rewards, infos=all_infos)
+    except Exception:
+        # Fallback to simple trainer when vector backend is unavailable or errors
+        return bandit_trainer(make_env, cfg, analytics_cb=analytics_cb)
 
 
 def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000, n_envs: int = 4, lr: float = 1e-3, seed: Optional[int] = None, verbose: bool = False, log_interval: int = 10, grad_clip: float = 1.0, checkpoint_dir: Optional[str] = None, checkpoint_interval: int = 0, early_stop_patience: int = 0, entropy_coef: float = 0.01, replay_capacity: int = 2048, replay_batch: int = 128) -> EpisodeStats:
@@ -882,7 +903,23 @@ class ToolchainExecutor:
             ok, out, dt = _run(cmd, ws, self.cfg.timeout_sec); issues = _parse_ruff_json(out)
             metrics.update({"lint_ok": bool(ok and issues == 0), "lint_issues": int(issues)}); info.update({"stdout": out[-4000:], "duration_sec": dt})
         elif tool == ToolAction.BUILD:
-            cmd = args.get("cmd") or self.cfg.build_cmd or "python -m compileall -q ."
+            # Prefer a workspace-local Python (venv/.venv) when available
+            def _default_python(ws_path: Path) -> str:
+                candidates = [
+                    ws_path / 'venv' / 'bin' / 'python',
+                    ws_path / '.venv' / 'bin' / 'python',
+                ]
+                for c in candidates:
+                    try:
+                        if c.exists():
+                            return str(c)
+                    except Exception:
+                        continue
+                # Fallback to current interpreter or discovered python3/python
+                return sys.executable or shutil.which('python3') or shutil.which('python') or 'python'
+
+            py = _default_python(ws)
+            cmd = args.get("cmd") or self.cfg.build_cmd or f"{py} -m compileall -q ."
             ok, out, dt = _run(cmd, ws, self.cfg.timeout_sec); metrics.update({"build_ok": bool(ok)}); info.update({"stdout": out[-4000:], "duration_sec": dt})
         elif tool == ToolAction.PATCH:
             # End-to-end patch attempt: propose -> verify -> apply -> test -> revert.
@@ -1176,7 +1213,17 @@ def detect_toolchain(
     build_cmd = build_cmd or None
     if not test_cmd and (ws / "tests").exists(): test_cmd = "pytest -q"
     if not lint_cmd: lint_cmd = "ruff check --output-format json ."
-    if not build_cmd: build_cmd = "python -m compileall -q ."
+    if not build_cmd:
+        # Prefer local venv python if present
+        def _pick_python(ws_path: Path) -> str:
+            for p in [ws_path / 'venv' / 'bin' / 'python', ws_path / '.venv' / 'bin' / 'python']:
+                try:
+                    if p.exists():
+                        return str(p)
+                except Exception:
+                    continue
+            return sys.executable or shutil.which('python3') or shutil.which('python') or 'python'
+        build_cmd = f"{_pick_python(ws)} -m compileall -q ."
     env_shell_timeout = os.getenv('RL_SHELL_TIMEOUT')
     timeout_val = int(timeout_sec or 180)
     if shell_timeout is None:

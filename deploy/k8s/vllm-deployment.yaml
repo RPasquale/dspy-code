@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server
+  labels:
+    app: vllm-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-server
+  template:
+    metadata:
+      labels:
+        app: vllm-server
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--model"
+            - "Qwen/Qwen2.5-7B-Instruct"
+            - "--dtype"
+            - "bfloat16"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--max-num-seqs"
+            - "64"
+            - "--port"
+            - "8000"
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "4"
+              memory: "16Gi"
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+          env:
+            - name: VLLM_WORKER_MULTIPROC_METHOD
+              value: spawn
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-server
+spec:
+  selector:
+    app: vllm-server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+

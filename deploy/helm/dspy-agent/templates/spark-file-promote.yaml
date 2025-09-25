@@ -1,0 +1,40 @@
+{{- if .Values.sparkApps.filePromote.enabled }}
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: file-promote-approvals
+  namespace: {{ .Values.namespace }}
+spec:
+  type: Python
+  mode: cluster
+  image: {{ .Values.image.spark }}
+  imagePullPolicy: IfNotPresent
+  sparkConf:
+    spark.sql.adaptive.enabled: "true"
+  mainApplicationFile: local:///opt/app/streaming/topics/file_promote_approvals.py
+  sparkVersion: 3.5.1
+  driver:
+    cores: {{ .Values.sparkApps.filePromote.driver.cores }}
+    memory: {{ .Values.sparkApps.filePromote.driver.memory | quote }}
+    serviceAccount: {{ .Values.serviceAccount }}
+    env:
+      - name: WAREHOUSE_BASE
+        value: {{ .Values.warehouseBase | quote }}
+  executor:
+    instances: {{ .Values.sparkApps.filePromote.executor.instances }}
+    cores: {{ .Values.sparkApps.filePromote.executor.cores }}
+    memory: {{ .Values.sparkApps.filePromote.executor.memory | quote }}
+  volumes:
+    - name: warehouse
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.warehouse.claim }}
+  driver:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+  executor:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+{{- end }}
+

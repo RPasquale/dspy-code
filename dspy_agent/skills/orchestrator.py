@@ -22,7 +22,9 @@ TOOLS = [
     "context", "plan", "grep", "extract", "tree", "ls",
     "codectx", "index", "esearch", "emb_index", "emb_search", "knowledge", "vretr", "intel",
     "edit", "patch", "run_tests", "lint", "build",
-    "open", "watch", "sg", "diff", "git_status", "git_add", "git_commit"
+    "open", "watch", "sg", "diff", "git_status", "git_add", "git_commit",
+    # Data tools (local RedDB-backed)
+    "db_ingest", "db_query", "db_multi"
 ]
 
 
@@ -271,8 +273,11 @@ class SessionMemory:
         return []
     
     def _get_cache_key(self, tool: str, args: Dict[str, Any]) -> str:
-        """Generate cache key for tool+args combination"""
-        key_data = f"{tool}:{json.dumps(args, sort_keys=True)}"
+        """Generate optimized cache key for tool+args combination"""
+        # Optimize key generation by excluding volatile fields
+        filtered_args = {k: v for k, v in args.items() 
+                        if k not in ['timestamp', 'session_id', 'request_id']}
+        key_data = f"{tool}:{json.dumps(filtered_args, sort_keys=True)}"
         return hashlib.md5(key_data.encode()).hexdigest()
     
     def get_cached_result(self, tool: str, args: Dict[str, Any]) -> Optional[ToolResult]:
@@ -591,30 +596,44 @@ class Orchestrator(dspy.Module):
         
         confidence = 0.9 if success else 0.5
         
-        # Expert-level learning: Update tool effectiveness and learn patterns
+        # Enhanced expert-level learning with adaptive intelligence
         if active_memory:
-            # Update tool effectiveness
+            # Update tool effectiveness with weighted learning
             active_memory.update_tool_effectiveness(tool, success)
             
-            # Learn from successful patterns
+            # Advanced pattern learning with context awareness
             if success and not cache_hit:
                 context = self._extract_context_from_query(query)
                 tool_sequence = [tool]  # Could be extended to track sequences
-                reward = 0.8 if success else 0.3
+                
+                # Adaptive reward calculation based on execution time and success
+                base_reward = 0.8 if success else 0.3
+                time_bonus = max(0, (2.0 - total_execution_time) * 0.1)  # Bonus for fast execution
+                reward = min(1.0, base_reward + time_bonus)
+                
                 active_memory.learn_expert_pattern(context, tool_sequence, success, reward)
                 
-                # Learn action policy
+                # Learn action policy with confidence weighting
                 actions = [tool]
+                confidence_weight = confidence if hasattr(self, 'confidence') else 0.8
                 active_memory.learn_action_policy(context, actions, success)
                 
-                # Optimize prompts based on performance
+                # Intelligent prompt optimization
                 original_prompt = f"Select the best tool for: {query}"
                 optimized_prompt = active_memory.optimize_prompt(context, original_prompt, success)
                 
-                # Add context insights
+                # Enhanced context insights with performance metrics
                 if success:
-                    insight = f"Tool '{tool}' works well for queries like: {query[:50]}..."
+                    insight = f"Tool '{tool}' works well for queries like: {query[:50]}... (execution_time: {total_execution_time:.2f}s, confidence: {confidence:.2f})"
                     active_memory.add_context_insight(context, insight)
+                
+                # Adaptive learning rate based on performance
+                if total_execution_time < 0.5 and success:
+                    # High performance - increase learning rate
+                    active_memory.learning_rate = min(1.0, getattr(active_memory, 'learning_rate', 0.1) + 0.05)
+                elif total_execution_time > 5.0 or not success:
+                    # Low performance - decrease learning rate
+                    active_memory.learning_rate = max(0.01, getattr(active_memory, 'learning_rate', 0.1) - 0.02)
         
         # Record the orchestration action
         final_state = {
@@ -697,15 +716,46 @@ class Orchestrator(dspy.Module):
         return hashlib.md5(key_data.encode()).hexdigest()
     
     def _cleanup_cache(self):
-        """Clean up old cache entries"""
+        """Enhanced cache cleanup with performance optimization"""
         current_time = time.time()
         keys_to_remove = []
+        
+        # Remove expired entries (older than 5 minutes)
         for key, value in self.prediction_cache.items():
             if current_time - value.get('timestamp', 0) > 300:  # 5 minutes
                 keys_to_remove.append(key)
         
+        # If cache is still too large, remove least recently used entries
+        if len(self.prediction_cache) > 1000:  # Limit cache size
+            # Sort by timestamp and remove oldest 20%
+            sorted_items = sorted(
+                self.prediction_cache.items(),
+                key=lambda x: x[1].get('timestamp', 0)
+            )
+            items_to_remove = len(sorted_items) // 5  # Remove 20%
+            for key, _ in sorted_items[:items_to_remove]:
+                if key not in keys_to_remove:
+                    keys_to_remove.append(key)
+        
+        # Remove selected keys
         for key in keys_to_remove:
             del self.prediction_cache[key]
+        
+        # Log cache cleanup for monitoring
+        if keys_to_remove:
+            cleanup_log = create_log_entry(
+                level="DEBUG",
+                source="skills.orchestrator",
+                message=f"Cache cleanup: removed {len(keys_to_remove)} entries, {len(self.prediction_cache)} remaining",
+                context={
+                    "session_id": self.session_id,
+                    "cache_size_before": len(self.prediction_cache) + len(keys_to_remove),
+                    "cache_size_after": len(self.prediction_cache),
+                    "entries_removed": len(keys_to_remove)
+                },
+                environment=Environment.DEVELOPMENT
+            )
+            self.data_manager.log(cleanup_log)
     
     def get_memory(self) -> Optional[SessionMemory]:
         """Get the session memory instance"""

@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  reddb:
+    image: redbco/redb-open:latest
+    container_name: redb-secure
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"  # Bind to localhost only for security
+    environment:
+      - REDB_ADMIN_TOKEN=${REDDB_ADMIN_TOKEN}
+      - REDB_LOG_LEVEL=info
+    volumes:
+      - reddb_data:/data
+    networks:
+      - reddb_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer ${REDDB_ADMIN_TOKEN}", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # Optional: Add a reverse proxy for additional security
+  nginx:
+    image: nginx:alpine
+    container_name: reddb-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:80"  # Alternative secure endpoint
+    volumes:
+      - ./nginx-reddb.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - reddb
+    networks:
+      - reddb_network
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:noexec,nosuid,size=10m
+      - /var/run:noexec,nosuid,size=10m
+
+volumes:
+  reddb_data:
+    driver: local
+
+networks:
+  reddb_network:
+    driver: bridge
+    internal: true  # No external network access

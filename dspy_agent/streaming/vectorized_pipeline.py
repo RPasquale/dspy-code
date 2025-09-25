@@ -12,10 +12,8 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
-try:  # Optional dependency; used when available for richer Kafka metadata
-    from confluent_kafka.admin import AdminClient  # type: ignore
-except Exception:  # pragma: no cover
-    AdminClient = None  # type: ignore
+# Avoid importing confluent-kafka at module import time
+AdminClient = None  # type: ignore
 
 from ..embedding.indexer import load_index, semantic_search, tokenize
 
@@ -395,9 +393,11 @@ class KafkaStreamInspector:
 
         topics: List[KafkaTopicStatus] = []
         reason: Optional[str] = None
-        if AdminClient is not None:
+        # Lazy import AdminClient only when explicitly enabled
+        if os.getenv("DSPY_ENABLE_KAFKA_ADMIN", "0").lower() in {"1", "true", "yes"}:
             try:
-                admin = AdminClient({'bootstrap.servers': self.bootstrap})
+                from confluent_kafka.admin import AdminClient as _AdminClient  # type: ignore
+                admin = _AdminClient({'bootstrap.servers': self.bootstrap})
                 metadata = admin.list_topics(timeout=self.timeout)
                 for topic_name in self.topics:
                     topic_meta = metadata.topics.get(topic_name)

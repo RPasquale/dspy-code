@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.pvc.warehouse.claim }}
+  namespace: {{ .Values.namespace }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: {{ .Values.pvc.warehouse.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.pvc.warehouse.size | quote }}
+

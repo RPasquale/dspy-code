@@ -170,3 +170,45 @@ def neighbors(graph: Dict[str, Any], file_path: str) -> Dict[str, list[str]]:
         "calls_out": call_out,
         "calls_in": call_in,
     }
+
+
+class KnowledgeAgent:
+    """Minimal knowledge agent for tests.
+
+    Stores simple documents in-memory and supports basic search & summarize.
+    """
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = Path(workspace).resolve()
+        self._docs: List[Dict[str, Any]] = []
+
+    def ingest(self, doc: Dict[str, Any]) -> None:
+        try:
+            self._docs.append(dict(doc))
+        except Exception:
+            pass
+
+    def search(self, query: str) -> List[Dict[str, Any]]:
+        q = (query or "").lower()
+        out: List[Dict[str, Any]] = []
+        for d in self._docs:
+            content = str(d.get("content", "")).lower()
+            title = str(d.get("title", "")).lower()
+            if q and (q in content or q in title):
+                out.append(d)
+        # Fallback to code graph facts if no docs match
+        if not out:
+            try:
+                graph = build_code_graph(self.workspace)
+                for f in graph.get("files", [])[:3]:
+                    out.append({"title": f.get("path"), "content": " ".join((f.get("classes") or []) + (f.get("functions") or []))})
+            except Exception:
+                pass
+        return out
+
+    def summarize(self, query: str) -> str:
+        hits = self.search(query)
+        if not hits:
+            return ""
+        titles = [str(h.get("title", "doc")) for h in hits[:5]]
+        return f"Found {len(hits)} document(s): " + ", ".join(titles)

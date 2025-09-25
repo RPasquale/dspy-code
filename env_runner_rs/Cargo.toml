@@ -1,0 +1,15 @@
+[package]
+name = "env_runner_rs"
+version = "0.1.0"
+edition = "2021"
+
+# No external dependencies to keep offline-friendly
+
+[lib]
+name = "env_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "env-runner"
+path = "src/main.rs"
+

@@ -1,0 +1,55 @@
+{{- if .Values.ingest.docs.enabled }}
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: file-ingest-docs
+  namespace: {{ .Values.namespace }}
+spec:
+  type: Python
+  mode: cluster
+  image: {{ .Values.image.spark }}
+  imagePullPolicy: IfNotPresent
+  sparkConf:
+    spark.sql.adaptive.enabled: "true"
+    spark.dynamicAllocation.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+    spark.dynamicAllocation.shuffleTracking.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+    spark.dynamicAllocation.minExecutors: "{{ .Values.dynamicAllocation.minExecutors }}"
+    spark.dynamicAllocation.maxExecutors: "{{ .Values.dynamicAllocation.maxExecutors }}"
+    spark.dynamicAllocation.initialExecutors: "{{ .Values.dynamicAllocation.initialExecutors }}"
+  mainApplicationFile: local:///opt/app/streaming/topics/file_ingest_docs.py
+  sparkVersion: 3.5.1
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: {{ .Values.serviceAccount }}
+    env:
+      - name: INGEST_DOCS_SRC
+        value: "/landing/docs"
+      - name: WAREHOUSE_BASE
+        value: {{ .Values.warehouseBase | quote }}
+      - name: MAX_FILES_PER_TRIGGER
+        value: "50"
+  executor:
+    instances: 2
+    cores: 2
+    memory: 4g
+  volumes:
+    - name: warehouse
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.warehouse.claim }}
+    - name: landing
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.landing.claim }}
+  driver:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+      - name: landing
+        mountPath: /landing
+  executor:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+      - name: landing
+        mountPath: /landing
+{{- end }}

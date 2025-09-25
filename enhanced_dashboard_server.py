@@ -218,12 +218,21 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             '/api/grpo/level-metrics/stream': self.serve_grpo_level_metrics_stream,
             '/api/policy/summary': self.serve_policy_summary,
             '/api/grpo/dataset-stats': self.serve_grpo_dataset_stats,
+            # Spark + Ingest
+            '/api/spark/apps': self.serve_spark_apps,
+            '/api/spark/app-list': self.serve_spark_apps_list,
+            '/api/spark/app-logs': self.serve_spark_app_logs,
+            '/api/ingest/pending-files': self.serve_ingest_pending_files,
+            '/api/events/tail': self.serve_events_tail,
+            '/api/events/stream': self.serve_events_stream,
             # Dev cycle
             '/api/dev-cycle/status': self.serve_dev_cycle_status,
             '/api/dev-cycle/stream': self.serve_dev_cycle_stream,
             '/api/stack/smoke': self.handle_stack_smoke_status,
             '/api/embedding/index/status': self.serve_embedding_index_status,
             '/api/dev-cycle/logs': self.serve_dev_cycle_logs,
+            # Events export (NDJSON)
+            '/api/events/export': self.handle_events_export,
             # System resources
             '/api/system/resources': self.serve_system_resources,
             '/api/system/resources/stream': self.serve_system_resources_stream,
@@ -234,6 +243,10 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             '/api/experiments/stream': self.serve_experiment_stream,
             '/api/datasets/preview': self.serve_dataset_preview,
             '/api/experiments/sweep': self.handle_experiment_sweep,
+            # Minimal DB health (mock/native) for frontend
+            '/api/db/health': self.serve_db_health,
+            # Models info
+            '/api/models': self.serve_models_info,
         }
 
         handler = api_routes.get(path)
@@ -351,10 +364,33 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_stack_smoke_post()
         elif path == '/api/embedding/index/build':
             self.handle_embedding_index_build()
+        # Frontend-friendly ingest/query endpoints
+        elif path == '/api/db/ingest':
+            self.handle_db_ingest()
+        elif path == '/api/db/query':
+            self.handle_db_query()
         elif path == '/api/debug/trace':
             self.handle_debug_trace_post()
         elif path == '/api/system/workspace':
             self.handle_system_workspace_post()
+        elif path == '/api/train/tool':
+            self.handle_train_tool()
+        elif path == '/api/train/code-log':
+            self.handle_train_code_log()
+        elif path == '/api/eval/code-log':
+            self.handle_eval_code_log()
+        elif path == '/api/eval/code-log/score':
+            self.handle_eval_code_log_score()
+        elif path == '/api/models':
+            self.serve_models_info()
+        elif path == '/api/train/code-log':
+            self.handle_train_code_log()
+        elif path == '/api/train/status':
+            self.serve_train_status()
+        elif path == '/api/events':
+            self.handle_events_post()
+        elif path == '/api/events/export':
+            self.handle_events_export()
         elif path == '/api/dev-cycle/start':
             if not self._is_admin():
                 self.send_json_response({'error': 'admin only'}, 403)
@@ -2123,6 +2159,11 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                 pass
             if changed:
                 _sc(cfg)
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('capacity_approve', result='ok', reward=1.0 if changed else 0.5, kind=kind, params=params, config_applied=changed)
+            except Exception:
+                pass
             self.send_json_response({'ok': True, 'config_applied': changed, 'config': cfg.to_dict()})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
@@ -2137,6 +2178,11 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             if not kind:
                 self.send_json_response({'error': 'missing kind'}, 400); return
             _rec(kind, params, approved=False)
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('capacity_deny', result='ok', reward=-0.1, kind=kind, params=params)
+            except Exception:
+                pass
             self.send_json_response({'ok': True})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
@@ -2162,6 +2208,11 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             code = logger.run_stream(args, phase='apply')
             ok = (code == 0)
             logger.close()
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('capacity_apply', result='ok' if ok else 'failed', reward=1.0 if ok else -1.0, bundle=str(bundle_path))
+            except Exception:
+                pass
             self.send_json_response({'ok': ok, 'bundle': str(bundle_path)})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
@@ -2212,6 +2263,11 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                     code = logger.run_stream(args, phase='apply')
                     ok = (code == 0)
                     logger.close()
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('capacity_apply_approved', result='ok' if ok else 'failed', reward=1.0 if ok else -1.0, plan=plan, estimate=estimate, bundle=str(bundle_path))
+            except Exception:
+                pass
             self.send_json_response({'ok': ok, 'plan': plan, 'estimate': estimate, 'bundle': str(bundle_path)})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
@@ -2759,6 +2815,769 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
+
+    def serve_spark_apps(self):
+        """Return SparkApplications and ScheduledSparkApplications via kubectl if present; fallback to stub."""
+        try:
+            import shutil, subprocess
+            ns = self._query_params().get('namespace', ['default'])[0]
+            if shutil.which('kubectl') is None:
+                self.send_json_response({'apps': [], 'scheduled': [], 'namespace': ns, 'timestamp': time.time()}); return
+            out1 = subprocess.run(['kubectl','get','sparkapplications','-n',ns,'-o','json'], capture_output=True, text=True)
+            out2 = subprocess.run(['kubectl','get','scheduledsparkapplications','-n',ns,'-o','json'], capture_output=True, text=True)
+            apps = json.loads(out1.stdout or '{}') if out1.returncode == 0 else {}
+            sched = json.loads(out2.stdout or '{}') if out2.returncode == 0 else {}
+            self.send_json_response({'namespace': ns, 'sparkapplications': apps, 'scheduled': sched, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_spark_apps_list(self):
+        """Return a compact list of Spark apps with state and times for easy UI rendering."""
+        try:
+            import shutil, subprocess
+            ns = self._query_params().get('namespace', ['default'])[0]
+            if shutil.which('kubectl') is None:
+                self.send_json_response({'items': [], 'namespace': ns, 'timestamp': time.time()}); return
+            out1 = subprocess.run(['kubectl','get','sparkapplications','-n',ns,'-o','json'], capture_output=True, text=True)
+            out2 = subprocess.run(['kubectl','get','scheduledsparkapplications','-n',ns,'-o','json'], capture_output=True, text=True)
+            items = []
+            if out1.returncode == 0:
+                data = json.loads(out1.stdout or '{}')
+                for it in (data.get('items') or []):
+                    meta = it.get('metadata') or {}
+                    status = it.get('status') or {}
+                    appst = (status.get('applicationState') or {}).get('state') or status.get('state') or 'UNKNOWN'
+                    sub = status.get('submissionTime') or meta.get('creationTimestamp')
+                    items.append({'kind': 'SparkApplication', 'name': meta.get('name'), 'namespace': meta.get('namespace'), 'state': appst, 'submissionTime': sub})
+            sched = []
+            if out2.returncode == 0:
+                data = json.loads(out2.stdout or '{}')
+                for it in (data.get('items') or []):
+                    meta = it.get('metadata') or {}
+                    spec = it.get('spec') or {}
+                    stat = it.get('status') or {}
+                    sched.append({'kind': 'ScheduledSparkApplication', 'name': meta.get('name'), 'namespace': meta.get('namespace'), 'schedule': spec.get('schedule'), 'lastRun': (stat.get('lastRun') or {}).get('startTime')})
+            self.send_json_response({'items': items, 'scheduled': sched, 'namespace': ns, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_spark_app_logs(self):
+        """Return recent logs for pods belonging to a SparkApplication (driver/executors)."""
+        try:
+            import shutil, subprocess
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            name = (qs.get('name') or [''])[0].strip()
+            ns = (qs.get('namespace') or ['default'])[0].strip() or 'default'
+            tail = int((qs.get('tail') or ['200'])[0])
+            if not name:
+                self.send_json_response({'error': 'name required'}, 400); return
+            if shutil.which('kubectl') is None:
+                self.send_json_response({'error': 'kubectl not found'}, 500); return
+            # Fetch logs from pods with label spark-app-selector=name
+            # Prefer driver pod logs
+            pods_out = subprocess.run(['kubectl','get','pods','-n',ns,'-l',f'spark-app-selector={name}','-o','json'], capture_output=True, text=True)
+            pods = json.loads(pods_out.stdout or '{}').get('items', []) if pods_out.returncode == 0 else []
+            logs = {}
+            for p in pods:
+                pname = (p.get('metadata') or {}).get('name')
+                if not pname:
+                    continue
+                out = subprocess.run(['kubectl','logs','-n',ns,pname,'--tail',str(max(50, tail))], capture_output=True, text=True)
+                if out.returncode == 0:
+                    logs[pname] = out.stdout[-40000:]
+            self.send_json_response({'name': name, 'namespace': ns, 'logs': logs, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+    def serve_ingest_pending_files(self):
+        base = os.getenv('WAREHOUSE_BASE', str(REPO_ROOT / 'warehouse'))
+        pending_dirs = [
+            os.path.join(base, 'silver', 'files_pending'),
+            os.path.join(base, 'silver', 'json_pending'),
+            os.path.join(base, 'silver', 'parquet_pending'),
+            os.path.join(base, 'silver', 'avro_pending'),
+            os.path.join(base, 'silver', 'docs_pending'),
+        ]
+        rows = []
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+            for pdir in pending_dirs:
+                if not os.path.exists(pdir):
+                    continue
+                try:
+                    tbl = pq.read_table(pdir)
+                    pdf = tbl.to_pydict()
+                    for src, rc, status in zip(pdf.get('source_file', []), pdf.get('rows', []), pdf.get('status', [])):
+                        rows.append({'source_file': src, 'rows': int(rc or 0), 'status': status, 'dir': pdir})
+                except Exception:
+                    continue
+            self.send_json_response({'pending': rows, 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'pending': rows, 'error': str(e), 'timestamp': time.time()})
+
+    def handle_train_tool(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            raw = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+            payload = json.loads(raw) if raw else {}
+            base = Path(os.getenv('WAREHOUSE_BASE', str(REPO_ROOT / 'warehouse')))
+            ctrl_dir = base / 'controls'
+            ctrl_dir.mkdir(parents=True, exist_ok=True)
+            with (ctrl_dir / 'train_tool.json').open('w') as fh:
+                json.dump(payload or {}, fh)
+            # Emit training trigger event (backend-side)
+            try:
+                from dspy_agent.streaming.events import log_training_trigger
+                trainer = str((payload.get('trainer') or 'tiny')).lower()
+                args = payload.get('args') or {}
+                log_training_trigger(trainer, args)
+            except Exception:
+                pass
+            self.send_json_response({'ok': True, 'payload': payload})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_train_code_log(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            raw = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+            payload = json.loads(raw) if raw else {}
+            base = Path(os.getenv('WAREHOUSE_BASE', str(REPO_ROOT / 'warehouse')))
+            ctrl_dir = base / 'controls'
+            ctrl_dir.mkdir(parents=True, exist_ok=True)
+            with (ctrl_dir / 'train_code_log.json').open('w') as fh:
+                json.dump(payload or {}, fh)
+            try:
+                from dspy_agent.streaming.events import publish_event
+                publish_event('training.trigger', {'trainer': 'code_log', 'args': payload.get('args') or {}})
+            except Exception:
+                pass
+            self.send_json_response({'ok': True, 'payload': payload})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_eval_code_log(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            raw = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+            payload = json.loads(raw) if raw else {}
+            code = payload.get('code') or ''
+            max_new = int(payload.get('max_new_tokens') or 128)
+            model_path = payload.get('model') or os.getenv('CODELOG_EVAL_MODEL') or '/warehouse/models/code_log_hf'
+            if not code or len(code.strip()) < 4:
+                self.send_json_response({'error': 'code required'}, 400); return
+            text = self._generate_code_log(code, model_path, max_new)
+            self.send_json_response({'text': text})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    _CODELOG_MODEL_CACHE = {'path': None, 'tok': None, 'model': None}
+
+    def _generate_code_log(self, code: str, model_path: str, max_new: int) -> str:
+        try:
+            from transformers import AutoTokenizer, AutoModelForSeq2SeqLM  # type: ignore
+            import torch  # type: ignore
+        except Exception as e:
+            raise RuntimeError('transformers not available')
+        cache = self._CODELOG_MODEL_CACHE
+        if cache['path'] != model_path:
+            tok = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+            model.eval()
+            cache['path'] = model_path; cache['tok'] = tok; cache['model'] = model
+        tok = cache['tok']; model = cache['model']
+        enc = tok(code, truncation=True, max_length=int(os.getenv('CODELOG_MAX_CODE', '1024')), return_tensors='pt')
+        with torch.no_grad():
+            out_ids = model.generate(**enc, max_new_tokens=max_new, do_sample=False)
+        return tok.decode(out_ids[0], skip_special_tokens=True)
+
+    def serve_models_info(self):
+        try:
+            base = Path(os.getenv('WAREHOUSE_BASE', str(REPO_ROOT / 'warehouse')))
+            # Code→Log model dir
+            cl_dir = Path(os.getenv('CODELOG_EVAL_MODEL', str(base / 'models' / 'code_log_hf')))
+            cl_size = 0; cl_mtime = None
+            if cl_dir.exists():
+                for root, dirs, files in os.walk(cl_dir):
+                    for f in files:
+                        p = Path(root) / f
+                        try:
+                            cl_size += p.stat().st_size
+                            mt = p.stat().st_mtime
+                            cl_mtime = max(cl_mtime or mt, mt)
+                        except Exception:
+                            pass
+            # GRPO model info (best-effort): show manifest mtime
+            grpo_manifest = base / 'datasets' / 'grpo_tool_batches' / 'manifest.json'
+            gm_mtime = grpo_manifest.stat().st_mtime if grpo_manifest.exists() else None
+            # Look for possible GRPO model dir and checkpoints
+            grpo_model = None
+            grpo_ckpts = []
+            # Candidate roots
+            roots = [base / 'models', REPO_ROOT / '.grpo']
+            for r in roots:
+                try:
+                    if not r.exists():
+                        continue
+                    for d in r.iterdir():
+                        if d.is_dir() and any(k in d.name.lower() for k in ('grpo','tool','policy')):
+                            grpo_model = str(d)
+                            ck = d / 'checkpoints'
+                            if ck.exists() and ck.is_dir():
+                                files = []
+                                for root2, _, fs in os.walk(ck):
+                                    for f in fs:
+                                        p = Path(root2) / f
+                                        try:
+                                            files.append((p.stat().st_mtime, str(p)))
+                                        except Exception:
+                                            continue
+                                files.sort(reverse=True)
+                                grpo_ckpts = [f for _, f in files[:5]]
+                            break
+                    if grpo_model:
+                        break
+                except Exception:
+                    continue
+            self.send_json_response({
+                'code_log': {
+                    'model_dir': str(cl_dir),
+                    'size_bytes': int(cl_size),
+                    'updated_at': cl_mtime
+                },
+                'grpo': {
+                    'manifest': str(grpo_manifest),
+                    'manifest_mtime': gm_mtime,
+                    'model_dir': grpo_model,
+                    'checkpoints': grpo_ckpts
+                },
+                'timestamp': time.time()
+            })
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_eval_code_log_score(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            raw = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+            payload = json.loads(raw) if raw else {}
+            code = payload.get('code') or ''
+            topic = (payload.get('topic') or 'spark.log').strip()
+            limit = int(payload.get('limit') or 200)
+            since = float(payload.get('since') or 0) or None
+            until = float(payload.get('until') or 0) or None
+            if not code:
+                self.send_json_response({'error': 'code required'}, 400); return
+            gen = self._generate_code_log(code, os.getenv('CODELOG_EVAL_MODEL') or '/warehouse/models/code_log_hf', int(payload.get('max_new_tokens') or 128))
+            # Collect recent logs: either from spark app pods or from event topic
+            items = []
+            spark_app = (payload.get('spark_app') or '').strip()
+            namespace = (payload.get('namespace') or 'default').strip() or 'default'
+            if spark_app:
+                try:
+                    import shutil, subprocess
+                    if shutil.which('kubectl') is not None:
+                        pods_out = subprocess.run(['kubectl','get','pods','-n',namespace,'-l',f'spark-app-selector={spark_app}','-o','json'], capture_output=True, text=True)
+                        pods = json.loads(pods_out.stdout or '{}').get('items', []) if pods_out.returncode == 0 else []
+                        for p in pods:
+                            pname = (p.get('metadata') or {}).get('name')
+                            if not pname:
+                                continue
+                            out = subprocess.run(['kubectl','logs','-n',namespace,pname,'--tail',str(max(50, limit))], capture_output=True, text=True)
+                            if out.returncode == 0:
+                                lines = (out.stdout or '').splitlines()[-limit:]
+                                for ln in lines:
+                                    if ln.strip():
+                                        items.append({'event': {'line': ln}})
+                except Exception:
+                    pass
+            try:
+                if not items:
+                    from dspy_agent.streaming import memory_tail
+                    items = memory_tail(topic, limit)
+            except Exception:
+                items = []
+            # Extract text and filter by time window if provided
+            logs = []
+            for it in items:
+                try:
+                    ts = it.get('ts') or it.get('timestamp')
+                    if since and ts and ts < since:
+                        continue
+                    if until and ts and ts > until:
+                        continue
+                    ev = it.get('event') or {}
+                    txt = None
+                    for k in ('line','message','text','stdout','status','action','name','event'):
+                        v = ev.get(k)
+                        if isinstance(v, str) and v.strip():
+                            txt = v; break
+                    if txt:
+                        logs.append({'ts': ts, 'text': txt, 'raw': it})
+                except Exception:
+                    continue
+            # Score: simple BLEU-1 and ROUGE-L (approx) without external deps
+            def tokens(s: str):
+                return [t for t in s.strip().split() if t]
+            import math
+            def bleu1(ref: str, hyp: str) -> float:
+                r = tokens(ref); h = tokens(hyp)
+                if not h: return 0.0
+                ref_counts = {}
+                for t in r: ref_counts[t] = ref_counts.get(t, 0)+1
+                match = 0
+                used = {}
+                for t in h:
+                    c = ref_counts.get(t, 0)
+                    u = used.get(t, 0)
+                    if u < c:
+                        match += 1; used[t] = u+1
+                prec = match / len(h)
+                bp = math.exp(1 - len(r)/len(h)) if len(h) < len(r) and len(h) > 0 else 1.0
+                return bp * prec
+            def lcs(a: list, b: list) -> int:
+                dp = [[0]*(len(b)+1) for _ in range(len(a)+1)]
+                for i in range(1, len(a)+1):
+                    for j in range(1, len(b)+1):
+                        if a[i-1] == b[j-1]: dp[i][j] = dp[i-1][j-1] + 1
+                        else: dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+                return dp[-1][-1]
+            def rouge_l(ref: str, hyp: str) -> float:
+                r = tokens(ref); h = tokens(hyp)
+                if not r or not h: return 0.0
+                L = lcs(r, h)
+                prec = L / len(h)
+                rec = L / len(r)
+                if prec+rec == 0: return 0.0
+                return (2*prec*rec) / (prec+rec)
+            best = None
+            for log in logs:
+                s1 = bleu1(log['text'], gen)
+                s2 = rouge_l(log['text'], gen)
+                sc = (s1 + s2) / 2.0
+                if not best or sc > best['score']:
+                    best = {'score': sc, 'bleu1': s1, 'rougeL': s2, 'log': log}
+            self.send_json_response({'generated': gen, 'best': best, 'count': len(logs)})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_train_code_log(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            raw = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+            payload = json.loads(raw) if raw else {}
+            base = Path(os.getenv('WAREHOUSE_BASE', str(REPO_ROOT / 'warehouse')))
+            ctrl_dir = base / 'controls'
+            ctrl_dir.mkdir(parents=True, exist_ok=True)
+            with (ctrl_dir / 'train_code_log.json').open('w') as fh:
+                json.dump(payload or {}, fh)
+            # Emit training trigger event
+            try:
+                from dspy_agent.streaming.events import publish_event
+                publish_event('training.trigger', {'trainer': 'code_log', 'args': payload.get('args') or {}})
+            except Exception:
+                pass
+            self.send_json_response({'ok': True, 'payload': payload})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_events_post(self):
+        """Accept a frontend event and publish to the unified event bus.
+
+        Body JSON: {"topic": "ui.action", "event": {...}, "meta": {...}}
+        """
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            raw = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+            data = json.loads(raw) if raw else {}
+            topic = (data.get('topic') or '').strip()
+            event = data.get('event') or {}
+            meta = data.get('meta') or {}
+            if not topic or not isinstance(event, dict):
+                self.send_json_response({'error': 'missing topic or event'}, 400)
+                return
+            try:
+                from dspy_agent.streaming.events import publish_event, ALLOWED_TOPICS
+                if topic not in ALLOWED_TOPICS:
+                    # Restrict to known topics; avoid arbitrary publishing
+                    self.send_json_response({'error': 'topic not allowed'}, 400)
+                    return
+                # Stamp as frontend-originated
+                event = {**event, 'origin': 'frontend', 'ip': self.client_address[0] if self.client_address else ''}
+                if meta:
+                    event['meta'] = meta
+                publish_event(topic, event)
+                self.send_json_response({'ok': True})
+            except Exception as e:
+                self.send_json_response({'error': str(e)}, 500)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_train_status(self):
+        try:
+            base = Path(os.getenv('WAREHOUSE_BASE', str(REPO_ROOT / 'warehouse')))
+            manifest = base / 'datasets' / 'grpo_tool_batches' / 'manifest.json'
+            shards = 0; rows = 0; mtime = None
+            if manifest.exists():
+                try:
+                    data = json.loads(manifest.read_text())
+                    shards = len(data or [])
+                    rows = sum(int(x.get('rows', 0)) for x in (data or []))
+                    mtime = manifest.stat().st_mtime
+                except Exception:
+                    pass
+            cfg = {
+                'train_interval_sec': int(os.getenv('TRAIN_INTERVAL_SEC', '86400')),
+                'min_fresh_sec': int(os.getenv('TRAIN_MIN_FRESH_SEC', '600')),
+                'min_shards': int(os.getenv('TRAIN_MIN_SHARDS', '1')),
+                'min_rows': int(os.getenv('TRAIN_MIN_ROWS', '100')),
+            }
+            ready = (shards >= cfg['min_shards'] and rows >= cfg['min_rows'])
+            now = time.time()
+            eta_fresh = None
+            if mtime is not None:
+                t = mtime + cfg['min_fresh_sec']
+                if t > now:
+                    eta_fresh = t
+            self.send_json_response({'manifest': str(manifest), 'shards': shards, 'rows': rows, 'mtime': mtime, 'cfg': cfg, 'ready': ready, 'eta_fresh': eta_fresh, 'now': now})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_events_export(self):
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            topic_single = (qs.get('topic', [''])[0] or '').strip()
+            topics_csv = (qs.get('topics', [''])[0] or '').strip()
+            topics = []
+            if topics_csv:
+                topics = [t.strip() for t in topics_csv.split(',') if t.strip()]
+            elif topic_single:
+                topics = [topic_single]
+            limit = int(qs.get('limit', ['200'])[0])
+            q = (qs.get('q', [''])[0] or '').strip()
+            keys = qs.get('key', [])
+            vals = qs.get('value', [])
+            download = (qs.get('download', ['0'])[0] or '').lower() in ('1','true','yes','y')
+            if not topics:
+                self.send_json_response({'error': 'missing topic(s)'}, 400); return
+            items = []
+            used_memory = False
+            try:
+                from dspy_agent.streaming import memory_tail
+                for t in topics:
+                    arr = memory_tail(t, limit)
+                    for rec in self._filter_events(arr, q=q, keys=keys, vals=vals):
+                        items.append({'topic': t, 'record': rec})
+                used_memory = True
+            except Exception:
+                used_memory = False
+            # Fallback to file logs if memory ring is empty or memory access failed
+            if not items:
+                log_dir = Path(os.getenv('EVENTBUS_LOG_DIR', str(REPO_ROOT / 'logs')))
+                import json as _json
+                for t in topics:
+                    p = log_dir / f"{t.replace('.', '_')}.jsonl"
+                    if not p.exists():
+                        continue
+                    lines = p.read_text().splitlines()
+                    tail = lines[-max(1, min(limit, 2000)):]  # cap
+                    recs = []
+                    for ln in tail:
+                        try:
+                            recs.append(_json.loads(ln))
+                        except Exception:
+                            recs.append({'raw': ln})
+                    for rec in self._filter_events(recs, q=q, keys=keys, vals=vals):
+                        items.append({'topic': t, 'record': rec})
+            # If still empty, best-effort: scan any topic file for last record
+            if not items:
+                try:
+                    log_dir = Path(os.getenv('EVENTBUS_LOG_DIR', str(REPO_ROOT / 'logs')))
+                    for p in sorted(log_dir.glob('*.jsonl')):
+                        try:
+                            lines = p.read_text().splitlines()
+                            if not lines:
+                                continue
+                            import json as _json
+                            rec = _json.loads(lines[-1])
+                            tname = p.stem.replace('_', '.')
+                            items.append({'topic': tname, 'record': rec})
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            # Build NDJSON
+            data = '\n'.join(json.dumps(it, default=str) for it in items)
+            if not data.strip():
+                # Ensure at least one well-formed line for client parsers
+                data = json.dumps({'topic': (topics[0] if topics else 'events.other'), 'record': {'event': {'name': 'noop'}}})
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/x-ndjson')
+            if download:
+                safe = (topics_csv or topic_single or 'events').replace(',', '_').replace('.', '_')
+                self.send_header('Content-Disposition', f'attachment; filename="events_{safe}.jsonl"')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write((data + '\n').encode('utf-8'))
+        except Exception as e:
+            try:
+                self.send_json_response({'error': str(e)}, 500)
+            except Exception:
+                pass
+
+    def serve_events_tail(self):
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            topic = (qs.get('topic', [''])[0] or '').strip()
+            limit = int(qs.get('limit', ['50'])[0])
+            q = (qs.get('q', [''])[0] or '').strip()
+            keys = qs.get('key', [])
+            vals = qs.get('value', [])
+            since = float(qs.get('since', ['0'])[0]) if qs.get('since') else None
+            until = float(qs.get('until', ['0'])[0]) if qs.get('until') else None
+            fields = qs.get('field', [])
+            if not topic:
+                self.send_json_response({'error': 'missing topic'}, 400); return
+            # Try in-memory tail first
+            items = []
+            try:
+                from dspy_agent.streaming import memory_tail
+                items = memory_tail(topic, limit)
+            except Exception:
+                items = []
+            if not items:
+                log_dir = Path(os.getenv('EVENTBUS_LOG_DIR', str(REPO_ROOT / 'logs')))
+                log_path = log_dir / f"{topic.replace('.', '_')}.jsonl"
+                if log_path.exists():
+                    try:
+                        lines = log_path.read_text().splitlines()
+                        tail = lines[-max(1, min(limit, 1000)):]  # cap at 1000 lines
+                        import json as _json
+                        for ln in tail:
+                            try:
+                                items.append(_json.loads(ln))
+                            except Exception:
+                                items.append({'raw': ln})
+                    except Exception:
+                        pass
+            # Apply filters
+            items = self._filter_events(items, q=q, keys=keys, vals=vals, since=since, until=until)
+            if fields:
+                items = [self._project_fields(it, fields) for it in items]
+            self.send_json_response({'topic': topic, 'limit': limit, 'items': items, 'count': len(items), 'timestamp': time.time()})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def serve_events_stream(self):
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            # Support single 'topic' or multi 'topics'
+            topic_single = (qs.get('topic', [''])[0] or '').strip()
+            topics_csv = (qs.get('topics', [''])[0] or '').strip()
+            topics = []
+            if topics_csv:
+                topics = [t.strip() for t in topics_csv.split(',') if t.strip()]
+            elif topic_single:
+                topics = [topic_single]
+            single_mode = bool(topic_single and not topics_csv)
+            limit = int(qs.get('limit', ['100'])[0])
+            follow = (qs.get('follow', ['0'])[0] or '').lower() in ('1','true','yes','y')
+            q = (qs.get('q', [''])[0] or '').strip()
+            keys = qs.get('key', [])
+            vals = qs.get('value', [])
+            since = float(qs.get('since', ['0'])[0]) if qs.get('since') else None
+            until = float(qs.get('until', ['0'])[0]) if qs.get('until') else None
+            if not topics:
+                self.send_error(400)
+                return
+            # Prefer in-memory ring; fallback to file
+            use_memory = True
+            try:
+                from dspy_agent.streaming import memory_tail, memory_delta, memory_last_seq
+            except Exception:
+                use_memory = False
+            if not use_memory:
+                log_dir = Path(os.getenv('EVENTBUS_LOG_DIR', str(REPO_ROOT / 'logs')))
+                paths = {t: (log_dir / f"{t.replace('.', '_')}.jsonl") for t in topics}
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+            last_sizes = {}
+            last_seq = {}
+            # initial tail per topic (unless follow=true)
+            if not follow:
+                try:
+                    if single_mode:
+                        t = topics[0]
+                        if use_memory:
+                            items = memory_tail(t, limit)
+                            payload = {'topic': t, 'limit': limit, 'items': self._filter_events(items, q=q, keys=keys, vals=vals, since=since, until=until), 'timestamp': time.time()}
+                            last_seq[t] = memory_last_seq(t)
+                        else:
+                            p = paths[t]
+                            items = []
+                            if p.exists():
+                                lines = p.read_text().splitlines()
+                                items = [self._safe_json(l) for l in lines[-max(1, min(limit, 2000)):]]
+                                last_sizes[t] = p.stat().st_size
+                            else:
+                                last_sizes[t] = 0
+                            payload = {'topic': t, 'limit': limit, 'items': self._filter_events(items, q=q, keys=keys, vals=vals), 'timestamp': time.time()}
+                        self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                    else:
+                        bundle = {'topics': {}, 'limit': limit, 'timestamp': time.time()}
+                        for t in topics:
+                            if use_memory:
+                                items = memory_tail(t, limit)
+                                bundle['topics'][t] = {'items': self._filter_events(items, q=q, keys=keys, vals=vals, since=since, until=until)}
+                                last_seq[t] = memory_last_seq(t)
+                            else:
+                                p = paths[t]
+                                if p.exists():
+                                    lines = p.read_text().splitlines()
+                                    tail = lines[-max(1, min(limit, 2000)):]  # cap initial burst
+                                    bundle['topics'][t] = {'items': self._filter_events([self._safe_json(l) for l in tail], q=q, keys=keys, vals=vals, since=since, until=until)}
+                                    last_sizes[t] = p.stat().st_size
+                                else:
+                                    last_sizes[t] = 0
+                        self.wfile.write(f"data: {json.dumps(bundle)}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                except Exception:
+                    pass
+            else:
+                if use_memory:
+                    for t in topics:
+                        last_seq[t] = memory_last_seq(t)
+                else:
+                    for t, p in paths.items():
+                        try:
+                            last_sizes[t] = p.stat().st_size if p.exists() else 0
+                        except Exception:
+                            last_sizes[t] = 0
+            for _ in range(2400):
+                try:
+                    deltas = {}
+                    if use_memory:
+                        for t in topics:
+                            arr, last = memory_delta(t, int(last_seq.get(t, 0)), max_items=max(200, limit))
+                            if arr:
+                                deltas[t] = self._filter_events(arr, q=q, keys=keys, vals=vals, since=since, until=until)
+                                last_seq[t] = last
+                        else:
+                            for t, p in paths.items():
+                                if p.exists():
+                                    cur = p.stat().st_size
+                                    last = last_sizes.get(t, 0)
+                                    if cur > last:
+                                        with p.open('r') as fh:
+                                            fh.seek(last)
+                                            delta_lines = fh.read().splitlines()
+                                        deltas[t] = self._filter_events([self._safe_json(l) for l in delta_lines if l.strip()], q=q, keys=keys, vals=vals, since=since, until=until)
+                                        last_sizes[t] = cur
+                    if deltas:
+                        if single_mode:
+                            # Back-compat single topic delta
+                            t = topics[0]
+                            payload = {'topic': t, 'limit': limit, 'delta': deltas.get(t) or [], 'timestamp': time.time()}
+                            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                        else:
+                            payload = {'delta': deltas, 'timestamp': time.time()}
+                            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                time.sleep(2)
+        except Exception:
+            pass
+
+    def _filter_events(self, items: list, q: str = '', keys: list[str] | None = None, vals: list[str] | None = None, *, since: float | None = None, until: float | None = None) -> list:
+        try:
+            keys = keys or []
+            vals = vals or []
+            r = None
+            if q:
+                import re
+                try:
+                    r = re.compile(q)
+                except Exception:
+                    r = None
+            def get_path(obj: dict, path: str):
+                cur = obj
+                for part in path.split('.'):  # simple dot path
+                    if isinstance(cur, dict) and part in cur:
+                        cur = cur[part]
+                    else:
+                        return None
+                return cur
+            out = []
+            for it in items:
+                # Time window filter (uses ts or timestamp at top-level)
+                try:
+                    tsv = None
+                    for tk in ('ts','timestamp'):
+                        v = it.get(tk)
+                        if isinstance(v, (int, float)):
+                            tsv = float(v); break
+                    if since is not None and tsv is not None and tsv < since:
+                        continue
+                    if until is not None and tsv is not None and tsv > until:
+                        continue
+                except Exception:
+                    pass
+                s = json.dumps(it, default=str)
+                if r and not r.search(s):
+                    continue
+                ok = True
+                for i, k in enumerate(keys):
+                    v = vals[i] if i < len(vals) else ''
+                    val = get_path(it, k)
+                    if v.startswith('~/') and v.endswith('/'):
+                        import re
+                        pat = v[2:-1]
+                        try:
+                            if not re.search(pat, str(val)):
+                                ok = False; break
+                        except Exception:
+                            ok = False; break
+                    else:
+                        if str(val) != v:
+                            ok = False; break
+                if ok:
+                    out.append(it)
+            return out
+        except Exception:
+            return items
+
+
+    def _safe_json(self, line: str):
+        try:
+            return json.loads(line)
+        except Exception:
+            return {'raw': line}
+
+    def _project_fields(self, obj: dict, fields: list[str]) -> dict:
+        try:
+            def get_path(o: dict, path: str):
+                cur = o
+                for part in path.split('.'):
+                    if isinstance(cur, dict) and part in cur:
+                        cur = cur[part]
+                    else:
+                        return None
+                return cur
+            out = {}
+            for f in fields:
+                out[f] = get_path(obj, f)
+            return out
+        except Exception:
+            return obj
 
     def serve_spark_stream(self):
         """SSE stream of Spark metrics from the driver UI REST API, with graceful fallback.
@@ -4172,6 +4991,48 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
+    # ---- DB endpoints for frontend convenience ----
+    def serve_db_health(self):
+        try:
+            from dspy_agent.dbkit import RedDBStorage
+            ns = os.getenv('REDDB_NAMESPACE', 'agent')
+            st = RedDBStorage(url=os.getenv('REDDB_URL'), namespace=ns)
+            self.send_json_response({'ok': True, 'storage': st.health_check(), 'namespace': ns, 'ts': time.time()})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e), 'ts': time.time()}, 200)
+
+    def handle_db_ingest(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            body = json.loads(self.rfile.read(length).decode('utf-8') or '{}') if length else {}
+        except Exception:
+            body = {}
+        try:
+            from dspy_agent.skills.tools.db_tools import db_ingest
+            ns = str(body.get('namespace') or os.getenv('REDDB_NAMESPACE', 'agent'))
+            payload = dict(body.get('payload') or body)
+            for k in ('namespace',): payload.pop(k, None)
+            out = db_ingest(payload, namespace=ns)
+            self.send_json_response({'ok': True, 'result': out})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 200)
+
+    def handle_db_query(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            body = json.loads(self.rfile.read(length).decode('utf-8') or '{}') if length else {}
+        except Exception:
+            body = {}
+        try:
+            from dspy_agent.skills.tools.db_tools import db_query
+            ns = str(body.get('namespace') or os.getenv('REDDB_NAMESPACE', 'agent'))
+            payload = dict(body.get('payload') or body)
+            for k in ('namespace',): payload.pop(k, None)
+            out = db_query(payload, namespace=ns)
+            self.send_json_response({'ok': True, 'result': out})
+        except Exception as e:
+            self.send_json_response({'ok': False, 'error': str(e)}, 200)
+
     def handle_mesh_tail_to_grpo(self):
         try:
             self.send_json_response({'ok': False, 'error': 'not implemented'})
@@ -5244,6 +6105,12 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
             ], capture_output=True, text=True, timeout=60)
             # Update queue
             self._write_pending_cmds(rest)
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                ok = (result.returncode == 0)
+                log_agent_action('guardrails_approve', result='ok' if ok else 'failed', reward=1.0 if ok else -0.5, id=cmd_id, workspace=match.get('workspace'), command=match.get('command'))
+            except Exception:
+                pass
             self.send_json_response({'success': result.returncode == 0, 'output': result.stdout, 'error': result.stderr})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
@@ -5258,6 +6125,49 @@ class EnhancedDashboardHandler(http.server.SimpleHTTPRequestHandler):
                 return
             pending = [item for item in self._read_pending_cmds() if item.get('id') != cmd_id]
             self._write_pending_cmds(pending)
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('guardrails_reject', result='ok', reward=0.0, id=cmd_id)
+            except Exception:
+                pass
+            self.send_json_response({'success': True})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    # Compatibility wrappers: some environments call "approve-action"/"reject-action" endpoints.
+    # Provide lightweight handlers that emit action-named events even if the full implementation
+    # is not available on this build.
+    def handle_guardrails_approve_action(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            aid = data.get('id')
+            if not aid:
+                self.send_json_response({'error': 'missing id'}, 400)
+                return
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('guardrails_approve_action', result='ok', reward=0.5, id=aid)
+            except Exception:
+                pass
+            self.send_json_response({'success': True})
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, 500)
+
+    def handle_guardrails_reject_action(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', '0') or '0')
+            data = json.loads(self.rfile.read(content_length).decode() or '{}') if content_length else {}
+            aid = data.get('id')
+            comment = data.get('comment')
+            if not aid:
+                self.send_json_response({'error': 'missing id'}, 400)
+                return
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('guardrails_reject_action', result='ok', reward=0.0, id=aid, comment=comment)
+            except Exception:
+                pass
             self.send_json_response({'success': True})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
@@ -6130,6 +7040,11 @@ if __name__ == "__main__":
                     it['status'] = 'approved'
                     it['decision'] = 'approve'
             self._write_pending_actions(items)
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('guardrails_approve_action', result='ok', reward=0.5, id=aid)
+            except Exception:
+                pass
             self.send_json_response({'success': True})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
@@ -6151,6 +7066,11 @@ if __name__ == "__main__":
                     if comment:
                         it['comment'] = str(comment)
             self._write_pending_actions(items)
+            try:
+                from dspy_agent.streaming.events import log_agent_action
+                log_agent_action('guardrails_reject_action', result='ok', reward=0.0, id=aid, comment=comment)
+            except Exception:
+                pass
             self.send_json_response({'success': True})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)

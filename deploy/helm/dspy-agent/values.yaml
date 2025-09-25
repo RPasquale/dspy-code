@@ -1,0 +1,161 @@
+image:
+  spark: ghcr.io/OWNER/dspy-spark:latest
+  vllm: vllm/vllm-openai:latest
+  train: ghcr.io/OWNER/dspy-spark-train:latest
+
+namespace: default
+serviceAccount: spark
+
+dynamicAllocation:
+  enabled: true
+  minExecutors: 1
+  maxExecutors: 10
+  initialExecutors: 1
+
+sparkExcelPackage: com.crealytics:spark-excel_2.12:3.5.0_0.20.4
+
+warehouseBase: /warehouse
+checkpointsBase: /checkpoints
+kafkaBootstrap: kafka:9092
+
+vllm:
+  model: Qwen/Qwen2.5-7B-Instruct
+  dtype: bfloat16
+  tensorParallel: 1
+  maxNumSeqs: 64
+  port: 8000
+  resources:
+    limits:
+      gpu: 1
+      cpu: "4"
+      memory: 16Gi
+    requests:
+      cpu: "2"
+      memory: 8Gi
+
+sparkApps:
+  toolJoinGroups:
+    enabled: true
+    driver:
+      cores: 1
+      memory: 2g
+    executor:
+      instances: 3
+      cores: 2
+      memory: 4g
+  toolVectorize:
+    enabled: true
+    schedule: "*/30 * * * *"
+    driver:
+      cores: 1
+      memory: 2g
+    executor:
+      instances: 3
+      cores: 2
+      memory: 4g
+    maxLen: 2048
+    clip: 5.0
+  toolBatchExport:
+    enabled: true
+    schedule: "*/60 * * * *"
+    driver:
+      cores: 1
+      memory: 2g
+    executor:
+      instances: 2
+      cores: 2
+      memory: 4g
+    shardSize: 4096
+  toolMapIngest:
+    enabled: true
+    driver:
+      cores: 1
+      memory: 2g
+    executor:
+      instances: 2
+      cores: 2
+      memory: 4g
+  toolMetrics:
+    enabled: true
+    driver:
+      cores: 1
+      memory: 2g
+    executor:
+      instances: 2
+      cores: 2
+      memory: 4g
+
+  filePromote:
+    enabled: true
+    schedule: "*/10 * * * *"  # every 10 minutes
+    driver:
+      cores: 1
+      memory: 1g
+    executor:
+      instances: 1
+      cores: 1
+      memory: 2g
+
+  metricsSchedule:
+    enabled: true
+    schedule: "*/15 * * * *"  # every 15 minutes
+
+  trainSchedule:
+    enabled: true
+    schedule: "0 3 * * *"  # daily 3am
+
+  trainHF:
+    enabled: false
+    schedule: "0 4 * * *"  # daily 4am
+    model: mistralai/Mistral-7B-Instruct
+    epochs: 1
+    batchSize: 2
+    maxLen: 1024
+    lr: 1e-5
+    bf16: true
+  codeLogTrain:
+    enabled: false
+    schedule: "0 5 * * *"  # daily 5am
+    model: Salesforce/codet5p-220m
+    epochs: 1
+    batch: 4
+    maxCode: 1024
+    maxLog: 256
+    lr: 2e-4
+
+ingest:
+  csv:
+    enabled: true
+  excel:
+    enabled: true
+  json:
+    enabled: true
+  parquet:
+    enabled: true
+  avro:
+    enabled: true
+  docs:
+    enabled: true
+
+cronFallback:
+  enabled: false
+  filePromote:
+    schedule: "*/10 * * * *"
+  toolMetrics:
+    schedule: "*/15 * * * *"
+  trainTool:
+    schedule: "0 3 * * *"
+
+pvc:
+  warehouse:
+    claim: warehouse-pvc
+    storageClass: standard
+    size: 50Gi
+  checkpoints:
+    claim: checkpoints-pvc
+    storageClass: standard
+    size: 10Gi
+  landing:
+    claim: landing-pvc
+    storageClass: standard
+    size: 10Gi

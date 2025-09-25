@@ -201,17 +201,37 @@ def summarize_patch(patch_text: str) -> Dict[str, int]:
 
     Returns a dict with keys: files, added_lines, removed_lines.
     """
-    files = set()
+    # Count files via normalized paths (handles ---/+++ pairs and a/ b/ prefixes)
+    try:
+        file_list = files_from_patch(patch_text)
+    except Exception:
+        file_list = []
     added = 0
     removed = 0
-    for line in patch_text.splitlines():
-        if line.startswith('+++ ') or line.startswith('--- '):
-            # ignore /dev/null markers; capture filename tokens
-            parts = line.split()
-            if len(parts) >= 2 and parts[1] not in {'/dev/null'}:
-                files.add(parts[1])
-        elif line.startswith('+') and not line.startswith('+++'):
+    for line in (patch_text or '').splitlines():
+        if line.startswith('+') and not line.startswith('+++'):
             added += 1
         elif line.startswith('-') and not line.startswith('---'):
             removed += 1
-    return {"files": max(0, len(files) // 2) if files else 0, "added_lines": added, "removed_lines": removed}
+    return {"files": len(file_list), "added_lines": added, "removed_lines": removed}
+
+
+def files_from_patch(patch_text: str) -> list[str]:
+    """Extract a deduplicated list of file paths touched by a unified diff.
+
+    Returns normalized paths with leading a/ or b/ removed when present.
+    """
+    touched: set[str] = set()
+    for line in (patch_text or '').splitlines():
+        if line.startswith('+++ ') or line.startswith('--- '):
+            parts = line.split()
+            if len(parts) >= 2:
+                token = parts[1]
+                if token in {'/dev/null'}:
+                    continue
+                # Normalize git-style prefixes
+                if token.startswith('a/') or token.startswith('b/'):
+                    token = token[2:]
+                touched.add(token)
+    # Files appear twice (--- and +++). Return unique filenames.
+    return sorted(touched)

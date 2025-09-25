@@ -12,6 +12,13 @@ DIST_DIR="$PROJECT_ROOT/dist"
 LOG_DIR="$PROJECT_ROOT/logs"
 DOCKER_DIR="$PROJECT_ROOT/docker/lightweight"
 
+# Advanced deployment configuration
+DEPLOYMENT_ENV="${DEPLOYMENT_ENV:-development}"
+ENABLE_AUTO_SCALING="${ENABLE_AUTO_SCALING:-true}"
+ENABLE_PERFORMANCE_MONITORING="${ENABLE_PERFORMANCE_MONITORING:-true}"
+ENABLE_INTELLIGENT_CACHING="${ENABLE_INTELLIGENT_CACHING:-true}"
+ENABLE_ADAPTIVE_LEARNING="${ENABLE_ADAPTIVE_LEARNING:-true}"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,6 +50,68 @@ handle_error() {
 }
 
 trap 'handle_error $LINENO' ERR
+
+# Advanced deployment functions
+setup_advanced_features() {
+    log_info "Setting up advanced features..."
+    
+    # Create environment configuration
+    cat > "$PROJECT_ROOT/.env.advanced" << EOF
+# Advanced DSPy Agent Configuration
+DEPLOYMENT_ENV=$DEPLOYMENT_ENV
+ENABLE_AUTO_SCALING=$ENABLE_AUTO_SCALING
+ENABLE_PERFORMANCE_MONITORING=$ENABLE_PERFORMANCE_MONITORING
+ENABLE_INTELLIGENT_CACHING=$ENABLE_INTELLIGENT_CACHING
+ENABLE_ADAPTIVE_LEARNING=$ENABLE_ADAPTIVE_LEARNING
+
+# Performance optimization
+DSPY_PERFORMANCE_MODE=optimized
+DSPY_INTELLIGENT_CACHING=true
+DSPY_ADAPTIVE_LEARNING=true
+DSPY_ENABLE_AUTO_SCALING=true
+
+# Monitoring configuration
+AUTO_SCALER_INTERVAL=30
+AUTO_SCALER_CPU_THRESHOLD=80
+AUTO_SCALER_MEMORY_THRESHOLD=85
+PERFORMANCE_MONITOR_INTERVAL=30
+EOF
+    
+    log_success "Advanced features configuration created"
+}
+
+deploy_with_advanced_features() {
+    log_info "Deploying with advanced features enabled..."
+    
+    # Set environment variables for advanced features
+    export DSPY_ENABLE_AUTO_SCALING=$ENABLE_AUTO_SCALING
+    export DSPY_PERFORMANCE_MODE=optimized
+    export DSPY_INTELLIGENT_CACHING=$ENABLE_INTELLIGENT_CACHING
+    export DSPY_ADAPTIVE_LEARNING=$ENABLE_ADAPTIVE_LEARNING
+    
+    # Deploy the stack
+    cd "$DOCKER_DIR"
+    docker compose up -d --build
+    
+    # Start advanced services if enabled
+    if [ "$ENABLE_AUTO_SCALING" = "true" ]; then
+        log_info "Starting auto-scaler service..."
+        docker compose up -d auto-scaler
+    fi
+    
+    if [ "$ENABLE_PERFORMANCE_MONITORING" = "true" ]; then
+        log_info "Starting performance monitoring..."
+        python3 -c "
+from dspy_agent.monitor.performance_monitor import PerformanceMonitor
+import asyncio
+monitor = PerformanceMonitor('$PROJECT_ROOT')
+monitor.start_monitoring()
+print('Performance monitoring started')
+" &
+    fi
+    
+    log_success "Advanced deployment completed"
+}
 
 # Create necessary directories
 setup_directories() {

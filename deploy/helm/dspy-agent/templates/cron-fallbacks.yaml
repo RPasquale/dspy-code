@@ -1,0 +1,99 @@
+{{- if .Values.cronFallback.enabled }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cron-file-promote
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.cronFallback.filePromote.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ .Values.serviceAccount }}
+          containers:
+            - name: spark
+              image: {{ .Values.image.spark }}
+              imagePullPolicy: IfNotPresent
+              command: ["/opt/bitnami/spark/bin/spark-submit"]
+              args:
+                - "--master"
+                - "local[*]"
+                - "local:///opt/app/streaming/topics/file_promote_approvals.py"
+              volumeMounts:
+                - name: warehouse
+                  mountPath: {{ .Values.warehouseBase }}
+          volumes:
+            - name: warehouse
+              persistentVolumeClaim:
+                claimName: {{ .Values.pvc.warehouse.claim }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cron-tool-metrics
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.cronFallback.toolMetrics.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ .Values.serviceAccount }}
+          containers:
+            - name: spark
+              image: {{ .Values.image.spark }}
+              imagePullPolicy: IfNotPresent
+              command: ["/opt/bitnami/spark/bin/spark-submit"]
+              args:
+                - "--master"
+                - "local[*]"
+                - "local:///opt/app/streaming/topics/tool_metrics.py"
+              volumeMounts:
+                - name: warehouse
+                  mountPath: {{ .Values.warehouseBase }}
+          volumes:
+            - name: warehouse
+              persistentVolumeClaim:
+                claimName: {{ .Values.pvc.warehouse.claim }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cron-train-tool
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.cronFallback.trainTool.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ .Values.serviceAccount }}
+          containers:
+            - name: spark
+              image: {{ .Values.image.train }}
+              imagePullPolicy: IfNotPresent
+              command: ["/opt/bitnami/spark/bin/spark-submit"]
+              args:
+                - "--master"
+                - "local[*]"
+                - "local:///opt/app/dspy_agent/training/train_grpo_tool.py"
+                - "--manifest"
+                - "{{ printf "%s/datasets/grpo_tool_batches/manifest.json" .Values.warehouseBase }}"
+                - "--epochs"
+                - "1"
+                - "--batch-size"
+                - "16"
+              volumeMounts:
+                - name: warehouse
+                  mountPath: {{ .Values.warehouseBase }}
+          volumes:
+            - name: warehouse
+              persistentVolumeClaim:
+                claimName: {{ .Values.pvc.warehouse.claim }}
+{{- end }}
+

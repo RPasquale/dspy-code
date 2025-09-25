@@ -15,7 +15,7 @@ jobs:
           node-version: '18'
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install frontend deps
         working-directory: frontend/react-dashboard
         run: |
@@ -43,4 +43,3 @@ jobs:
         with:
           name: dspy_reports
           path: .dspy_reports/**
-

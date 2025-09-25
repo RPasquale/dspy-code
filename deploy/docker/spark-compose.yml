@@ -1,0 +1,54 @@
+version: '3.9'
+services:
+  spark-master:
+    image: bitnami/spark:3.5.1
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    networks: [dspy]
+
+  spark-worker:
+    image: bitnami/spark:3.5.1
+    depends_on: [spark-master]
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=1
+    networks: [dspy]
+
+  spark-jobs:
+    image: ghcr.io/OWNER/dspy-spark:latest
+    depends_on: [spark-master, spark-worker]
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - WAREHOUSE_BASE=/warehouse
+      - CHECKPOINT_BASE=/checkpoints
+      - LANDING_BASE=/landing
+      - INGEST_CSV=1
+      - INGEST_EXCEL=0
+      - INGEST_JSON=1
+      - INGEST_PARQUET=1
+      - INGEST_AVRO=1
+      - INGEST_DOCS=1
+      - PROMOTE_INTERVAL_SEC=600
+      - METRICS_INTERVAL_SEC=900
+      - FEATURES_INTERVAL_SEC=900
+      - TRAIN_INTERVAL_SEC=86400
+    volumes:
+      - warehouse:/warehouse
+      - checkpoints:/checkpoints
+      - landing:/landing
+    command: ["python", "/opt/app/scripts/spark_job_supervisor.py"]
+    networks: [dspy]
+
+volumes:
+  warehouse: {}
+  checkpoints: {}
+  landing: {}
+
+networks:
+  dspy: {}
+

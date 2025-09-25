@@ -47,20 +47,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     llvm \
     libomp-dev && rm -rf /var/lib/apt/lists/*
 
-# Build raylib from source for the current architecture (pufferlib dep)
-# This ensures compatibility with PufferLib's requirements
-RUN git clone --depth 1 --branch 5.5 https://github.com/raysan5/raylib.git /tmp/raylib \
- && cd /tmp/raylib/src \
- && make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE -j"$(nproc)" \
- && make install PLATFORM=PLATFORM_DESKTOP RAYLIB_LIB_PATH=/usr/local/lib RAYLIB_INCLUDE_PATH=/usr/local/include \
- && ldconfig \
- && rm -rf /tmp/raylib
+# Optionally build raylib from source for x86_64 only (pufferlib dependency)
+# On non-x86_64 (e.g., aarch64), RL extras will be skipped unless user opts in.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    if [ "$arch" = "x86_64" ]; then \
+      git clone --depth 1 --branch 5.5 https://github.com/raysan5/raylib.git /tmp/raylib; \
+      cd /tmp/raylib/src; \
+      make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE -j"$(nproc)"; \
+      make install PLATFORM=PLATFORM_DESKTOP RAYLIB_LIB_PATH=/usr/local/lib RAYLIB_INCLUDE_PATH=/usr/local/include; \
+      ldconfig; \
+      rm -rf /tmp/raylib; \
+      echo "[raylib] built for $arch"; \
+    else \
+      echo "[raylib] skipping build on $arch"; \
+    fi
 
-# Set environment variables to help PufferLib find the correct raylib
+# Set environment variables to help PufferLib find raylib when built
 ENV RAYLIB_PATH=/usr/local \
     RAYLIB_LIB_PATH=/usr/local/lib \
     RAYLIB_INCLUDE_PATH=/usr/local/include \
-    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
 
 ENV AST_GREP_VERSION=0.33.0
 RUN set -eux; \
@@ -96,24 +103,27 @@ COPY dspy_agent /app/dspy_agent
 
 # Install uv and base dependencies
 RUN pip install --no-cache-dir uv && \
-    uv pip install --system .
+    uv pip install --system . && \
+    pip install --no-cache-dir fastapi uvicorn
 
-# Install RL dependencies if available (optional)
+# Install RL dependencies on x86_64 only (optional)
 RUN set -eux; \
-    echo "Installing RL extras (optional)..."; \
-    # Set environment variables to help with PufferLib build \
-    export RAYLIB_PATH=/usr/local; \
-    export RAYLIB_LIB_PATH=/usr/local/lib; \
-    export RAYLIB_INCLUDE_PATH=/usr/local/include; \
-    export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH; \
-    # Install PufferLib from source to avoid pre-built raylib issues \
-    if pip install --no-cache-dir --no-binary=pufferlib pufferlib>=3.0.0; then \
-      echo "PufferLib installed successfully from source"; \
-      # Install other RL dependencies \
-      uv pip install --system .[rl]; \
-      echo "RL extras installed"; \
+    arch="$(uname -m)"; \
+    if [ "$arch" = "x86_64" ]; then \
+      echo "Installing RL extras (optional)..."; \
+      export RAYLIB_PATH=/usr/local; \
+      export RAYLIB_LIB_PATH=/usr/local/lib; \
+      export RAYLIB_INCLUDE_PATH=/usr/local/include; \
+      export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH; \
+      if pip install --no-cache-dir --no-binary=pufferlib pufferlib>=3.0.0; then \
+        echo "PufferLib installed successfully"; \
+        uv pip install --system .[rl]; \
+        echo "RL extras installed"; \
+      else \
+        echo "[warn] RL extras failed to install (optional). Continuing."; \
+      fi; \
     else \
-      echo "[warn] RL extras failed to install (optional). Continuing."; \
+      echo "[warn] Skipping RL extras on $arch"; \
     fi
 
 # Create non-root user and set permissions

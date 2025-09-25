@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.pvc.landing.claim }}
+  namespace: {{ .Values.namespace }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: {{ .Values.pvc.landing.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.pvc.landing.size | quote }}
+

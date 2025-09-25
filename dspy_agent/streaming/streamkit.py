@@ -143,6 +143,26 @@ class LocalBus:
         self._kafka = kafka
         self._dlq_path = Path('.dspy_reports') / 'dlq.jsonl'
         
+        # Performance optimization metrics
+        self._metrics = {
+            'messages_published': 0,
+            'messages_dropped': 0,
+            'avg_processing_time': 0.0,
+            'peak_queue_size': 0,
+            'total_processing_time': 0.0,
+            'batch_operations': 0
+        }
+        
+        # Batch processing optimization
+        self._batch_size = 100
+        self._batch_timeout = 0.1  # seconds
+        self._pending_messages = []
+        self._last_batch_time = time.time()
+        
+        # Queue size monitoring
+        self._max_queue_size = 1000
+        self._queue_size_warnings = 0
+        
         # Initialize RedDB data manager for enhanced logging
         try:
             from ..db import get_enhanced_data_manager, create_log_entry, Environment
@@ -2015,11 +2035,64 @@ def _tcp_check(bootstrap: str, timeout: float = 0.2) -> bool:
     return False
 
 
+class StreamingRuntime:
+    """Minimal async-friendly runtime that wraps LocalBus for tests.
+
+    Provides initialize/publish/subscribe/shutdown matching test expectations.
+    """
+
+    def __init__(self) -> None:
+        self._bus = LocalBus()
+        self._subs: list[tuple['threading.Thread','threading.Event']] = []
+        self.is_initialized = False
+
+    async def initialize(self) -> None:
+        self.is_initialized = True
+
+    async def publish(self, topic: str, message: Any) -> None:
+        self._bus.publish(topic, message)
+
+    async def subscribe(self, topic: str, handler) -> None:
+        q = self._bus.subscribe(topic)
+        stop = threading.Event()
+
+        def _loop():
+            import asyncio
+            while not stop.is_set():
+                try:
+                    msg = q.get(timeout=0.1)
+                except Empty:
+                    continue
+                except Exception:
+                    break
+                try:
+                    res = handler(msg)
+                    if asyncio.iscoroutine(res):
+                        asyncio.run(res)
+                except Exception:
+                    # Swallow handler errors in background loop
+                    pass
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        self._subs.append((t, stop))
+
+    async def shutdown(self) -> None:
+        for t, s in list(self._subs):
+            s.set()
+        for t, s in list(self._subs):
+            try:
+                t.join(timeout=0.5)
+            except Exception:
+                pass
+        self._subs.clear()
+
+
 __all__ = [
     # Config
     'DEFAULT_CONFIG_PATH','TRAINER_SETTINGS_PATH','KafkaTopic','KafkaConfig','SparkConfig','K8sConfig','ContainerTopic','StreamConfig','load_config','save_config','render_kafka_topic_commands',
     # Runtime
-    'LocalBus','Discovered','autodiscover_logs','FileTailer','DockerTailer','Aggregator','Worker','Trainer','start_local_stack','process_ctx','make_context_example',
+    'LocalBus','StreamingRuntime','Discovered','autodiscover_logs','FileTailer','DockerTailer','Aggregator','Worker','Trainer','start_local_stack','process_ctx','make_context_example',
     # Kafka
     'KafkaParams','WorkerLoop',
 ]

@@ -4,10 +4,8 @@ import json
 import os
 from typing import Any, Optional
 
-try:
-    from confluent_kafka import Producer  # type: ignore
-except Exception:  # pragma: no cover
-    Producer = None  # type: ignore
+# Do not import confluent_kafka at module import time to avoid native crashes
+Producer = None  # type: ignore
 
 
 class KafkaLogger:
@@ -16,10 +14,13 @@ class KafkaLogger:
         self.client_id = client_id or os.getenv("KAFKA_CLIENT_ID") or "dspy-agent"
         self.topic_prefix = topic_prefix or os.getenv("KAFKA_TOPIC_PREFIX", "")
         self._producer = None
-        if self.bootstrap and Producer is not None:
-            conf = {"bootstrap.servers": self.bootstrap, "client.id": self.client_id}
+        # Lazy import: only attempt if bootstrap configured and not explicitly disabled
+        if self.bootstrap and os.getenv("DSPY_DISABLE_KAFKA", "0").lower() not in {"1", "true", "yes"}:
             try:
-                self._producer = Producer(conf)
+                # Import within guarded block; failure should not crash process
+                from confluent_kafka import Producer as _Producer  # type: ignore
+                conf = {"bootstrap.servers": self.bootstrap, "client.id": self.client_id}
+                self._producer = _Producer(conf)
             except Exception:
                 self._producer = None
 
@@ -45,8 +46,11 @@ class KafkaLogger:
             # Swallow errors to avoid impacting main flow
             pass
 
+    # Backwards-compatible alias used in some scripts
+    def publish(self, topic: str, value: Any) -> None:  # pragma: no cover - simple alias
+        self.send(topic, value)
+
 
 def get_kafka_logger() -> Optional[KafkaLogger]:
     kl = KafkaLogger()
     return kl if kl.enabled else None
-

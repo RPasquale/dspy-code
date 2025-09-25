@@ -19,14 +19,14 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 # Import streaming components
-from dspy_agent.streaming import get_kafka_logger
+from dspy_agent.streaming import get_event_bus
 
 class AgentStreamingPublisher:
     """Publishes agent actions and thoughts to Kafka streams"""
     
     def __init__(self, project_root: Path):
         self.project_root = project_root
-        self.kafka_logger = get_kafka_logger()
+        self.bus = get_event_bus()
         self.action_count = 0
         self.thought_count = 0
         
@@ -144,18 +144,10 @@ class AgentStreamingPublisher:
     
     def _publish_to_kafka(self, topic: str, data: Dict[str, Any]):
         """Publish data to Kafka topic"""
-        if not self.kafka_logger:
-            # Fallback to file logging if Kafka not available
-            self._log_to_file(topic, data)
-            return
-        
         try:
-            # Publish to Kafka
-            self.kafka_logger.publish(topic, data)
+            self.bus.publish(topic, data)
         except Exception as e:
-            print(f"⚠️  Failed to publish to Kafka topic {topic}: {e}")
-            # Fallback to file logging
-            self._log_to_file(topic, data)
+            print(f"⚠️  Failed to publish event: {e}")
     
     def _log_to_file(self, topic: str, data: Dict[str, Any]):
         """Fallback: log to file if Kafka not available"""

@@ -1,0 +1,68 @@
+{{- if .Values.sparkApps.toolJoinGroups.enabled }}
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: tool-join-groups
+  namespace: {{ .Values.namespace }}
+spec:
+  type: Python
+  mode: cluster
+  image: {{ .Values.image.spark }}
+  imagePullPolicy: IfNotPresent
+  sparkConf:
+    spark.sql.adaptive.enabled: "true"
+    spark.dynamicAllocation.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+    spark.dynamicAllocation.shuffleTracking.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+    spark.dynamicAllocation.minExecutors: "{{ .Values.dynamicAllocation.minExecutors }}"
+    spark.dynamicAllocation.maxExecutors: "{{ .Values.dynamicAllocation.maxExecutors }}"
+    spark.dynamicAllocation.initialExecutors: "{{ .Values.dynamicAllocation.initialExecutors }}"
+  mainApplicationFile: local:///opt/app/streaming/topics/tool_join_groups.py
+  sparkVersion: 3.5.1
+  driver:
+    cores: {{ .Values.sparkApps.toolJoinGroups.driver.cores }}
+    memory: {{ .Values.sparkApps.toolJoinGroups.driver.memory | quote }}
+    serviceAccount: {{ .Values.serviceAccount }}
+    env:
+      - name: KAFKA_BOOTSTRAP
+        value: {{ .Values.kafkaBootstrap | quote }}
+      - name: TOPIC_TOOL_GROUPS
+        value: tool_groups
+      - name: TOPIC_TOOL_SAMPLES
+        value: tool_samples
+      - name: TOPIC_TOOL_SCORES
+        value: tool_scores
+      - name: CHECKPOINT_BASE
+        value: {{ .Values.checkpointsBase | quote }}
+      - name: WAREHOUSE_BASE
+        value: {{ .Values.warehouseBase | quote }}
+  executor:
+    instances: {{ .Values.sparkApps.toolJoinGroups.executor.instances }}
+    cores: {{ .Values.sparkApps.toolJoinGroups.executor.cores }}
+    memory: {{ .Values.sparkApps.toolJoinGroups.executor.memory | quote }}
+  volumes:
+    - name: warehouse
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.warehouse.claim }}
+    - name: checkpoints
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.checkpoints.claim }}
+    - name: landing
+      persistentVolumeClaim:
+        claimName: {{ .Values.pvc.landing.claim }}
+  driver:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+      - name: checkpoints
+        mountPath: {{ .Values.checkpointsBase }}
+      - name: landing
+        mountPath: /landing
+  executor:
+    volumeMounts:
+      - name: warehouse
+        mountPath: {{ .Values.warehouseBase }}
+      - name: checkpoints
+        mountPath: {{ .Values.checkpointsBase }}
+      - name: landing
+        mountPath: /landing
+{{- end }}

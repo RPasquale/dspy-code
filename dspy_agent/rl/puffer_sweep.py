@@ -18,7 +18,19 @@ import random
 from copy import deepcopy
 from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-import numpy as np
+# Avoid importing numpy at module import time to prevent native crashes in
+# restricted environments. Strategies that require numpy import it lazily.
+_HAS_NUMPY = False
+def _ensure_numpy():
+    global _HAS_NUMPY
+    if _HAS_NUMPY:
+        return
+    import importlib
+    try:
+        importlib.import_module("numpy")
+        _HAS_NUMPY = True
+    except Exception as exc:  # pragma: no cover - optional
+        raise RuntimeError("numpy is required for this operation") from exc
 
 # PufferLib is optional - we'll import it only when needed
 pufferlib = None  # type: ignore[assignment]
@@ -37,7 +49,9 @@ def _ensure_pufferlib():
 def _unroll_nested_dict(mapping: Mapping[str, object], prefix: Tuple[str, ...] = ()) -> Iterator[Tuple[str, object]]:
     try:
         _ensure_pufferlib()
-        yield from pufferlib.unroll_nested_dict(mapping)  # type: ignore[attr-defined]
+        for key, value in pufferlib.unroll_nested_dict(mapping):  # type: ignore[attr-defined]
+            # Normalize to dot-separated keys
+            yield str(key).replace('/', '.'), value
         return
     except ImportError:
         pass  # Fall back to manual implementation
@@ -216,10 +230,11 @@ class Hyperparameters:
         if goal not in {"maximize", "minimize"}:
             raise ValueError("goal must be 'maximize' or 'minimize'")
         self.optimize_direction = 1 if goal == "maximize" else -1
-        self.search_centers = np.array([space.norm_mean for space in self.flat_spaces.values()])
-        self.min_bounds = np.array([space.norm_min for space in self.flat_spaces.values()])
-        self.max_bounds = np.array([space.norm_max for space in self.flat_spaces.values()])
-        self.search_scales = np.array([space.scale for space in self.flat_spaces.values()])
+        # Store lists to avoid requiring numpy for basic usage (Carbs strategy)
+        self.search_centers: List[float] = [space.norm_mean for space in self.flat_spaces.values()]
+        self.min_bounds: List[float] = [space.norm_min for space in self.flat_spaces.values()]
+        self.max_bounds: List[float] = [space.norm_max for space in self.flat_spaces.values()]
+        self.search_scales: List[float] = [float(space.scale) for space in self.flat_spaces.values()]
         if verbose:
             self._print_extrema()
 
@@ -231,26 +246,28 @@ class Hyperparameters:
         for name, space in self.flat_spaces.items():
             print(f"\t{name}: {space.unnormalize(min(space.norm_mean + space.scale, space.norm_max))}")
 
-    def sample(self, n: int, mu: Optional[np.ndarray] = None, scale: float = 1.0) -> np.ndarray:
-        if mu is None:
-            mu = self.search_centers
-        if len(mu.shape) == 1:
-            mu = mu[None, :]
-        n_input, n_dim = mu.shape
-        scale_arr = scale * self.search_scales
+    def sample(self, n: int, mu: Optional[Sequence[Sequence[float]]] = None, scale: float = 1.0):  # type: ignore[override]
+        # Lightweight fallback; used by strategies that explicitly require numpy.
+        _ensure_numpy()
+        import numpy as np  # type: ignore
+        mu_arr = np.array(mu) if mu is not None else np.array(self.search_centers)[None, :]
+        if len(mu_arr.shape) == 1:
+            mu_arr = mu_arr[None, :]
+        n_input, n_dim = mu_arr.shape
+        scale_arr = scale * np.array(self.search_scales)
         mu_idxs = np.random.randint(0, n_input, n)
-        samples = scale_arr * (2 * np.random.rand(n, n_dim) - 1) + mu[mu_idxs]
-        return np.clip(samples, self.min_bounds, self.max_bounds)
+        samples = scale_arr * (2 * np.random.rand(n, n_dim) - 1) + mu_arr[mu_idxs]
+        return np.clip(samples, np.array(self.min_bounds), np.array(self.max_bounds))
 
-    def from_dict(self, params: Mapping[str, object]) -> np.ndarray:
+    def from_dict(self, params: Mapping[str, object]):  # type: ignore[override]
         flat_params = dict(_unroll_nested_dict(params))
-        values = []
+        values: List[float] = []
         for key, space in self.flat_spaces.items():
             if key not in flat_params:
                 raise KeyError(f"Missing hyperparameter {key}")
             normed = space.normalize(float(flat_params[key]))
             values.append(normed)
-        return np.array(values)
+        return values
 
     def to_dict(self, sample: Sequence[float], fill: Optional[MutableMapping[str, object]] = None) -> MutableMapping[str, object]:
         params = deepcopy(fill) if fill is not None else deepcopy(self.spaces)
@@ -268,18 +285,26 @@ class Hyperparameters:
 
 
 def pareto_points(observations: Sequence[Mapping[str, float]], eps: float = 1e-6) -> Tuple[List[Mapping[str, float]], List[int]]:
-    scores = np.array([obs["output"] for obs in observations], dtype=float)
-    costs = np.array([obs["cost"] for obs in observations], dtype=float)
+    # Pure-Python Pareto front: maximize score, minimize cost
     pareto: List[Mapping[str, float]] = []
     idxs: List[int] = []
-    for idx, obs in enumerate(observations):
-        higher_score = scores + eps > scores[idx]
-        lower_cost = costs - eps < costs[idx]
-        better = higher_score & lower_cost
-        better[idx] = False
-        if not better.any():
-            pareto.append(obs)
-            idxs.append(idx)
+    for i, obs_i in enumerate(observations):
+        s_i = float(obs_i.get("output", 0.0))
+        c_i = float(obs_i.get("cost", float("inf")))
+        dominated = False
+        for j, obs_j in enumerate(observations):
+            if i == j:
+                continue
+            s_j = float(obs_j.get("output", 0.0))
+            c_j = float(obs_j.get("cost", float("inf")))
+            better_score = (s_j + eps) > s_i
+            lower_cost = (c_j - eps) < c_i
+            if better_score and lower_cost:
+                dominated = True
+                break
+        if not dominated:
+            pareto.append(obs_i)
+            idxs.append(i)
     return pareto, idxs
 
 
@@ -289,10 +314,11 @@ class RandomStrategy:
         self.global_search_scale = global_search_scale
         self.random_suggestions = random_suggestions
         self.success_observations: List[Dict[str, object]] = []
-        self.suggestion: Optional[np.ndarray] = None
+        self.suggestion = None  # numpy ndarray when available
 
     def suggest(self, fill: Optional[MutableMapping[str, object]] = None) -> Tuple[MutableMapping[str, object], Dict[str, object]]:
         suggestions = self.hyperparameters.sample(self.random_suggestions, scale=self.global_search_scale)
+        import numpy as np  # noqa: F401
         self.suggestion = random.choice(suggestions)
         return self.hyperparameters.to_dict(self.suggestion, fill), {}
 
@@ -308,7 +334,7 @@ class RandomStrategy:
     # Lightweight persistence API
     def state(self) -> Dict[str, object]:  # pragma: no cover - simple JSON state
         return {
-            "suggestion": (self.suggestion.tolist() if isinstance(self.suggestion, np.ndarray) else None),
+            "suggestion": (self.suggestion.tolist() if getattr(self.suggestion, "tolist", None) else None),
             "observations": [
                 {"input": list(map(float, obs.get("input", []))), "output": float(obs.get("output", 0.0)), "cost": float(obs.get("cost", 0.0)), "is_failure": bool(obs.get("is_failure", False))}
                 for obs in self.success_observations
@@ -317,6 +343,8 @@ class RandomStrategy:
 
     def load_state(self, data: Mapping[str, object]) -> None:  # pragma: no cover - simple JSON state
         try:
+            _ensure_numpy()
+            import numpy as np  # type: ignore
             self.suggestion = np.array(data.get("suggestion") or []) if data.get("suggestion") is not None else None
             self.success_observations = list(data.get("observations") or [])
         except Exception:
@@ -346,6 +374,8 @@ class ParetoGenetic:
             suggestion = self.hyperparameters.search_centers
             return self.hyperparameters.to_dict(suggestion, fill), {}
         candidates, _ = pareto_points(self.success_observations)
+        _ensure_numpy()
+        import numpy as np  # type: ignore
         pareto_costs = np.array([obs["cost"] for obs in candidates])
         if self.bias_cost:
             if self.log_bias:
@@ -608,10 +638,15 @@ class Carbs:
 
         normalized: List[float] = []
         cleaned_mapping: Dict[str, float] = {}
+        # Accept both slash and dot key styles
+        mapping_norm: Dict[str, float] = {}
+        for k, v in mapping.items():
+            mapping_norm[str(k)] = float(v)
+            mapping_norm[str(k).replace('/', '.')] = float(v)
         for name, space in self.hyperparameters.flat_spaces.items():
-            if name not in mapping:
+            if name not in mapping_norm:
                 raise KeyError(f"CARBS suggestion missing hyperparameter '{name}'")
-            value = mapping[name]
+            value = mapping_norm[name]
             try:
                 value_f = float(value)
             except (TypeError, ValueError) as exc:
@@ -834,17 +869,12 @@ def get_strategy(name: str):
     if key in {"pareto", "pareto_genetic", "paretogenetic"}:
         return ParetoGenetic
     if key == "protein":
-        # Prefer native variant when Pyro unavailable
-        if not _HAS_PYRO:
-            return EProtein
+        # Always return the Protein class; instantiation may error if deps missing
         return Protein
     if key == "carbs":
-        try:
-            from carbs import CARBS  # type: ignore
-            _ = CARBS
-            return Carbs
-        except Exception:
-            return ECarbs
+        # Always return the Carbs strategy class so callers can handle
+        # dependency errors explicitly when instantiating.
+        return Carbs
     if key in {"eprotein", "native_protein"}:
         return EProtein
     if key in {"ecarbs", "native_carbs"}:

@@ -1,0 +1,238 @@
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: tool-join-groups
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: ghcr.io/OWNER/dspy-spark:latest # replace OWNER
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/app/streaming/topics/tool_join_groups.py
+  sparkVersion: 3.5.1
+  restartPolicy:
+    type: OnFailure
+    onFailureRetries: 3
+    onFailureRetryInterval: 30
+    onSubmissionFailureRetries: 5
+    onSubmissionFailureRetryInterval: 30
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: KAFKA_BOOTSTRAP
+        value: "kafka:9092"
+      - name: TOPIC_TOOL_GROUPS
+        value: "tool_groups"
+      - name: TOPIC_TOOL_SAMPLES
+        value: "tool_samples"
+      - name: TOPIC_TOOL_SCORES
+        value: "tool_scores"
+      - name: CHECKPOINT_BASE
+        value: "/checkpoints"
+      - name: WAREHOUSE_BASE
+        value: "/warehouse"
+  executor:
+    instances: 3
+    cores: 2
+    memory: 4g
+---
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: tool-vectorize-tokens
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: ghcr.io/OWNER/dspy-spark:latest # replace OWNER
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/app/streaming/topics/tool_vectorize_tokens.py
+  sparkVersion: 3.5.1
+  restartPolicy:
+    type: Never
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: WAREHOUSE_BASE
+        value: "/warehouse"
+      - name: FEATURES_BASE
+        value: "/warehouse/features"
+      - name: MAX_LEN
+        value: "2048"
+      - name: GRPO_CLIP
+        value: "5.0"
+  executor:
+    instances: 3
+    cores: 2
+    memory: 4g
+---
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: tool-batch-export
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: ghcr.io/OWNER/dspy-spark:latest # replace OWNER
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/app/streaming/topics/tool_batch_export.py
+  sparkVersion: 3.5.1
+  restartPolicy:
+    type: Never
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: WAREHOUSE_BASE
+        value: "/warehouse"
+      - name: FEATURES_BASE
+        value: "/warehouse/features"
+      - name: DATASET_DIR
+        value: "/warehouse/datasets/grpo_tool_batches"
+      - name: GRPO_SHARD_SIZE
+        value: "4096"
+  executor:
+    instances: 2
+    cores: 2
+    memory: 4g
+
+---
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: file-ingest-csv
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: ghcr.io/OWNER/dspy-spark:latest # replace OWNER
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/app/streaming/topics/file_ingest_csv.py
+  sparkVersion: 3.5.1
+  restartPolicy:
+    type: OnFailure
+    onFailureRetries: 3
+    onFailureRetryInterval: 30
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: INGEST_SRC
+        value: "/landing/csv"
+      - name: WAREHOUSE_BASE
+        value: "/warehouse"
+      - name: MAX_FILES_PER_TRIGGER
+        value: "100"
+  executor:
+    instances: 2
+    cores: 2
+    memory: 4g
+
+---
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: file-ingest-excel
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: ghcr.io/OWNER/dspy-spark:latest # replace OWNER
+  imagePullPolicy: IfNotPresent
+  sparkConf:
+    spark.jars.packages: "com.crealytics:spark-excel_2.12:3.5.0_0.20.4"
+  mainApplicationFile: local:///opt/app/streaming/topics/file_ingest_excel.py
+  sparkVersion: 3.5.1
+  deps:
+    packages:
+      - com.crealytics:spark-excel_2.12:3.5.0_0.20.4
+  restartPolicy:
+    type: Never
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: INGEST_XLSX_SRC
+        value: "/landing/excel"
+      - name: WAREHOUSE_BASE
+        value: "/warehouse"
+      - name: XLSX_HEADER
+        value: "true"
+      - name: XLSX_INFER
+        value: "true"
+  executor:
+    instances: 2
+    cores: 2
+    memory: 4g
+
+---
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: tool-map-ingest
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: ghcr.io/OWNER/dspy-spark:latest # replace OWNER
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/app/streaming/topics/tool_map_ingest.py
+  sparkVersion: 3.5.1
+  restartPolicy:
+    type: OnFailure
+    onFailureRetries: 3
+    onFailureRetryInterval: 30
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: KAFKA_BOOTSTRAP
+        value: "kafka:9092"
+      - name: TOPIC_TOOL_TO_DIFF_MAP
+        value: "tool_to_diff_map"
+      - name: CHECKPOINT_BASE
+        value: "/checkpoints"
+      - name: WAREHOUSE_BASE
+        value: "/warehouse"
+  executor:
+    instances: 2
+    cores: 2
+    memory: 4g
+
+---
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: tool-metrics
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: ghcr.io/OWNER/dspy-spark:latest # replace OWNER
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/app/streaming/topics/tool_metrics.py
+  sparkVersion: 3.5.1
+  restartPolicy:
+    type: Never
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: WAREHOUSE_BASE
+        value: "/warehouse"
+      - name: METRICS_BASE
+        value: "/warehouse/metrics"
+  executor:
+    instances: 2
+    cores: 2
+    memory: 4g

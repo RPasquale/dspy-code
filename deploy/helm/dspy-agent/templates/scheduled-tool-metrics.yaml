@@ -1,0 +1,45 @@
+{{- if .Values.sparkApps.metricsSchedule.enabled }}
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: ScheduledSparkApplication
+metadata:
+  name: tool-metrics-schedule
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.sparkApps.metricsSchedule.schedule | quote }}
+  concurrencyPolicy: Forbid
+  template:
+    type: Python
+    mode: cluster
+    image: {{ .Values.image.spark }}
+    imagePullPolicy: IfNotPresent
+    sparkConf:
+      spark.sql.adaptive.enabled: "true"
+    mainApplicationFile: local:///opt/app/streaming/topics/tool_metrics.py
+    sparkVersion: 3.5.1
+    driver:
+      cores: {{ .Values.sparkApps.toolMetrics.driver.cores }}
+      memory: {{ .Values.sparkApps.toolMetrics.driver.memory | quote }}
+      serviceAccount: {{ .Values.serviceAccount }}
+      env:
+        - name: WAREHOUSE_BASE
+          value: {{ .Values.warehouseBase | quote }}
+        - name: METRICS_BASE
+          value: {{ printf "%s/metrics" .Values.warehouseBase | quote }}
+    executor:
+      instances: {{ .Values.sparkApps.toolMetrics.executor.instances }}
+      cores: {{ .Values.sparkApps.toolMetrics.executor.cores }}
+      memory: {{ .Values.sparkApps.toolMetrics.executor.memory | quote }}
+    volumes:
+      - name: warehouse
+        persistentVolumeClaim:
+          claimName: {{ .Values.pvc.warehouse.claim }}
+    driver:
+      volumeMounts:
+        - name: warehouse
+          mountPath: {{ .Values.warehouseBase }}
+    executor:
+      volumeMounts:
+        - name: warehouse
+          mountPath: {{ .Values.warehouseBase }}
+{{- end }}
+

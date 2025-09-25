@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path
 import json as _json
 
 
@@ -89,3 +90,31 @@ def get_settings() -> Settings:
         rl_clamp01_kinds=_parse_csv("RL_CLAMP01_KINDS"),
         rl_scales=_parse_scales("RL_SCALES"),
     )
+
+
+# Backward-compatibility shim for older tests that expect Config
+class Config:
+    """Simple configuration facade for tests expecting `Config`.
+
+    Exposes a minimal surface used by tests:
+    - `workspace`: resolved from WORKSPACE_DIR or CWD
+    - `log_level`: normalized log level from DSPY_LOG_LEVEL
+    - `auto_train`: boolean from DSPY_AUTO_TRAIN
+    """
+
+    _ALLOWED_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
+
+    def __init__(self, workspace: Optional[Path] = None):
+        try:
+            ws_env = os.getenv("WORKSPACE_DIR")
+            base = Path(ws_env) if ws_env else (workspace or Path.cwd())
+            self.workspace = Path(base).resolve()
+        except Exception:
+            # Fall back to current directory if resolution fails
+            self.workspace = Path.cwd()
+
+        raw_level = (os.getenv("DSPY_LOG_LEVEL", "INFO") or "INFO").upper()
+        self.log_level = raw_level if raw_level in self._ALLOWED_LEVELS else "INFO"
+
+        auto = os.getenv("DSPY_AUTO_TRAIN", "false").strip().lower()
+        self.auto_train = auto in {"1", "true", "yes", "on"}

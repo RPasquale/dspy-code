@@ -1,0 +1,52 @@
+{{- if .Values.sparkApps.toolVectorize.enabled }}
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: ScheduledSparkApplication
+metadata:
+  name: tool-vectorize-tokens-schedule
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.sparkApps.toolVectorize.schedule | default "*/30 * * * *" | quote }}
+  concurrencyPolicy: Forbid
+  template:
+    type: Python
+    mode: cluster
+    image: {{ .Values.image.spark }}
+    imagePullPolicy: IfNotPresent
+    sparkConf:
+      spark.sql.adaptive.enabled: "true"
+      spark.dynamicAllocation.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+      spark.dynamicAllocation.shuffleTracking.enabled: {{ ternary "true" "false" .Values.dynamicAllocation.enabled }}
+      spark.dynamicAllocation.minExecutors: "{{ .Values.dynamicAllocation.minExecutors }}"
+      spark.dynamicAllocation.maxExecutors: "{{ .Values.dynamicAllocation.maxExecutors }}"
+      spark.dynamicAllocation.initialExecutors: "{{ .Values.dynamicAllocation.initialExecutors }}"
+    mainApplicationFile: local:///opt/app/streaming/topics/tool_vectorize_tokens.py
+    sparkVersion: 3.5.1
+    driver:
+      cores: 1
+      memory: 2g
+      serviceAccount: {{ .Values.serviceAccount }}
+      env:
+        - name: WAREHOUSE_BASE
+          value: {{ .Values.warehouseBase | quote }}
+        - name: FEATURES_BASE
+          value: {{ printf "%s/features" .Values.warehouseBase | quote }}
+    executor:
+      instances: 1
+      cores: 1
+      memory: 2g
+    volumes:
+      - name: warehouse
+        persistentVolumeClaim:
+          claimName: {{ .Values.pvc.warehouse.claim }}
+      - name: checkpoints
+        persistentVolumeClaim:
+          claimName: {{ .Values.pvc.checkpoints.claim }}
+    driver:
+      volumeMounts:
+        - name: warehouse
+          mountPath: {{ .Values.warehouseBase }}
+    executor:
+      volumeMounts:
+        - name: warehouse
+          mountPath: {{ .Values.warehouseBase }}
+{{- end }}

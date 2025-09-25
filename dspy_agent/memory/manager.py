@@ -63,13 +63,18 @@ class MemoryManager:
 
     def __init__(
         self,
-        root: Path,
+        root: Path | None = None,
         *,
+        workspace: Path | None = None,
         include: Optional[Iterable[Path]] = None,
         budget_mb: int = 2048,
         ttl_days: int = 30,
     ) -> None:
-        self.root = root
+        base = workspace or root or Path.cwd()
+        self.root = Path(base)
+        # Validate workspace/root path
+        if not self.root.exists() or not self.root.is_dir():
+            raise ValueError(f"Invalid workspace path: {self.root}")
         self.budget_bytes = int(max(1, budget_mb)) * 1024 * 1024
         self.ttl_sec = int(max(1, ttl_days)) * 86400
         self.targets: List[Path] = []
@@ -81,9 +86,9 @@ class MemoryManager:
                     continue
         else:
             self.targets = [
-                (root / 'logs').resolve(),
-                (root / '.dspy_reports').resolve(),
-                (root / '.dspy_cache').resolve(),
+                (self.root / 'logs').resolve(),
+                (self.root / '.dspy_reports').resolve(),
+                (self.root / '.dspy_cache').resolve(),
             ]
 
     def status(self) -> Dict[str, object]:
@@ -196,3 +201,43 @@ class MemoryManager:
                     continue
         return {"action": "compact", "changes": changed}
 
+    # --- Simple key-value memory API for tests ---
+    def _mem_file(self) -> Path:
+        return (self.root / '.dspy_memory.json')
+
+    def _load_mem(self) -> Dict[str, object]:
+        p = self._mem_file()
+        try:
+            if p.exists():
+                return json.loads(p.read_text())
+        except Exception:
+            pass
+        return {}
+
+    def _save_mem(self, data: Dict[str, object]) -> None:
+        try:
+            self._mem_file().write_text(json.dumps(data))
+        except Exception:
+            pass
+
+    def store(self, key: str, value: object) -> None:
+        data = self._load_mem(); data[str(key)] = value; self._save_mem(data)
+
+    def retrieve(self, key: str) -> object | None:
+        return self._load_mem().get(str(key))
+
+    def search(self, query: str) -> list[object]:
+        q = (query or '').lower(); data = self._load_mem(); out: list[object] = []
+        for k, v in data.items():
+            if q in str(k).lower() or q in str(v).lower():
+                out.append(v)
+        return out
+
+    def get_metrics(self) -> Dict[str, object]:
+        data = self._load_mem(); total_items = len(data)
+        # approximate memory usage as file size
+        try:
+            usage = self._mem_file().stat().st_size
+        except Exception:
+            usage = 0
+        return {"total_items": total_items, "memory_usage": usage}

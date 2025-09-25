@@ -11,6 +11,51 @@ from ..embedding.indexer import build_index, save_index, load_index, semantic_se
 from ..code_tools.code_snapshot import build_code_snapshot
 
 
+class OrchestratorRuntime:
+    """Minimal orchestrator runtime for tests and local workflows.
+
+    Tracks simple tasks in-memory and provides create/execute/status methods.
+    """
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = Path(workspace).resolve()
+        self._tasks: Dict[str, Dict[str, Any]] = {}
+
+    def create_task(self, task: Dict[str, Any]) -> None:
+        tid = str(task.get("id") or task.get("task_id") or "task")
+        if not tid:
+            raise ValueError("task id is required")
+        self._tasks[tid] = {"status": "pending", "data": dict(task)}
+
+    def execute_task(self, task_id: str) -> Dict[str, Any] | None:
+        rec = self._tasks.get(task_id)
+        if rec is None:
+            return None
+        rec["status"] = "running"
+        # Trivial placeholder "execution" logic: snapshot or log extraction by type
+        ttype = str(rec["data"].get("type") or "").lower()
+        try:
+            if ttype in {"code_analysis", "codectx"}:
+                snap = build_code_snapshot(self.workspace)
+                result = {"task": task_id, "summary_len": len(snap)}
+            else:
+                # Default to evaluating a safe tool choice if provided
+                tool = rec["data"].get("tool") or "context"
+                ev = evaluate_tool_choice(str(tool), rec["data"], workspace=self.workspace)
+                result = {"task": task_id, "score": ev.score, "feedback": ev.feedback}
+        except Exception:
+            result = {"task": task_id, "error": True}
+        rec["status"] = "completed"
+        rec["result"] = result
+        return result
+
+    def get_task_status(self, task_id: str) -> str:
+        rec = self._tasks.get(task_id)
+        if not rec:
+            return "failed"
+        return str(rec.get("status") or "pending")
+
+
 SAFE_TOOLS = {
     "context", "plan", "grep", "extract", "codectx", "index", "esearch",
     "knowledge", "vretr", "intel", "edit", "patch", "run_tests", "lint", "build"

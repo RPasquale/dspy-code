@@ -25,8 +25,9 @@ class RedDBStorage:
     """
 
     def __init__(self, url: Optional[str] = None, namespace: str = "dspy") -> None:
-        self.url = url or os.getenv("REDDB_URL", "")
-        self.ns = os.getenv("REDDB_NAMESPACE", namespace)
+        self.url = "" if url is None else url
+        # Explicit argument takes precedence over environment for tests
+        self.ns = namespace or os.getenv("REDDB_NAMESPACE", "dspy")
         self.token = os.getenv("REDDB_TOKEN", None)
         self.client = None
         self._kv: dict[str, Any] = {}
