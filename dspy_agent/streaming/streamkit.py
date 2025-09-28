@@ -7,10 +7,11 @@ import re
 import subprocess
 import threading
 import time
+import importlib
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from queue import Queue, Empty, Full
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from .feature_store import FeatureStore
 from ..monitor.hw_profiler import HardwareProfiler
@@ -98,11 +99,27 @@ class ContainerTopic:
 
 
 @dataclass
+class SignatureVerifierConfig:
+    name: str
+    module: str
+    weight: float = 1.0
+
+
+@dataclass
+class SignatureStream:
+    name: str
+    sources: List[str]
+    sink: str
+    verifiers: List[SignatureVerifierConfig] = field(default_factory=list)
+
+
+@dataclass
 class StreamConfig:
     kafka: KafkaConfig
     spark: SparkConfig
     k8s: K8sConfig
     containers: List[ContainerTopic]
+    signature_streams: List[SignatureStream] = field(default_factory=list)
 
     @staticmethod
     def default() -> "StreamConfig":
@@ -124,17 +141,42 @@ class StreamConfig:
             KafkaTopic(name="agent.rl.vectorized"),
         ]
         bootstrap = _resolve_bootstrap(None)
+        signatures = [
+            SignatureStream(
+                name="code_patch",
+                sources=["agent.patches", "agent.results"],
+                sink="signatures.code_patch",
+                verifiers=[
+                    SignatureVerifierConfig(name="patch_applied", module="dspy_agent.verifiers.signatures:verify_patch_applied"),
+                    SignatureVerifierConfig(name="tests_passed", module="dspy_agent.verifiers.signatures:verify_tests_passed", weight=1.5),
+                    SignatureVerifierConfig(name="syntax_ok", module="dspy_agent.verifiers.signatures:verify_syntax_ok"),
+                ],
+            ),
+            SignatureStream(
+                name="embedding_lookup",
+                sources=["embedding_input", "embeddings"],
+                sink="signatures.embedding_lookup",
+                verifiers=[
+                    SignatureVerifierConfig(name="embedding_nonempty", module="dspy_agent.verifiers.signatures:verify_embedding_generated"),
+                ],
+            ),
+        ]
         return StreamConfig(
             kafka=KafkaConfig(bootstrap_servers=bootstrap, topics=topics),
             spark=SparkConfig(),
             k8s=K8sConfig(),
             containers=[ContainerTopic(container="backend", services=["users", "billing"]), ContainerTopic(container="frontend", services=["web"])],
+            signature_streams=signatures,
         )
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> StreamConfig:
     data = json.loads(path.read_text())
     def _kt(d): return KafkaTopic(**d)
+    def _sv(d): return SignatureVerifierConfig(**d)
+    def _ss(d):
+        verifs = [_sv(v) for v in d.get('verifiers', [])]
+        return SignatureStream(name=d['name'], sources=d.get('sources', []), sink=d.get('sink', ''), verifiers=verifs)
     kafka_bootstrap = _resolve_bootstrap(data["kafka"].get("bootstrap_servers"))
     return StreamConfig(
         kafka=KafkaConfig(
@@ -149,6 +191,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> StreamConfig:
         spark=SparkConfig(**data.get("spark", {})),
         k8s=K8sConfig(**data.get("k8s", {})),
         containers=[ContainerTopic(**c) for c in data.get("containers", [])],
+        signature_streams=[_ss(s) for s in data.get("signature_streams", [])],
     )
 
 
@@ -506,6 +549,85 @@ class MetricsWriter(threading.Thread):
                 pass
             finally:
                 time.sleep(self.interval)
+
+
+class SignatureStreamManager(threading.Thread):
+    def __init__(self, bus: 'LocalBus', cfg: SignatureStream, *, reward_topic: str = 'agent.learning', max_queue: int = 0) -> None:
+        super().__init__(name=f"signature-stream:{cfg.name}", daemon=True)
+        self._bus = bus
+        self._cfg = cfg
+        self._reward_topic = reward_topic
+        self._stop_event = threading.Event()
+        self._queues: Dict[str, Queue] = {}
+        for source in cfg.sources:
+            group_id = f"signature:{cfg.name}:{source}"
+            self._queues[source] = bus.subscribe_group(source, group_id, maxsize=max_queue)
+        self._verifiers: List[Tuple[str, float, Callable[[Mapping[str, Any]], float]]] = []
+        for verifier_cfg in cfg.verifiers:
+            try:
+                fn = self._load_verifier(verifier_cfg.module)
+                self._verifiers.append((verifier_cfg.name, float(verifier_cfg.weight or 1.0), fn))
+            except Exception as exc:
+                print(f"Warning: failed to load verifier {verifier_cfg.module}: {exc}")
+                continue
+
+    @staticmethod
+    def _load_verifier(path: str) -> Callable[[Mapping[str, Any]], float]:
+        if ':' in path:
+            module_name, attr = path.split(':', 1)
+        else:
+            module_name, attr = path.rsplit('.', 1)
+        module = importlib.import_module(module_name)
+        fn = getattr(module, attr)
+        if not callable(fn):
+            raise TypeError(f"Verifier {path} is not callable")
+        return fn  # type: ignore[return-value]
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:  # pragma: no cover - integration tested
+        sink_topic = self._cfg.sink or f"signatures.{self._cfg.name}"
+        weights_total = sum(weight for _, weight, _ in self._verifiers) or 1.0
+        while not self._stop_event.is_set():
+            activity = False
+            for source, queue in self._queues.items():
+                if self._stop_event.is_set():
+                    break
+                try:
+                    payload = queue.get(timeout=0.2)
+                except Empty:
+                    continue
+                activity = True
+                event: Dict[str, Any] = {
+                    'signature': self._cfg.name,
+                    'source': source,
+                    'payload': payload,
+                    'ts': time.time(),
+                }
+                scores: Dict[str, float] = {}
+                reward = 0.0
+                for name, weight, verifier in self._verifiers:
+                    try:
+                        score = float(verifier(event))
+                    except Exception:
+                        score = 0.0
+                    scores[name] = score
+                    reward += score * weight
+                reward = reward / weights_total
+                event['verifier_scores'] = scores
+                event['reward'] = reward
+                self._bus.publish(sink_topic, event)
+                learning_event = {
+                    'tool': self._cfg.name,
+                    'signature': self._cfg.name,
+                    'reward': reward,
+                    'verifier_scores': scores,
+                    'ts': time.time(),
+                }
+                self._bus.publish(self._reward_topic, learning_event)
+            if not activity:
+                self._stop_event.wait(0.2)
 
 
 class StreamAutoLearner(threading.Thread):
@@ -1043,6 +1165,16 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
         except Exception as exc:
             print(f"Warning: vectorization pipeline unavailable: {exc}")
 
+    signature_managers: List[SignatureStreamManager] = []
+    for sig_cfg in getattr(cfg, 'signature_streams', []) or []:
+        try:
+            mgr = SignatureStreamManager(bus, sig_cfg)
+            mgr.start()
+            signature_managers.append(mgr)
+            threads.append(mgr)
+        except Exception as exc:
+            print(f"Warning: signature stream {sig_cfg.name} unavailable: {exc}")
+
     # Attach streaming health monitors for Kafka and Spark when available
     try:
         from .vectorized_pipeline import KafkaStreamInspector, SparkCheckpointMonitor
@@ -1084,7 +1216,7 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
             hp.start(); threads.append(hp)
     except Exception:
         pass
-    return threads, bus
+        return threads, bus
 
 
 # -----------------
@@ -2127,9 +2259,9 @@ class StreamingRuntime:
 
 __all__ = [
     # Config
-    'DEFAULT_CONFIG_PATH','TRAINER_SETTINGS_PATH','KafkaTopic','KafkaConfig','SparkConfig','K8sConfig','ContainerTopic','StreamConfig','load_config','save_config','render_kafka_topic_commands',
+    'DEFAULT_CONFIG_PATH','TRAINER_SETTINGS_PATH','KafkaTopic','KafkaConfig','SparkConfig','K8sConfig','ContainerTopic','SignatureVerifierConfig','SignatureStream','StreamConfig','load_config','save_config','render_kafka_topic_commands',
     # Runtime
-    'LocalBus','StreamingRuntime','Discovered','autodiscover_logs','FileTailer','DockerTailer','Aggregator','Worker','Trainer','start_local_stack','process_ctx','make_context_example',
+    'LocalBus','StreamingRuntime','Discovered','autodiscover_logs','FileTailer','DockerTailer','Aggregator','Worker','Trainer','SignatureStreamManager','start_local_stack','process_ctx','make_context_example',
     # Kafka
     'KafkaParams','WorkerLoop',
 ]

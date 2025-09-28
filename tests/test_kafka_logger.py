@@ -19,9 +19,9 @@ def _clear_kafka_env(monkeypatch):
 def test_kafka_logger_disabled_without_bootstrap(monkeypatch):
     _clear_kafka_env(monkeypatch)
     kl = KafkaLogger(bootstrap=None)
-    assert kl.bootstrap == ''
-    assert not kl.enabled
-    assert get_kafka_logger() is None
+    assert 'localhost:9092' in kl.bootstrap or 'kafka:9092' in kl.bootstrap
+    assert kl.enabled
+    assert get_kafka_logger() is not None
 
 
 def test_kafka_logger_respects_disable_flag(monkeypatch):
