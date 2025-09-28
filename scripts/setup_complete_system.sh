@@ -188,7 +188,7 @@ METRICS_ENABLED=true
 REDIS_URL=redis://redis:6379
 KAFKA_BROKERS=kafka:9092
 REDDB_URL=http://reddb:8000
-INFERMESH_URL=http://infermesh:9000
+INFERMESH_URL=http://infermesh-router:9000
 EOF
 
     log_success "Environment configuration created"
@@ -408,6 +408,8 @@ This is the complete DSPy Agent system with Go/Rust/Slurm integration.
 - **Dashboard**: http://localhost:8080
 - **Orchestrator API**: http://localhost:9097
 - **Env-Runner API**: http://localhost:8080
+- **InferMesh Gateway**: http://localhost:19000
+- **Redis Cache**: http://localhost:6379
 - **Metrics**: http://localhost:9097/metrics
 - **Queue Status**: http://localhost:9097/queue/status
 
@@ -425,6 +427,13 @@ curl -X POST http://localhost:9097/queue/submit \
 curl -X POST http://localhost:9097/queue/submit \
   -H 'Content-Type: application/json' \
   -d '{"id":"slurm_001","class":"gpu_slurm","payload":{"method":"grpo"}}'
+```
+
+### Test InferMesh embedding:
+```bash
+curl -X POST http://localhost:19000/embed \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "BAAI/bge-small-en-v1.5", "inputs": ["test embedding"]}'
 ```
 
 ### Check job status:

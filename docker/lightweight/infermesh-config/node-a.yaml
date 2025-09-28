@@ -1,0 +1,110 @@
+node:
+  id: node-a
+  roles:
+    - Gpu
+  zone: null
+  labels: {}
+  mock: false
+runtime:
+  runtime_type: mock
+  config: {}
+  model_repository: null
+  max_concurrent_requests: 128
+  request_timeout_seconds: 30
+  enable_control: true
+network:
+  bind_ip: 0.0.0.0
+  grpc_port: 50051
+  metrics_port: 9090
+  tls_enabled: false
+  tls_cert_file: null
+  tls_key_file: null
+  tls_ca_file: null
+  connection_timeout_seconds: 10
+  keepalive_interval_seconds: 30
+observability:
+  metrics_enabled: true
+  tracing_enabled: false
+  otlp_endpoint: null
+  log_level: info
+  log_format: text
+  metrics_interval_seconds: 5
+gossip:
+  port: 7946
+  seeds:
+    - infermesh-node-b:7946
+  gossip_interval_ms: 200
+  probe_timeout_ms: 500
+  probe_indirect_count: 3
+  suspicion_timeout_ms: 1000
+raft:
+  data_dir: /app/data/raft
+  election_timeout_ms: 1000
+  heartbeat_interval_ms: 100
+  max_append_entries: 100
+  snapshot_threshold: 1000
+  enabled: false
+agent:
+  name: mesh-agent
+  data_dir: /app/data
+  pid_file: /app/data/meshd.pid
+  daemon: false
+  shutdown_timeout_seconds: 30
+  health_check:
+    enabled: true
+    interval_seconds: 30
+    timeout_seconds: 5
+    failure_threshold: 3
+logging:
+  level: info
+  format: text
+  show_target: true
+  show_thread_ids: false
+  show_line_numbers: false
+  file: null
+  rotation:
+    enabled: false
+    max_size_mb: 100
+    max_files: 10
+services:
+  control_plane:
+    enabled: true
+    bind_addr: 0.0.0.0:50051
+    config: {}
+  state_plane:
+    enabled: true
+    bind_addr: 0.0.0.0:50052
+    config: {}
+  scoring:
+    enabled: true
+    bind_addr: 0.0.0.0:50053
+    config: {}
+  metrics:
+    enabled: true
+    bind_addr: 0.0.0.0:9090
+    prometheus:
+      enabled: true
+      collection_interval_seconds: 15
+      global_labels:
+        service: infermesh
+        node: node-a
+  adapters:
+    runtime:
+      enabled: false
+      vllm: null
+      triton: null
+      tgi: null
+      health_check_interval_seconds: 30
+      metrics_collection_interval_seconds: 15
+    gpu:
+      enabled: false
+      nvml: null
+      dcgm: null
+      rocm: null
+      health_check_interval_seconds: 30
+      metrics_collection_interval_seconds: 15
+    telemetry:
+      enabled: false
+      buffer_size: 1000
+      flush_interval_seconds: 5
+      max_batch_size: 100

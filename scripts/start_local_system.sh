@@ -88,17 +88,47 @@ start_reddb() {
   fi
 }
 
-# Start InferMesh if available
+# Start InferMesh stack if available
 start_infermesh() {
-  if [ -f "$ROOT_DIR/scripts/start_infermesh.sh" ]; then
-    if ! pgrep -f "infermesh" >/dev/null 2>&1; then
-      echo "[start] infermesh"
-      (cd "$ROOT_DIR" && nohup bash scripts/start_infermesh.sh >/dev/null 2>&1 & echo $! > "$PIDS_DIR/infermesh.pid") || true
+  if command -v docker >/dev/null 2>&1 && command -v docker-compose >/dev/null 2>&1; then
+    if [ -f "$ROOT_DIR/docker/lightweight/docker-compose.yml" ]; then
+      echo "[start] infermesh stack (redis + embedder + dual nodes + router)"
+      cd "$ROOT_DIR/docker/lightweight"
+      
+      # Start Redis first
+      if ! docker compose ps redis | grep -q "Up"; then
+        echo "[start] starting redis cache..."
+        docker compose up -d redis
+        sleep 2
+      fi
+      
+      # Start DSPy embedder
+      if ! docker compose ps dspy-embedder | grep -q "Up"; then
+        echo "[start] starting DSPy embedder..."
+        docker compose up -d dspy-embedder
+        sleep 4
+      fi
+
+      # Start InferMesh nodes
+      if ! docker compose ps infermesh-node-a | grep -q "Up"; then
+        echo "[start] starting infermesh nodes..."
+        docker compose up -d infermesh-node-a infermesh-node-b
+        sleep 5
+      fi
+      
+      # Start official router
+      if ! docker compose ps infermesh-router | grep -q "Up"; then
+        echo "[start] starting infermesh router..."
+        docker compose up -d infermesh-router
+        sleep 4
+      fi
+      
+      echo "[start] infermesh stack started"
     else
-      echo "[start] infermesh already running"
+      echo "[warn] docker-compose.yml not found; InferMesh will be skipped"
     fi
   else
-    echo "[warn] infermesh not found; InferMesh will be skipped"
+    echo "[warn] docker/docker-compose not found; InferMesh will be skipped"
   fi
 }
 
@@ -215,6 +245,44 @@ check_health() {
     services+=("❌ dashboard (not running)")
   fi
   
+  # Check InferMesh stack
+  if command -v docker >/dev/null 2>&1; then
+    cd "$ROOT_DIR/docker/lightweight"
+    if docker compose ps dspy-embedder | grep -q "Up"; then
+      if curl -s http://localhost:18082/health >/dev/null 2>&1; then
+        services+=("✅ dspy-embedder (http://localhost:18082)")
+      else
+        services+=("⚠️  dspy-embedder (starting...)")
+      fi
+    else
+      services+=("❌ dspy-embedder (not running)")
+    fi
+
+    if docker compose ps infermesh-router | grep -q "Up"; then
+      if curl -s http://localhost:19000/health >/dev/null 2>&1; then
+        services+=("✅ infermesh-router (http://localhost:19000)")
+      else
+        services+=("⚠️  infermesh-router (starting...)")
+      fi
+    else
+      services+=("❌ infermesh-router (not running)")
+    fi
+
+    if docker compose ps redis | grep -q "Up"; then
+      services+=("✅ redis-cache (http://localhost:6379)")
+    else
+      services+=("❌ redis-cache (not running)")
+    fi
+    
+    if docker compose ps infermesh-node-a | grep -q "Up" && docker compose ps infermesh-node-b | grep -q "Up"; then
+      services+=("✅ infermesh-nodes (node-a, node-b)")
+    else
+      services+=("❌ infermesh-nodes (not running)")
+    fi
+  else
+    services+=("❌ infermesh-stack (docker not available)")
+  fi
+  
   echo ""
   echo "=== Service Status ==="
   for service in "${services[@]}"; do
@@ -231,8 +299,15 @@ echo "=== Quick Start Guide ==="
 echo "1. Dashboard: http://localhost:8080"
 echo "2. Orchestrator API: http://localhost:9097"
 echo "3. Env-Runner API: http://localhost:8080"
-echo "4. Metrics: http://localhost:9097/metrics"
-echo "5. Queue Status: http://localhost:9097/queue/status"
+echo "4. InferMesh Gateway: http://localhost:19000"
+echo "5. Redis Cache: http://localhost:6379"
+echo "6. Metrics: http://localhost:9097/metrics"
+echo "7. Queue Status: http://localhost:9097/queue/status"
+echo ""
+echo "=== Test InferMesh Embedding ==="
+echo "curl -X POST http://localhost:19000/embed \\"
+echo "  -H 'Content-Type: application/json' \\"
+echo "  -d '{\"model\": \"BAAI/bge-small-en-v1.5\", \"inputs\": [\"test embedding\"]}'"
 echo ""
 echo "=== Submit a Test Job ==="
 echo "curl -X POST http://localhost:9097/queue/submit \\"
@@ -243,4 +318,9 @@ echo "=== Submit a Slurm Job ==="
 echo "curl -X POST http://localhost:9097/queue/submit \\"
 echo "  -H 'Content-Type: application/json' \\"
 echo "  -d '{\"id\":\"slurm_001\",\"class\":\"gpu_slurm\",\"payload\":{\"method\":\"grpo\"}}'"
+echo ""
+echo "=== InferMesh Management ==="
+echo "View logs: docker compose -f docker/lightweight/docker-compose.yml logs -f"
+echo "Stop stack: docker compose -f docker/lightweight/docker-compose.yml down"
+echo "Restart: docker compose -f docker/lightweight/docker-compose.yml restart"
 echo ""

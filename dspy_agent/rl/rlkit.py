@@ -23,54 +23,6 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Proto
 
 logger = logging.getLogger(__name__)
 
-# Avoid importing optional native deps at module import time; default to fallback
-PUFFERLIB_AVAILABLE = False
-from .fallback_rl import (
-    get_fallback_trainer,
-    train_fallback_rl,
-    select_fallback_action,
-    get_fallback_stats,
-)
-
-
-# ----------------
-# RL Environment
-# ----------------
-
-def train_rl_with_fallback(state: Dict[str, Any], action: str, reward: float, 
-                          next_state: Dict[str, Any], done: bool = False) -> Dict[str, Any]:
-    """Train RL system with fallback support."""
-    if PUFFERLIB_AVAILABLE:
-        # Use full PufferLib RL system
-        # TODO: Implement PufferLib training
-        return {"status": "pufferlib_training", "reward": reward}
-    else:
-        # Use fallback RL system
-        return train_fallback_rl(state, action, reward, next_state, done)
-
-
-def select_rl_action_with_fallback(state: Dict[str, Any], available_actions: List[str]) -> str:
-    """Select RL action with fallback support."""
-    if PUFFERLIB_AVAILABLE:
-        # Use full PufferLib RL system
-        # TODO: Implement PufferLib action selection
-        return random.choice(available_actions) if available_actions else "plan"
-    else:
-        # Use fallback RL system
-        return select_fallback_action(state, available_actions)
-
-
-def get_rl_stats_with_fallback() -> Dict[str, Any]:
-    """Get RL statistics with fallback support."""
-    if PUFFERLIB_AVAILABLE:
-        # Use full PufferLib RL system
-        return {"status": "pufferlib", "available": True}
-    else:
-        # Use fallback RL system
-        stats = get_fallback_stats()
-        stats["status"] = "fallback"
-        stats["available"] = True
-        return stats
 
 class ToolAction(IntEnum):
     RUN_TESTS = 0

@@ -2146,7 +2146,7 @@ def learn(
 
 @app.command()
 def spark_script(
-    out: Path = typer.Option(Path("scripts/streaming/spark_logs.py"), '--out', help="Path to write PySpark job"),
+    out: Path = typer.Option(Path("dspy_agent/streaming/spark_logs.py"), '--out', help="Path to write PySpark job"),
 ):
     out.parent.mkdir(parents=True, exist_ok=True)
     code = '''#!/usr/bin/env python3
@@ -2226,7 +2226,7 @@ if __name__ == '__main__':
 '''
     out.write_text(code)
     console.print(Panel.fit(f"Wrote PySpark job to {out}", title="spark", border_style="accent"))
-    console.print(Panel.fit("Example: spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 scripts/streaming/spark_logs.py --bootstrap localhost:9092 --pattern 'logs.raw.*' --window '30 seconds' --slide '15 seconds' --watermark '2 minutes'", title="run", border_style="dim"))
+    console.print(Panel.fit("Example: spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 dspy_agent/streaming/spark_logs.py --bootstrap localhost:9092 --pattern 'logs.raw.*' --window '30 seconds' --slide '15 seconds' --watermark '2 minutes'", title="run", border_style="dim"))
 
 
 @app.command()

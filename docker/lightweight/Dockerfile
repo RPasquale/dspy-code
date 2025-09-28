@@ -116,6 +116,7 @@ RUN chmod +x /entrypoints/*.sh
 
 COPY pyproject.toml README.md /app/
 COPY dspy_agent /app/dspy_agent
+COPY scripts /app/scripts
 
 RUN pip install --no-cache-dir uv && \
     uv pip install --system . && \

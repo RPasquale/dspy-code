@@ -3,8 +3,8 @@ services:
       image: dspy-lightweight:latest
       user: "10001:10001"
       build:
-        context: .
-        dockerfile: Dockerfile
+        context: ../..
+        dockerfile: docker/lightweight/Dockerfile
       environment:
         - LOCAL_MODE=false
         - USE_OLLAMA=true
@@ -150,6 +150,29 @@ services:
             memory: 1G
             cpus: '1.0'
 
+    redis:
+      image: redis:7-alpine
+      command: ["redis-server","--save","","--appendonly","no"]
+      ports:
+        - "127.0.0.1:6379:6379"
+      volumes:
+        - redis-data:/data
+      healthcheck:
+        test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 5s
+      restart: unless-stopped
+      deploy:
+        resources:
+          limits:
+            memory: 2G
+            cpus: '1.0'
+          reservations:
+            memory: 512M
+            cpus: '0.5'
+
     reddb:
       image: dspy-lightweight:latest
       container_name: reddb
@@ -218,24 +241,85 @@ services:
       cap_drop:
         - ALL
 
-    infermesh:
-      image: ghcr.io/rpasquale/infermesh:cpu-local
-      build:
-        context: .
-        dockerfile: infermesh_cpu.Dockerfile
+    dspy-embedder:
+      image: dspy-lightweight:latest
+      entrypoint: ["uvicorn", "dspy_agent.embedding.dspy_embedder_service:app", "--host", "0.0.0.0", "--port", "8080"]
       environment:
-        - MODEL_ID=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
+        - DSPY_EMBED_MODEL=${DSPY_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+        - DSPY_EMBED_NORMALIZE=${DSPY_EMBED_NORMALIZE:-0}
+        - DSPY_GEPA_DATASET=${DSPY_GEPA_DATASET:-}
+        - DSPY_GEPA_AUTO=${DSPY_GEPA_AUTO:-light}
+        - DSPY_GEPA_LOG_DIR=${DSPY_GEPA_LOG_DIR:-}
+        - DSPY_LM_MODEL=${DSPY_LM_MODEL:-}
+        - DSPY_LM_PROVIDER=${DSPY_LM_PROVIDER:-openai}
+        - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+        - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      volumes:
+        - ${WORKSPACE_DIR}:/workspace
+      ports:
+        - "127.0.0.1:18082:8080"
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+
+    infermesh-node-a:
+      image: official-infermesh:latest
+      entrypoint: ["/usr/local/bin/meshd", "start", "--config", "/config/node-a.yaml"]
+      volumes:
+        - ./infermesh-config/node-a.yaml:/config/node-a.yaml:ro
+        - infermesh-node-a-data:/app/data
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+
+    infermesh-node-b:
+      image: official-infermesh:latest
+      entrypoint: ["/usr/local/bin/meshd", "start", "--config", "/config/node-b.yaml"]
+      volumes:
+        - ./infermesh-config/node-b.yaml:/config/node-b.yaml:ro
+        - infermesh-node-b-data:/app/data
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+        interval: 15s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+
+    infermesh-router:
+      image: official-infermesh:latest
+      entrypoint: ["/entrypoints/run_official_router.sh"]
+      environment:
+        - AGENT_SERVICE=infermesh-node-a:50051
+        - ROUTER_HTTP_PORT=9000
+        - ROUTER_GRPC_PORT=9100
+        - ROUTER_MAX_REQUESTS=512
+        - ROUTER_REQUEST_TIMEOUT=30
+        - DSPY_EMBEDDER_URL=http://dspy-embedder:8080/embed
+      volumes:
+        - ./entrypoints:/entrypoints:ro
+      depends_on:
+        infermesh-node-a:
+          condition: service_healthy
+        dspy-embedder:
+          condition: service_healthy
       ports:
         - "127.0.0.1:${INFERMESH_HOST_PORT:-19000}:9000"
-      restart: unless-stopped
-      volumes:
-        - hf-cache:/root/.cache/huggingface
       healthcheck:
-        test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:9000/health')\" >/dev/null 2>&1 || exit 1"]
-        interval: 10s
-        timeout: 3s
+        test: ["CMD-SHELL", "curl -sf http://localhost:9000/health || exit 1"]
+        interval: 15s
+        timeout: 5s
         retries: 10
-        start_period: 5s
+        start_period: 10s
+      restart: unless-stopped
 
     # Dedicated dashboard service (serves enhanced_dashboard_server on port 8081)
     dashboard:
@@ -268,7 +352,7 @@ services:
       depends_on:
         kafka:
           condition: service_healthy
-        infermesh:
+        infermesh-router:
           condition: service_started
       environment:
         - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -276,13 +360,15 @@ services:
         - EMBED_OUTPUT_TOPIC=embeddings
         - EMBED_GROUP=embed-worker
         - EMBED_BACKEND=infermesh
-        - INFERMESH_URL=http://infermesh:9000
+        - INFERMESH_URL=http://infermesh-router:9000
         - EMBED_MODEL=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
         - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-64}
         - EMBED_MAX_WAIT_SEC=${EMBED_MAX_WAIT_SEC:-0.5}
         - EMBED_WRITE_PARQUET=1
         - EMBED_NORMALIZE=${EMBED_NORMALIZE:-0}
         - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings_imesh
+        - INFERMESH_ROUTING_STRATEGY=${INFERMESH_ROUTING_STRATEGY:-hybrid}
+        - INFERMESH_CACHE_TTL=${INFERMESH_CACHE_TTL:-300}
         - REDDB_URL
         - REDDB_NAMESPACE=dspy
         - REDDB_TOKEN
@@ -291,7 +377,7 @@ services:
         - EMBED_METRICS_PORT=9100
       volumes:
         - ${WORKSPACE_DIR}:/workspace
-        - ./scripts:/app/scripts:ro
+        - ./dspy_agent/streaming:/app/dspy_agent/streaming:ro
         - ./entrypoints:/entrypoints:ro
         - hf-cache:/root/.cache/huggingface
       entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_embed_worker.sh"]
@@ -328,7 +414,7 @@ services:
         - SPARK_CONF_DIR=/opt/bitnami/spark/conf
       volumes:
         - ${WORKSPACE_DIR}:/workspace
-        - ./scripts:/app/scripts:ro
+        - ./dspy_agent/streaming:/app/dspy_agent/streaming:ro
         - ./entrypoints:/entrypoints:ro
       entrypoint: ["/entrypoints/run_spark.sh"]
       healthcheck:
@@ -558,7 +644,7 @@ services:
         - REDDB_INDEX_STREAM=emb_index
       volumes:
         - ${WORKSPACE_DIR}:/workspace
-        - ./scripts:/app/scripts:ro
+        - ./dspy_agent/streaming:/app/dspy_agent/streaming:ro
         - ./entrypoints:/entrypoints:ro
       entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_emb_indexer.sh"]
       restart: unless-stopped
@@ -594,7 +680,7 @@ services:
         - SPARK_STARTUP_DELAY=10
       volumes:
         - ${WORKSPACE_DIR}:/workspace
-        - ./scripts:/app/scripts:ro
+        - ./dspy_agent/streaming:/app/dspy_agent/streaming:ro
         - ./entrypoints:/entrypoints:ro
       entrypoint: ["/bin/bash", "-lc", "source /entrypoints/run_spark_vectorizer.sh"]
       ports:
@@ -635,7 +721,6 @@ services:
         - SLEEP_SEC=6
       volumes:
         - ${WORKSPACE_DIR}:/workspace
-        - ./scripts:/app/scripts:ro
         - ./entrypoints:/entrypoints:ro
       entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_smoke.sh"]
       restart: "no"
@@ -715,11 +800,11 @@ services:
     go-orchestrator:
       image: dspy-lightweight:latest
       build:
-        context: .
-        dockerfile: Dockerfile
+        context: ../..
+        dockerfile: docker/lightweight/Dockerfile
       environment:
         - ORCHESTRATOR_PORT=9097
-        - INFERMESH_BASE_URL=http://infermesh:9000
+        - INFERMESH_BASE_URL=http://infermesh-router:9000
         - INFERMESH_API_KEY=${INFERMESH_API_KEY:-}
         - INFERMESH_MODEL=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
         - REDIS_URL=redis://redis:6379
@@ -733,7 +818,7 @@ services:
         - ./logs:/app/logs
       depends_on:
         - redis
-        - infermesh
+        - infermesh-router
       restart: unless-stopped
       healthcheck:
         test: ["CMD-SHELL", "curl -f http://localhost:9097/metrics || exit 1"]
@@ -754,10 +839,10 @@ services:
     rust-env-runner:
       image: dspy-lightweight:latest
       build:
-        context: .
-        dockerfile: Dockerfile
+        context: ../..
+        dockerfile: docker/lightweight/Dockerfile
       environment:
-        - INFERMESH_BASE_URL=http://infermesh:9000
+        - INFERMESH_BASE_URL=http://infermesh-router:9000
         - INFERMESH_API_KEY=${INFERMESH_API_KEY:-}
         - INFERMESH_MODEL=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
         - MAX_CONCURRENT_REQUESTS=100
@@ -773,7 +858,7 @@ services:
         - ./logs:/app/logs
       depends_on:
         - redis
-        - infermesh
+        - infermesh-router
         - go-orchestrator
       restart: unless-stopped
       healthcheck:
@@ -791,28 +876,6 @@ services:
             memory: 1G
             cpus: '1.0'
 
-    # Redis Service
-    redis:
-      image: redis:7-alpine
-      ports:
-        - "127.0.0.1:6379:6379"
-      volumes:
-        - redis-data:/data
-      restart: unless-stopped
-      healthcheck:
-        test: ["CMD", "redis-cli", "ping"]
-        interval: 10s
-        timeout: 3s
-        retries: 5
-        start_period: 5s
-      deploy:
-        resources:
-          limits:
-            memory: 2G
-            cpus: '1.0'
-          reservations:
-            memory: 512M
-            cpus: '0.5'
 
 volumes:
   ollama: {}
@@ -820,4 +883,5 @@ volumes:
   hf-cache: {}
   reddb_data: {}
   redis-data: {}
-  infermesh-cache: {}
+  infermesh-node-a-data: {}
+  infermesh-node-b-data: {}

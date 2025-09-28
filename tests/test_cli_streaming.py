@@ -61,9 +61,8 @@ def test_spark_script_and_k8s_render(tmp_path: Path):
         Path(".dspy_stream.json").write_text('{"kafka": {"bootstrap_servers": "localhost:9092", "group_id": "dspy-code", "acks": "all", "topics": []}, "spark": {}, "k8s": {}, "containers": [{"container":"backend","services":["users"]}]}')
         res = runner.invoke(app, ["spark-script"])  # type: ignore
         assert res.exit_code == 0
-        assert Path("scripts/streaming/spark_logs.py").exists()
+        assert Path("dspy_agent/streaming/spark_logs.py").exists()
         res2 = runner.invoke(app, ["k8s-render"])  # type: ignore
         assert res2.exit_code == 0
         outdir = Path("deploy/k8s")
         assert any(p.name.startswith("dspy-worker-") for p in outdir.iterdir())
-

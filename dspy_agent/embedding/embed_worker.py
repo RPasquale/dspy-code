@@ -106,11 +106,69 @@ class TTLCache:
         self.store[key] = (val, time.time() + self.ttl)
 
 
-def infermesh_embed(url: str, model: str, inputs: List[str], api_key: Optional[str] = None, timeout: float = 30.0) -> List[List[float]]:
+def ensure_kafka_topics(bootstrap: str, topics: Dict[str, int], replication_factor: int = 1) -> None:
+    """Best-effort topic creation so downstream services don't require manual setup."""
+    try:
+        from kafka.admin import KafkaAdminClient, NewTopic  # type: ignore
+        from kafka.errors import TopicAlreadyExistsError  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log(f"[warn] kafka admin unavailable ({exc}); skipping topic creation")
+        return
+
+    deduped = {name: max(1, partitions) for name, partitions in topics.items() if name}
+    if not deduped:
+        return
+
+    try:
+        admin = KafkaAdminClient(bootstrap_servers=bootstrap, client_id="dspy-embed-worker-init")
+    except Exception as exc:
+        log(f"[warn] unable to initialize KafkaAdminClient: {exc}")
+        return
+
+    new_topics = [NewTopic(name=name, num_partitions=partitions, replication_factor=replication_factor) for name, partitions in deduped.items()]
+    try:
+        futures = admin.create_topics(new_topics, validate_only=False)
+    except Exception as exc:
+        log(f"[warn] create_topics failed: {exc}")
+        admin.close()
+        return
+
+    for name, future in futures.items():
+        try:
+            future.result()
+            log(f"created topic {name}")
+        except TopicAlreadyExistsError:
+            log(f"topic {name} already exists")
+        except Exception as exc:
+            log(f"topic {name} creation failed: {exc}")
+
+    admin.close()
+
+
+def infermesh_embed(
+    url: str,
+    model: str,
+    inputs: List[str],
+    api_key: Optional[str] = None,
+    *,
+    timeout: float = 30.0,
+    options: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    cache: Optional[Dict[str, Any]] = None,
+    hints: Optional[Dict[str, Any]] = None,
+) -> List[List[float]]:
     headers = {'Content-Type': 'application/json'}
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
-    payload = {'model': model, 'inputs': inputs}
+    payload: Dict[str, Any] = {'model': model, 'inputs': inputs}
+    if options:
+        payload['options'] = options
+    if metadata:
+        payload['metadata'] = metadata
+    if cache:
+        payload['cache'] = cache
+    if hints:
+        payload['hints'] = hints
     t0 = time.time()
     r = requests.post(url.rstrip('/') + '/embed', headers=headers, json=payload, timeout=timeout)
     r.raise_for_status()
@@ -123,11 +181,34 @@ def infermesh_embed(url: str, model: str, inputs: List[str], api_key: Optional[s
     return [[float(x) for x in v] for v in vecs]
 
 
-def embed_with_retries(url: str, model: str, inputs: List[str], api_key: Optional[str], *, timeout: float, retries: int, backoff: float) -> List[List[float]]:
+def embed_with_retries(
+    url: str,
+    model: str,
+    inputs: List[str],
+    api_key: Optional[str],
+    *,
+    timeout: float,
+    retries: int,
+    backoff: float,
+    options: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    cache: Optional[Dict[str, Any]] = None,
+    hints: Optional[Dict[str, Any]] = None,
+) -> List[List[float]]:
     last_err: Optional[Exception] = None
     for attempt in range(max(1, retries + 1)):
         try:
-            return infermesh_embed(url, model, inputs, api_key, timeout=timeout)
+            return infermesh_embed(
+                url,
+                model,
+                inputs,
+                api_key,
+                timeout=timeout,
+                options=options,
+                metadata=metadata,
+                cache=cache,
+                hints=hints,
+            )
         except Exception as e:
             last_err = e
             METRICS['infermesh_failures'] = METRICS.get('infermesh_failures', 0) + 1
@@ -251,6 +332,63 @@ def main():
     write_parquet = os.getenv('EMBED_WRITE_PARQUET', '0') in ('1','true','yes','on')
     parquet_dir = os.getenv('EMBED_PARQUET_DIR', '/workspace/vectorized/embeddings_imesh')
     os.makedirs(parquet_dir, exist_ok=True)
+    dlq_topic = os.getenv('EMBED_DLQ_TOPIC', '').strip()
+
+    topic_partitions = int(os.getenv('EMBED_TOPIC_PARTITIONS', '3') or '3')
+    topic_replication = int(os.getenv('EMBED_TOPIC_REPLICATION', '1') or '1')
+    topics_to_ensure = {in_topic: topic_partitions, out_topic: topic_partitions}
+    if dlq_topic:
+        dlq_partitions = int(os.getenv('EMBED_DLQ_PARTITIONS', str(topic_partitions)) or str(topic_partitions))
+        topics_to_ensure[dlq_topic] = dlq_partitions
+    ensure_kafka_topics(bootstrap, topics_to_ensure, replication_factor=topic_replication)
+
+    def _json_env(name: str) -> Optional[Dict[str, Any]]:
+        raw = os.getenv(name)
+        if not raw:
+            return None
+        try:
+            val = json.loads(raw)
+            return val if isinstance(val, dict) else None
+        except Exception:
+            return None
+
+    mesh_routing = os.getenv('INFERMESH_ROUTING_STRATEGY') or os.getenv('INFERMESH_ROUTING') or ''
+    mesh_priority = os.getenv('INFERMESH_PRIORITY') or ''
+    mesh_tenant = os.getenv('INFERMESH_TENANT') or ''
+    mesh_batch_override = os.getenv('INFERMESH_REQUEST_BATCH_SIZE') or ''
+    mesh_cache_ttl = os.getenv('INFERMESH_CACHE_TTL') or ''
+    mesh_cache_key = os.getenv('INFERMESH_CACHE_KEY') or ''
+    mesh_hints = _json_env('INFERMESH_HINTS') or {}
+    mesh_options = _json_env('INFERMESH_OPTIONS') or {}
+    mesh_metadata = _json_env('INFERMESH_METADATA') or {}
+    mesh_cache = _json_env('INFERMESH_CACHE_OPTIONS') or {}
+
+    if mesh_routing.strip():
+        mesh_options.setdefault('routing_strategy', mesh_routing.strip())
+    if mesh_priority.strip():
+        mesh_options.setdefault('priority', mesh_priority.strip())
+    if mesh_batch_override.strip():
+        try:
+            mesh_options.setdefault('batch_size', int(mesh_batch_override))
+        except Exception:
+            pass
+    if mesh_tenant.strip():
+        mesh_metadata.setdefault('tenant', mesh_tenant.strip())
+    if mesh_cache_ttl.strip():
+        try:
+            mesh_cache['ttl_seconds'] = int(mesh_cache_ttl)
+        except Exception:
+            pass
+    if mesh_cache_key.strip():
+        mesh_cache['key_template'] = mesh_cache_key.strip()
+    if not mesh_options:
+        mesh_options = None
+    if not mesh_metadata:
+        mesh_metadata = None
+    if not mesh_cache:
+        mesh_cache = None
+    if not mesh_hints:
+        mesh_hints = None
 
     # Optional RedDB upsert/append
     REDDB_URL = os.getenv('REDDB_URL', '').strip()
@@ -296,7 +434,6 @@ def main():
         bootstrap_servers=bootstrap,
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
     )
-    dlq_topic = os.getenv('EMBED_DLQ_TOPIC', '').strip()
 
     cache = TTLCache(ttl_sec=int(os.getenv('EMBED_CACHE_TTL', '300')),
                      max_items=int(os.getenv('EMBED_CACHE_MAX', '200000')))
@@ -360,13 +497,17 @@ def main():
                 vecs = local_embed(model, inputs, normalize=os.getenv('EMBED_NORMALIZE', '0').lower() in ('1','true','yes','on'))
             else:
                 vecs = embed_with_retries(
-                    mesh_url or 'http://infermesh:9000',
+                    mesh_url or 'http://infermesh-router:9000',
                     model,
                     inputs,
                     api_key,
                     timeout=float(os.getenv('INFERMESH_TIMEOUT_SEC', '30') or '30'),
                     retries=int(os.getenv('INFERMESH_RETRIES', '2') or '2'),
                     backoff=float(os.getenv('INFERMESH_BACKOFF_SEC', '0.5') or '0.5'),
+                    options=mesh_options,
+                    metadata=mesh_metadata,
+                    cache=mesh_cache,
+                    hints=mesh_hints,
                 )
             failed = []
             for idx, i in enumerate(to_query):

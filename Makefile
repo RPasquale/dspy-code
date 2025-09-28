@@ -42,6 +42,43 @@ dashboard-logs:
 dashboard-down:
 	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) stop dashboard
 
+# InferMesh stack targets
+.PHONY: infermesh-up infermesh-down infermesh-logs infermesh-ps infermesh-test infermesh-health
+
+infermesh-up: stack-env
+	@echo "[make] Starting InferMesh stack (Redis + dual nodes + router + DSPy embedder)..."
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) up -d redis dspy-embedder infermesh-node-a infermesh-node-b infermesh-router
+	@echo "[make] InferMesh stack started"
+
+infermesh-down:
+	@echo "[make] Stopping InferMesh stack..."
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) stop redis dspy-embedder infermesh-node-a infermesh-node-b infermesh-router
+
+infermesh-logs:
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) logs -f redis dspy-embedder infermesh-node-a infermesh-node-b infermesh-router
+
+infermesh-ps:
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) ps redis dspy-embedder infermesh-node-a infermesh-node-b infermesh-router
+
+infermesh-test:
+	@echo "[make] Testing InferMesh router..."
+	@curl -f http://localhost:19000/health || (echo "[error] InferMesh router health check failed" && exit 1)
+	@echo "[make] Testing InferMesh embedding endpoint..."
+	@curl -f -X POST http://localhost:19000/embed \
+		-H "Content-Type: application/json" \
+		-d '{"model": "BAAI/bge-small-en-v1.5", "inputs": ["test embedding"]}' \
+		>/dev/null || (echo "[error] InferMesh embedding test failed" && exit 1)
+	@echo "[make] InferMesh tests passed"
+
+infermesh-health:
+	@echo "[make] Checking InferMesh stack health..."
+	@echo "Redis: $$(docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) ps redis | grep -q 'Up' && echo '✅' || echo '❌')"
+	@echo "DSPy Embedder: $$(docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) ps dspy-embedder | grep -q 'Up' && echo '✅' || echo '❌')"
+	@echo "Node A: $$(docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) ps infermesh-node-a | grep -q 'Up' && echo '✅' || echo '❌')"
+	@echo "Node B: $$(docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) ps infermesh-node-b | grep -q 'Up' && echo '✅' || echo '❌')"
+	@echo "Router: $$(docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) ps infermesh-router | grep -q 'Up' && echo '✅' || echo '❌')"
+	@echo "Health endpoint: $$(curl -s http://localhost:19000/health >/dev/null && echo '✅' || echo '❌')"
+
 test-lightweight: stack-build
 	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) run --rm agent-tests
 

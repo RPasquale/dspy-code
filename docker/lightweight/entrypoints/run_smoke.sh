@@ -9,5 +9,4 @@ export EMBED_PARQUET_DIR="${EMBED_PARQUET_DIR:-/workspace/vectorized/embeddings_
 export N_MESSAGES="${N_MESSAGES:-5}"
 export SLEEP_SEC="${SLEEP_SEC:-5}"
 
-python /app/scripts/smoke_embed_pipeline.py
-
+python -m dspy_agent.embedding.smoke_embed_pipeline

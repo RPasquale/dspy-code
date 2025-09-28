@@ -244,7 +244,7 @@ def evaluate_tool_choice(
             try:
                 if _os.getenv('INFERMESH_URL'):
                     from ..embedding.infermesh import InferMeshEmbedder as _IME  # type: ignore
-                    _base = (_os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                    _base = (_os.getenv('INFERMESH_URL') or 'http://infermesh-router:9000').strip()
                     _model = (argd.get('model') or _os.getenv('EMBED_MODEL') or 'sentence-transformers/all-MiniLM-L6-v2')
                     _embedder = _IME(_base, _model, api_key=_os.getenv('INFERMESH_API_KEY'))
                 else:
@@ -405,7 +405,7 @@ def evaluate_tool_choice(
             try:
                 if _os.getenv('INFERMESH_URL'):
                     from ..embedding.infermesh import InferMeshEmbedder as _IME  # type: ignore
-                    _base = (_os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                    _base = (_os.getenv('INFERMESH_URL') or 'http://infermesh-router:9000').strip()
                     _model = (argd.get('model') or _os.getenv('EMBED_MODEL') or 'sentence-transformers/all-MiniLM-L6-v2')
                     _embedder = _IME(_base, _model, api_key=_os.getenv('INFERMESH_API_KEY'))
                 else:

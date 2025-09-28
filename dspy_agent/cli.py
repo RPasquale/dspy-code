@@ -3143,7 +3143,7 @@ def learn(
 
 @app.command()
 def spark_script(
-    out: Path = typer.Option(Path("scripts/streaming/spark_logs.py"), '--out', help="Path to write PySpark job"),
+    out: Path = typer.Option(Path("dspy_agent/streaming/spark_logs.py"), '--out', help="Path to write PySpark job"),
 ):
     out.parent.mkdir(parents=True, exist_ok=True)
     code = '''#!/usr/bin/env python3
@@ -3223,7 +3223,7 @@ if __name__ == '__main__':
 '''
     out.write_text(code)
     console.print(Panel.fit(f"Wrote PySpark job to {out}", title="spark", border_style="accent"))
-    console.print(Panel.fit("Example: spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 scripts/streaming/spark_logs.py --bootstrap localhost:9092 --pattern 'logs.raw.*' --window '30 seconds' --slide '15 seconds' --watermark '2 minutes'", title="run", border_style="dim"))
+    console.print(Panel.fit("Example: spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 dspy_agent/streaming/spark_logs.py --bootstrap localhost:9092 --pattern 'logs.raw.*' --window '30 seconds' --slide '15 seconds' --watermark '2 minutes'", title="run", border_style="dim"))
 
 
 @app.command()
@@ -7197,7 +7197,7 @@ def start_command(
             try:
                 if use_infermesh:
                     from .embedding.infermesh import InferMeshEmbedder  # type: ignore
-                    base = (args.get("url") or os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                    base = (args.get("url") or os.getenv('INFERMESH_URL') or 'http://infermesh-router:9000').strip()
                     api_key = args.get("api_key") or os.getenv('INFERMESH_API_KEY')
                     embedder = InferMeshEmbedder(base, model, api_key=api_key)
                 elif hf:
@@ -7372,7 +7372,7 @@ def start_command(
                 try:
                     if bool(args.get("infermesh", False)) or bool(os.getenv('INFERMESH_URL')):
                         from .embedding.infermesh import InferMeshEmbedder  # type: ignore
-                        base = (args.get("url") or os.getenv('INFERMESH_URL') or 'http://infermesh:9000').strip()
+                        base = (args.get("url") or os.getenv('INFERMESH_URL') or 'http://infermesh-router:9000').strip()
                         api_key = args.get("api_key") or os.getenv('INFERMESH_API_KEY')
                         embedder_obj = InferMeshEmbedder(base, model, api_key=api_key)
                         def _emb(text): return embedder_obj.embed(text)  # type: ignore

@@ -31,4 +31,4 @@ echo "[entrypoint] starting spark vectorizer with enhanced timeout configuration
 
 exec "$SPARK_HOME/bin/spark-submit" \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-  /app/scripts/streaming/spark_vectorize.py
+  /app/dspy_agent/streaming/spark_vectorize.py

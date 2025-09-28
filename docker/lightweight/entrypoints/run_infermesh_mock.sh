@@ -2,5 +2,4 @@
 set -euo pipefail
 
 echo "[entrypoint] starting infermesh mock on :9000"
-exec python /app/scripts/infermesh_mock.py
-
+exec python -m dspy_agent.embedding.infermesh_mock

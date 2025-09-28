@@ -1,0 +1,33 @@
+# InferMesh Router Configuration
+bind_address: "0.0.0.0"
+http_port: 9000
+grpc_port: 9100
+agent_address: "infermesh-node-a:50051"
+max_concurrent_requests: 512
+request_timeout: 30s
+upstream_timeout: 10s
+enable_grpc_reflection: true
+enable_websockets: true
+enable_cors: true
+enable_compression: true
+max_request_size: 10485760
+health_check:
+  enabled: true
+  path: "/health"
+  interval: 30s
+  timeout: 5s
+routing:
+  enable_scoring: true
+  fallback_round_robin: true
+  max_retries: 3
+  retry_delay: 100ms
+  load_balancing: "ScoreBased"
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    success_threshold: 3
+    timeout: 60s
+metrics:
+  enabled: true
+  path: "/metrics"
+  port: null

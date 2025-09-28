@@ -75,7 +75,7 @@ pub struct InferMeshConfig {
 impl Default for InferMeshConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://infermesh:9000".to_string(),
+            base_url: "http://infermesh-router:9000".to_string(),
             api_key: None,
             model: "BAAI/bge-small-en-v1.5".to_string(),
             max_concurrent_requests: 100,

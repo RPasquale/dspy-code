@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / 'docker' / 'lightweight' / 'scripts' / 'embed_worker.py'
+MODULE_PATH = Path(__file__).resolve().parents[1] / 'dspy_agent' / 'embedding' / 'embed_worker.py'
 
 if 'kafka' not in sys.modules:
     kafka_stub = types.ModuleType('kafka')
@@ -30,7 +30,7 @@ def test_resolve_bootstrap_alias(monkeypatch):
 
 def test_spark_resolve_bootstrap_alias(monkeypatch):
     pytest.importorskip('pyspark')
-    spark_path = Path(__file__).resolve().parents[1] / 'docker' / 'lightweight' / 'scripts' / 'streaming' / 'spark_vectorize.py'
+    spark_path = Path(__file__).resolve().parents[1] / 'dspy_agent' / 'streaming' / 'spark_vectorize.py'
     spark_spec = importlib.util.spec_from_file_location('spark_vectorize_module', spark_path)
     spark_module = importlib.util.module_from_spec(spark_spec)  # type: ignore[arg-type]
     assert spark_spec is not None and spark_spec.loader is not None
@@ -85,3 +85,27 @@ def test_cache_put_and_flush_logic(monkeypatch, inputs, expected):
     assert cache.get(key) == inputs[0]['vector']
     if inputs[0]['vector']:
         assert len(inputs[0]['vector']) == dim
+
+
+def test_ensure_kafka_topics_handles_admin_failure(monkeypatch):
+    import types
+    from dspy_agent.embedding import embed_worker
+
+    class FailingAdmin:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("no broker")
+
+    class DummyNewTopic:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    dummy_admin_module = types.SimpleNamespace(
+        KafkaAdminClient=FailingAdmin,
+        NewTopic=DummyNewTopic,
+    )
+    dummy_errors_module = types.SimpleNamespace(TopicAlreadyExistsError=RuntimeError)
+
+    monkeypatch.setitem(sys.modules, 'kafka.admin', dummy_admin_module)
+    monkeypatch.setitem(sys.modules, 'kafka.errors', dummy_errors_module)
+
+    embed_worker.ensure_kafka_topics('localhost:9092', {'agent.results': 1})
