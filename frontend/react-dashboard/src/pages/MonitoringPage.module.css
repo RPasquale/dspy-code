@@ -1,0 +1,205 @@
+.wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.headerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.headerRow h1 {
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.headerRow p {
+  margin-top: 6px;
+  color: rgba(148, 163, 184, 0.8);
+}
+
+.restartButton {
+  padding: 10px 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  background: rgba(59, 130, 246, 0.15);
+  color: #bfdbfe;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.restartButton:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.25);
+  border-color: rgba(96, 165, 250, 0.6);
+}
+
+.restartButton:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.layoutGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 24px;
+}
+
+.statusList {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.statusRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: rgba(15, 23, 42, 0.35);
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.muted {
+  color: rgba(148, 163, 184, 0.6);
+  font-size: 0.85rem;
+}
+
+.metricsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.metricCard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.38);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.metricLabel {
+  font-size: 0.8rem;
+  color: rgba(148, 163, 184, 0.75);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.metricValue {
+  font-size: 1.2rem;
+}
+
+.actionBar {
+  display: flex;
+  gap: 8px;
+}
+
+.secondaryButton {
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  background: rgba(15, 23, 42, 0.3);
+  color: rgba(226, 232, 240, 0.86);
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.secondaryButton:hover {
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.logViewer {
+  max-height: 320px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  background: rgba(2, 6, 23, 0.9);
+  color: #7dd3fc;
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(15, 118, 110, 0.35);
+  overflow: auto;
+}
+
+.commandForm {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.commandInput {
+  flex: 1;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 23, 42, 0.5);
+  color: rgba(226, 232, 240, 0.95);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+.commandInput::placeholder {
+  color: rgba(148, 163, 184, 0.55);
+}
+
+.primaryButton {
+  padding: 12px 20px;
+  border-radius: 12px;
+  border: none;
+  background: linear-gradient(135deg, #22d3ee, #6366f1);
+  color: #04121f;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
+
+.primaryButton:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.primaryButton:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.commandResult {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(15, 23, 42, 0.35);
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  padding: 14px;
+}
+
+.commandOutput {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  color: rgba(148, 163, 184, 0.9);
+  max-height: 180px;
+  overflow: auto;
+}
+
+@media (max-width: 768px) {
+  .headerRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .commandForm {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .actionBar {
+    flex-wrap: wrap;
+  }
+}

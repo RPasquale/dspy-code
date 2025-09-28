@@ -49,7 +49,6 @@ def extract_key_events(text: str, max_lines: int = 120) -> str:
     # Noise filters: drop extremely spammy warnings
     noise = re.compile(
         r"dspy\.adapters\.json_adapter.*structured output format|json_adapter: Failed to use structured|"
-
         r"litellm\.Timeout: Connection timed out after 600\.0 seconds|litellm\.exceptions\.Timeout:.*Connection timed out after 600\.0 seconds|httpcore\.ReadTimeout",
         re.IGNORECASE,
     )

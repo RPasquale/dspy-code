@@ -35,6 +35,42 @@ import threading
 import signal
 from typing import List, Dict, Any, Optional
 
+
+def log(msg: str) -> None:
+    print(f"[embed-worker] {msg}", flush=True)
+
+
+def _resolve_bootstrap(raw: str) -> str:
+    alias = os.getenv('DSPY_KAFKA_LOCAL_ALIAS', 'kafka')
+    hosts = []
+    for token in (raw or '').split(','):
+        token = token.strip()
+        if not token:
+            continue
+        scheme = ''
+        rest = token
+        if '://' in token:
+            scheme, rest = token.split('://', 1)
+        host = rest
+        port = ''
+        if rest.startswith('[') and ']' in rest:
+            bracket, after = rest.split(']', 1)
+            host = bracket[1:]
+            if after.startswith(':'):
+                port = after[1:]
+        elif rest.count(':') == 1:
+            host, port = rest.split(':', 1)
+        local_hosts = {'localhost', '127.0.0.1', '0.0.0.0'}
+        if host in local_hosts and alias:
+            host = alias
+        rebuilt = host
+        if port:
+            rebuilt = f"{host}:{port}"
+        if scheme:
+            rebuilt = f"{scheme}://{rebuilt}"
+        hosts.append(rebuilt)
+    return ','.join(hosts) if hosts else raw
+
 from kafka import KafkaConsumer, KafkaProducer
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -166,14 +202,43 @@ def start_metrics_server(port: int = 9100):
         def log_message(self, format, *args):  # type: ignore[override]
             return  # quiet
 
-    srv = HTTPServer(('0.0.0.0', port), Handler)
-    t = threading.Thread(target=srv.serve_forever, name='metrics-http', daemon=True)
-    t.start()
-    return srv
+    candidates = []
+    if port >= 0:
+        candidates.append(port)
+    extra = os.getenv('EMBED_METRICS_FALLBACK_PORTS', '')
+    for token in extra.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            candidates.append(int(token))
+        except ValueError:
+            continue
+    if os.getenv('EMBED_METRICS_ALLOW_RANDOM', '1').lower() in {'1', 'true', 'yes', 'on'}:
+        candidates.append(0)
+
+    last_err: Optional[Exception] = None
+    for candidate in candidates:
+        try:
+            srv = HTTPServer(('0.0.0.0', candidate), Handler)
+            actual = srv.server_address[1]
+            log(f"metrics server listening on :{actual}")
+            t = threading.Thread(target=srv.serve_forever, name='metrics-http', daemon=True)
+            t.start()
+            return srv
+        except OSError as exc:
+            last_err = exc
+            log(f"metrics server failed on port {candidate}: {exc}")
+            continue
+
+    if last_err:
+        log(f"metrics server disabled: {last_err}")
+    return None
 
 
 def main():
-    bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS', os.getenv('KAFKA_BOOTSTRAP', 'kafka:9092'))
+    bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS') or os.getenv('KAFKA_BOOTSTRAP') or 'kafka:9092'
+    bootstrap = _resolve_bootstrap(bootstrap)
     in_topic = os.getenv('EMBED_INPUT_TOPIC', 'embedding_input')
     out_topic = os.getenv('EMBED_OUTPUT_TOPIC', 'embeddings')
     group = os.getenv('EMBED_GROUP', 'embed-worker')
@@ -216,6 +281,8 @@ def main():
             session.put(url, headers=reddb_headers(), data=json.dumps(value), timeout=3)
         except Exception:
             pass
+
+    log(f"starting embed-worker: bootstrap={bootstrap} input={in_topic} output={out_topic} backend={backend}")
 
     consumer = KafkaConsumer(
         in_topic,
@@ -337,6 +404,7 @@ def main():
             out_records.append(out)
             producer.send(out_topic, out)
         producer.flush()
+        log(f"flushed {len(out_records)} embeddings")
 
         # DLQ handling for failed embeddings (empty vectors)
         if dlq_topic or REDDB_URL:
@@ -401,27 +469,49 @@ def main():
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    for msg in consumer:
-        if stop:
-            break
-        val = msg.value
-        # Expect JSON with 'text', optionally 'topic', 'kafka_ts', 'doc_id'
-        text = val.get('text') if isinstance(val, dict) else None
-        if isinstance(text, str) and text.strip():
-            # derive doc_id if upstream provided different keys
-            doc_id = None
-            if isinstance(val, dict):
-                for k in ('doc_id', 'id', 'document_id', 'key'):
-                    if isinstance(val.get(k), str) and val.get(k).strip():
-                        doc_id = val.get(k).strip()
+    poll_ms = max(50, int(float(os.getenv('EMBED_POLL_TIMEOUT_SEC', '0.2')) * 1000))
+    try:
+        while not stop:
+            records = consumer.poll(timeout_ms=poll_ms)
+            if records:
+                for _tp, messages in records.items():
+                    for msg in messages:
+                        if stop:
+                            break
+                        val = msg.value
+                        text = val.get('text') if isinstance(val, dict) else None
+                        if isinstance(text, str) and text.strip():
+                            doc_id = None
+                            if isinstance(val, dict):
+                                for k in ('doc_id', 'id', 'document_id', 'key'):
+                                    if isinstance(val.get(k), str) and val.get(k).strip():
+                                        doc_id = val.get(k).strip()
+                                        break
+                            if not doc_id:
+                                doc_id = hashlib.sha256(text.encode('utf-8')).hexdigest()
+                            batch.append({'text': text, 'doc_id': doc_id, 'topic': val.get('topic'), 'kafka_ts': val.get('kafka_ts')})
+                            METRICS['records_in'] += 1
+                        if len(batch) >= batch_size or (time.time() - last_flush) >= max_wait:
+                            flush()
+                    if stop:
                         break
-            if not doc_id:
-                # fallback to text hash
-                doc_id = hashlib.sha256(text.encode('utf-8')).hexdigest()
-            batch.append({'text': text, 'doc_id': doc_id, 'topic': val.get('topic'), 'kafka_ts': val.get('kafka_ts')})
-            METRICS['records_in'] += 1
-        if len(batch) >= batch_size or (time.time() - last_flush) >= max_wait:
+            else:
+                if batch and (time.time() - last_flush) >= max_wait:
+                    flush()
+    finally:
+        try:
             flush()
+        except Exception:
+            pass
+        try:
+            consumer.close()
+        except Exception:
+            pass
+        try:
+            producer.flush()
+            producer.close()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

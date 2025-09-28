@@ -22,6 +22,13 @@ if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
   echo "spark:x:$(id -u):$(id -g):Spark User:$HOME:/bin/sh" >> /etc/passwd || true
 fi
 
+# Add startup delay to ensure Kafka is fully ready
+STARTUP_DELAY=${SPARK_STARTUP_DELAY:-10}
+echo "[entrypoint] waiting ${STARTUP_DELAY} seconds for Kafka to be fully ready..."
+sleep "$STARTUP_DELAY"
+
+echo "[entrypoint] starting spark vectorizer with enhanced timeout configuration"
+
 exec "$SPARK_HOME/bin/spark-submit" \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
   /app/scripts/streaming/spark_vectorize.py

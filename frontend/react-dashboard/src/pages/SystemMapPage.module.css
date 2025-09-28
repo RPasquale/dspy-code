@@ -1,0 +1,169 @@
+.wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.pageHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.pageHeading h1 {
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.pageHeading p {
+  margin-top: 6px;
+  color: rgba(148, 163, 184, 0.78);
+}
+
+.grid {
+  display: grid;
+  gap: 24px;
+}
+
+.canvas {
+  width: 100%;
+  height: 520px;
+  border-radius: 18px;
+  background: rgba(10, 17, 36, 0.7);
+}
+
+.summaryList {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.summaryList li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.35);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.summaryList span {
+  color: rgba(148, 163, 184, 0.75);
+  font-size: 0.9rem;
+}
+
+.summaryList strong {
+  font-size: 1.1rem;
+}
+
+.nodeList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.nodeRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.35);
+  padding: 10px 14px;
+  color: inherit;
+  cursor: pointer;
+  transition: border 0.2s ease, transform 0.2s ease;
+}
+
+.nodeRow:hover {
+  border-color: rgba(96, 165, 250, 0.4);
+  transform: translateX(2px);
+}
+
+.nodeRowActive {
+  border-color: rgba(96, 165, 250, 0.6);
+  box-shadow: 0 12px 28px rgba(59, 130, 246, 0.18);
+}
+
+.nodeIndicator {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.nodeMeta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  text-align: left;
+}
+
+.nodeMeta strong {
+  font-size: 0.95rem;
+}
+
+.nodeMeta small {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(148, 163, 184, 0.7);
+}
+
+.connections header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.connections header h3 {
+  font-size: 1.1rem;
+}
+
+.connections header p {
+  font-size: 0.85rem;
+  color: rgba(148, 163, 184, 0.7);
+}
+
+.connections ul {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.connections li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: rgba(15, 23, 42, 0.35);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.connectionStats {
+  display: flex;
+  gap: 14px;
+  font-size: 0.85rem;
+  color: rgba(148, 163, 184, 0.78);
+}
+
+.muted {
+  color: rgba(148, 163, 184, 0.6);
+  font-size: 0.85rem;
+}
+
+@media (max-width: 768px) {
+  .pageHeading {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

@@ -1,0 +1,178 @@
+.wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.pageHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.pageHeading h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.pageHeading p {
+  margin-top: 6px;
+  color: rgba(148, 163, 184, 0.8);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 24px;
+}
+
+.statusGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.statusItem {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.35);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.statusHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.statusLabel {
+  font-weight: 600;
+  color: rgba(226, 232, 240, 0.95);
+}
+
+.statusDetails {
+  font-size: 0.9rem;
+  color: rgba(148, 163, 184, 0.9);
+}
+
+.muted {
+  color: rgba(148, 163, 184, 0.6);
+  font-size: 0.85rem;
+}
+
+.metricsRow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.metricItem {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px;
+  background: rgba(15, 23, 42, 0.4);
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.metricLabel {
+  font-size: 0.9rem;
+  color: rgba(148, 163, 184, 0.75);
+}
+
+.metricValue {
+  font-size: 1.6rem;
+  letter-spacing: -0.02em;
+}
+
+.metricTrend {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: rgba(96, 165, 250, 0.85);
+}
+
+.commands {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.commandItem {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.4);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.commandItem code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.85rem;
+  color: #7dd3fc;
+}
+
+.progressList {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.progressList li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.4);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.progressList span {
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 0.9rem;
+}
+
+.progressList strong {
+  font-size: 1rem;
+}
+
+.checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  list-style: none;
+  color: rgba(226, 232, 240, 0.85);
+}
+
+.checklist li {
+  padding-left: 20px;
+  position: relative;
+}
+
+.checklist li::before {
+  content: '•';
+  position: absolute;
+  left: 0;
+  color: rgba(99, 102, 241, 0.8);
+}
+
+@media (max-width: 768px) {
+  .pageHeading {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}

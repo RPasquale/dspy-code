@@ -31,25 +31,116 @@ import json
 import hashlib
 
 
+def _resolve_bootstrap(raw: str) -> str:
+    """Normalize Kafka bootstrap list for container + host environments."""
+    alias = os.getenv('DSPY_KAFKA_LOCAL_ALIAS', 'kafka')
+    hosts = []
+    for token in (raw or '').split(','):
+        token = token.strip()
+        if not token:
+            continue
+        scheme = ''
+        rest = token
+        if '://' in token:
+            scheme, rest = token.split('://', 1)
+        host = rest
+        port = ''
+        if rest.startswith('[') and ']' in rest:
+            bracket, after = rest.split(']', 1)
+            host = bracket[1:]
+            if after.startswith(':'):
+                port = after[1:]
+        elif rest.count(':') == 1:
+            host, port = rest.split(':', 1)
+        local_hosts = {'localhost', '127.0.0.1', '0.0.0.0'}
+        if host in local_hosts and alias:
+            host = alias
+        rebuilt = host
+        if port:
+            rebuilt = f"{host}:{port}"
+        if scheme:
+            rebuilt = f"{scheme}://{rebuilt}"
+        hosts.append(rebuilt)
+    return ','.join(hosts) if hosts else raw
+
+
+def wait_for_kafka(bootstrap, max_retries=30, retry_delay=2):
+    """Wait for Kafka to be ready before starting Spark"""
+    import socket
+    import time
+    
+    print(f"[spark-vectorizer] Waiting for Kafka to be ready at {bootstrap}...")
+    
+    for attempt in range(max_retries):
+        try:
+            # Parse bootstrap servers
+            servers = bootstrap.split(',')
+            for server in servers:
+                host, port = server.strip().split(':')
+                port = int(port)
+                
+                # Test connection to each server
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                result = sock.connect_ex((host, port))
+                sock.close()
+                
+                if result != 0:
+                    print(f"[spark-vectorizer] Attempt {attempt + 1}/{max_retries}: {host}:{port} not ready")
+                    time.sleep(retry_delay)
+                    break
+            else:
+                print(f"[spark-vectorizer] Kafka is ready at {bootstrap}")
+                return True
+        except Exception as e:
+            print(f"[spark-vectorizer] Attempt {attempt + 1}/{max_retries}: Error checking Kafka - {e}")
+            time.sleep(retry_delay)
+    
+    print(f"[spark-vectorizer] WARNING: Kafka not ready after {max_retries} attempts, proceeding anyway...")
+    return False
+
 def main():
-    bootstrap = os.getenv('KAFKA_BOOTSTRAP', 'kafka:9092')
+    bootstrap = os.getenv('KAFKA_BOOTSTRAP') or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or 'kafka:9092'
+    print(f"[spark-vectorizer] Original bootstrap: {bootstrap}")
+    bootstrap = _resolve_bootstrap(bootstrap)
+    print(f"[spark-vectorizer] Resolved bootstrap: {bootstrap}")
     topics = os.getenv('SPARK_KAFKA_TOPICS', 'agent.results')
     out_dir = os.getenv('VEC_OUTPUT_DIR', '/workspace/vectorized/embeddings')
     ckpt_dir = os.getenv('VEC_CHECKPOINT', '/workspace/.dspy_checkpoints/vectorizer')
     sink_kafka = os.getenv('SINK_TO_KAFKA', '0') in ('1', 'true', 'yes', 'on')
 
+    # Wait for Kafka to be ready
+    wait_for_kafka(bootstrap)
+
     spark = (
         SparkSession.builder.appName('kafka_vectorizer')
         .config('spark.sql.shuffle.partitions', '4')
+        # Add Kafka timeout configurations
+        .config('spark.sql.streaming.kafka.consumer.poll.timeoutMs', '30000')
+        .config('spark.sql.streaming.kafka.consumer.request.timeoutMs', '30000')
+        .config('spark.sql.streaming.kafka.consumer.metadata.max.age.ms', '300000')
+        .config('spark.sql.streaming.kafka.consumer.reconnect.backoff.max.ms', '10000')
+        .config('spark.sql.streaming.kafka.consumer.reconnect.backoff.ms', '1000')
         .getOrCreate()
     )
 
-    # Read from Kafka
+    # Read from Kafka with enhanced timeout and retry configuration
     df = (
         spark.readStream.format('kafka')
         .option('kafka.bootstrap.servers', bootstrap)
         .option('subscribe', topics)
         .option('startingOffsets', 'latest')
+        # Enhanced timeout and retry configuration
+        .option('kafka.request.timeout.ms', '30000')
+        .option('kafka.metadata.max.age.ms', '300000')
+        .option('kafka.retries', '10')
+        .option('kafka.retry.backoff.ms', '1000')
+        .option('kafka.reconnect.backoff.ms', '1000')
+        .option('kafka.reconnect.backoff.max.ms', '10000')
+        .option('kafka.connections.max.idle.ms', '300000')
+        .option('kafka.socket.timeout.ms', '30000')
+        .option('kafka.socket.connection.setup.timeout.ms', '30000')
+        .option('kafka.socket.connection.setup.timeout.max.ms', '30000')
         .load()
     )
 
@@ -95,11 +186,6 @@ def main():
 
     hash_vec_udf = F.udf(lambda s: hash_vector((s or '').split()), ArrayType(DoubleType()))
 
-    base = df.select(
-        F.col('topic'),
-        F.col('timestamp').alias('kafka_ts'),
-        parse_value_udf(F.col('value')).alias('text')
-    )
 
     # Derive doc_id:
     # 1) If upstream provided JSON containing doc_id/id/document_id/key, try to parse from raw value
@@ -120,6 +206,15 @@ def main():
     doc_from_raw_udf = F.udf(lambda b: extract_doc_id(b) if b is not None else '', StringType())
     sha_udf = F.udf(lambda s: hashlib.sha256((s or '').encode('utf-8')).hexdigest(), StringType())
 
+    # We need to access the original 'value' column from the base DataFrame
+    # Let's modify the base selection to include both value and text
+    base = df.select(
+        F.col('topic'),
+        F.col('timestamp').alias('kafka_ts'),
+        F.col('value'),  # Keep original value for doc_id extraction
+        parse_value_udf(F.col('value')).alias('text')
+    )
+    
     typed = base.withColumn('doc_id_raw', doc_from_raw_udf(F.col('value')))
     typed = typed.withColumn('doc_id', F.when(F.length(F.col('doc_id_raw')) > 0, F.col('doc_id_raw')).otherwise(sha_udf(F.col('text'))))
 

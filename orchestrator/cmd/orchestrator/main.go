@@ -1,20 +1,24 @@
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "io"
-    "log"
-    "net/http"
-    "os"
-    "path/filepath"
-    "os/signal"
-    "syscall"
-    "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
 
-    "github.com/dspy/orchestrator/internal/metrics"
-    "github.com/dspy/orchestrator/internal/workflow"
-    "github.com/dspy/orchestrator/pkg/telemetry"
+	"github.com/dspy/orchestrator/internal/events"
+	"github.com/dspy/orchestrator/internal/metrics"
+	"github.com/dspy/orchestrator/internal/queue"
+	"github.com/dspy/orchestrator/internal/slurm"
+	"github.com/dspy/orchestrator/internal/workflow"
+	"github.com/dspy/orchestrator/pkg/telemetry"
 )
 
 func main() {
@@ -23,6 +27,41 @@ func main() {
 
 	registry := telemetry.NewRegistry()
 
+	// Create event bus
+	eventBus, err := events.NewEventBus(registry, true, true) // Enable Kafka and RedDB
+	if err != nil {
+		log.Fatalf("Failed to create event bus: %v", err)
+	}
+	defer eventBus.Close()
+
+	// Create queue watcher
+	queueDir := os.Getenv("ENV_QUEUE_DIR")
+	if queueDir == "" {
+		queueDir = "logs/env_queue"
+	}
+	pendDir := filepath.Join(queueDir, "pending")
+	doneDir := filepath.Join(queueDir, "done")
+	_ = os.MkdirAll(pendDir, 0o755)
+	_ = os.MkdirAll(doneDir, 0o755)
+
+	queueWatcher, err := queue.NewQueueWatcher(pendDir, doneDir, registry)
+	if err != nil {
+		log.Fatalf("Failed to create queue watcher: %v", err)
+	}
+
+	// Start queue watcher
+	if err := queueWatcher.Start(ctx); err != nil {
+		log.Fatalf("Failed to start queue watcher: %v", err)
+	}
+
+	// Create Slurm bridge
+	slurmBridge := slurm.NewSlurmBridge(registry, queueDir, eventBus)
+	if err := slurmBridge.Start(ctx); err != nil {
+		log.Fatalf("Failed to start Slurm bridge: %v", err)
+	}
+	defer slurmBridge.Stop()
+
+	// Create metrics
 	queueGauge := telemetry.NewGauge(registry, "env_queue_depth", "Number of queued environment evaluations awaiting execution.")
 	gpuWaitGauge := telemetry.NewGauge(registry, "gpu_wait_seconds", "Average seconds tasks waited for GPU resources.")
 	errorGauge := telemetry.NewGauge(registry, "env_error_rate", "Rolling error rate observed across tasks.")
@@ -34,6 +73,7 @@ func main() {
 		ErrorMetric: "env_error_rate",
 	}
 
+	// Create orchestrator
 	cfg := workflow.Config{
 		BaseLimit:          4,
 		MinLimit:           1,
@@ -51,48 +91,119 @@ func main() {
 		log.Fatalf("create orchestrator: %v", err)
 	}
 
-    // Queue directories (file-queue integration)
-    baseQueue := filepath.Join("logs", "env_queue")
-    pendDir := filepath.Join(baseQueue, "pending")
-    doneDir := filepath.Join(baseQueue, "done")
-    _ = os.MkdirAll(pendDir, 0o755)
-    _ = os.MkdirAll(doneDir, 0o755)
+	// HTTP mux: metrics + queue submit + Slurm endpoints
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", registry.Handler())
+	mux.HandleFunc("/queue/submit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		var envelope map[string]interface{}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		id, _ := envelope["id"].(string)
+		if id == "" {
+			id = time.Now().Format("20060102T150405.000000000")
+			envelope["id"] = id
+		}
+		class, _ := envelope["class"].(string)
+		if class == "" {
+			class = "cpu_short"
+			envelope["class"] = class
+		}
+		payload, _ := envelope["payload"].(map[string]interface{})
+		if payload == nil {
+			payload = make(map[string]interface{})
+			envelope["payload"] = payload
+		}
 
-    // HTTP mux: metrics + queue submit
-    mux := http.NewServeMux()
-    mux.Handle("/metrics", registry.Handler())
-    mux.HandleFunc("/queue/submit", func(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodPost {
-            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-            return
-        }
-        body, err := io.ReadAll(r.Body)
-        if err != nil { http.Error(w, err.Error(), 400); return }
-        var req struct{ ID, Class, Payload string }
-        _ = json.Unmarshal(body, &req)
-        if req.ID == "" { req.ID = time.Now().Format("20060102T150405.000000000") }
-        if req.Class == "" { req.Class = "cpu_short" }
-        // write file to pending
-        fpath := filepath.Join(pendDir, req.ID+".json")
-        if err := os.WriteFile(fpath, body, 0o644); err != nil {
-            http.Error(w, err.Error(), 500); return
-        }
-        // bump queue depth gauge by counting pending files
-        if n, _ := dirCount(pendDir); n >= 0 { queueGauge.Set(float64(n)) }
-        w.Header().Set("Content-Type", "application/json")
-        _, _ = w.Write([]byte(`{"ok":true}`))
-    })
+		// Check if this is a Slurm job
+		if class == "gpu_slurm" {
+			// Submit to Slurm
+			job, err := slurmBridge.SubmitGPUJob(r.Context(), id, payload)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Slurm submission failed: %v", err), 500)
+				return
+			}
 
-    server := &http.Server{Addr: ":9097", Handler: mux}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":           true,
+				"slurm_job_id": job.ID,
+				"status":       "submitted",
+			})
+			return
+		}
+
+		// Regular queue processing
+		fpath := filepath.Join(pendDir, id+".json")
+		serialized, err := json.Marshal(envelope)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err := os.WriteFile(fpath, serialized, 0o644); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		// Publish event
+		if err := eventBus.PublishTaskSubmitted(ctx, id, map[string]interface{}{
+			"class":   class,
+			"payload": payload,
+		}); err != nil {
+			log.Printf("Failed to publish task submission event: %v", err)
+		}
+
+		// Update queue depth
+		queueDepth := queueWatcher.GetQueueDepth()
+		queueGauge.Set(float64(queueDepth))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+	})
+
+	// Slurm job status endpoint
+	mux.HandleFunc("/slurm/status/", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.URL.Path[len("/slurm/status/"):]
+		job, exists := slurmBridge.GetJobStatus(taskID)
+		if !exists {
+			http.Error(w, "Job not found", 404)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(job)
+	})
+
+	// Queue status endpoint
+	mux.HandleFunc("/queue/status", func(w http.ResponseWriter, r *http.Request) {
+		stats := queueWatcher.GetQueueStats()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats)
+	})
+
+	server := &http.Server{Addr: ":9097", Handler: mux}
 
 	go func() {
-		log.Printf("metrics listening on %s", server.Addr)
+		log.Printf("orchestrator listening on %s", server.Addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("metrics server error: %v", err)
+			log.Printf("server error: %v", err)
 		}
 	}()
 
-    demoTasks(o, queueGauge, gpuWaitGauge, errorGauge)
+	// Demo tasks (only if ORCHESTRATOR_DEMO is not set to 0)
+	if os.Getenv("ORCHESTRATOR_DEMO") != "0" {
+		demoTasks(o, queueGauge, gpuWaitGauge, errorGauge)
+	}
 
 	<-ctx.Done()
 	log.Println("shutting down orchestrator")
@@ -103,7 +214,7 @@ func main() {
 }
 
 func demoTasks(o *workflow.Orchestrator, queue *telemetry.Gauge, gpu *telemetry.Gauge, errGauge *telemetry.Gauge) {
-	// Simulate metrics oscillation in the background so the adaptive loop has signals.
+	// Simulate metrics oscillation in the background
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
@@ -134,13 +245,4 @@ func demoTasks(o *workflow.Orchestrator, queue *telemetry.Gauge, gpu *telemetry.
 			}
 		})
 	}
-}
-
-func dirCount(path string) (int, error) {
-    f, err := os.Open(path)
-    if err != nil { return -1, err }
-    defer f.Close()
-    names, err := f.Readdirnames(-1)
-    if err != nil { return -1, err }
-    return len(names), nil
 }

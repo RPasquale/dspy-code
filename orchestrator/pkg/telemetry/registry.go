@@ -32,6 +32,29 @@ func (r *Registry) RegisterCounterVec(c *CounterVec) {
 	r.mu.Unlock()
 }
 
+// Counter returns a handle to an unlabeled counter, creating it if necessary.
+// This avoids boilerplate CounterVec wiring when callers only need a single
+// monotonically increasing metric.
+func (r *Registry) Counter(name string) *Counter {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if existing, ok := r.counters[name]; ok {
+		if len(existing.labelNames) != 0 {
+			panic("telemetry: counter requires labels")
+		}
+		return &Counter{parent: existing, key: "", labels: nil}
+	}
+
+	ctr := &CounterVec{
+		name:   name,
+		help:   name,
+		values: make(map[string]float64),
+	}
+	r.counters[name] = ctr
+	return &Counter{parent: ctr, key: "", labels: nil}
+}
+
 // Value returns the latest recorded value for the provided metric name if it exists.
 func (r *Registry) Value(name string) (float64, bool) {
 	r.mu.RLock()
@@ -137,6 +160,10 @@ func (c *CounterVec) seriesSnapshot() []string {
 	defer c.mu.RUnlock()
 	series := make([]string, 0, len(c.values))
 	for key, v := range c.values {
+		if len(c.labelNames) == 0 {
+			series = append(series, fmt.Sprintf("%s %g", c.name, v))
+			continue
+		}
 		labels := strings.Split(key, "\xff")
 		pairs := make([]string, len(labels))
 		for i, val := range labels {

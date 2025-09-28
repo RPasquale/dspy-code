@@ -121,6 +121,8 @@ from .code_tools.code_search import (
 from .code_tools.code_snapshot import build_code_snapshot
 from .code_tools.patcher import apply_unified_patch, summarize_patch
 from .embedding.indexer import build_index, save_index, load_index, semantic_search
+# Many heavy dependencies are imported lazily inside command handlers to
+# keep CLI startup lightweight in constrained environments.
 from .training.train_gepa import run_gepa, run_gepa_with_val, evaluate_on_set
 from .training.train_prefs import train_preference_rewriter
 from .training.train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
@@ -139,6 +141,7 @@ from .embedding.embeddings_index import (
     embed_query,
 )
 from .code_tools.diffutil import unified_diff_file_vs_text
+from .streaming.streamkit import _resolve_bootstrap
 from .streaming.streaming_config import (
     StreamConfig,
     load_config as load_stream_cfg,
@@ -198,8 +201,6 @@ from .rl.rlkit import (
 )
 from .preferences import PREFS_FILENAME, write_default_preferences
 from .policy import update_policy_with_feedback, POLICY_YAML, POLICY_JSON
-from .grpo.mining import mine_reddb_to_grpo
-from .grpo.trainer import GRPOConfig as _GRPOConfig, GRPOTrainer as _GRPOTrainer
 from .rl.rl_helpers import (
     load_effective_rl_config_dict as _load_effective_rl_config_dict,
     rl_config_from_dict as _rl_config_from_dict,
@@ -297,7 +298,7 @@ def _rl_build_make_env(
     # Context provider preferring Kafka (logs.ctx.* topics); falls back to log counters
     def _ctx_provider() -> list[float]:
         # Try Kafka first if available
-        bootstrap = os.getenv('KAFKA_BOOTSTRAP') or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
+        bootstrap = _resolve_bootstrap(os.getenv('KAFKA_BOOTSTRAP') or os.getenv('KAFKA_BOOTSTRAP_SERVERS'))
         if not _kafka_is_available(bootstrap):
             return _logs_ctx_features(workspace)
         try:
@@ -365,7 +366,7 @@ def _rl_build_make_env(
 
 def _kafka_is_available(bootstrap: str, timeout: float = 0.2) -> bool:
     try:
-        tokens = (bootstrap or '').split(',')
+        tokens = (_resolve_bootstrap(bootstrap) or '').split(',')
         import socket as _s
         for tk in tokens:
             tk = tk.strip()
@@ -9277,6 +9278,11 @@ def grpo_mine(
     Attempts to enrich with InferMesh retrieval hits and mesh context.
     """
     try:
+        from .grpo.mining import mine_reddb_to_grpo  # local import to avoid heavy deps at startup
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="grpo mine unavailable", border_style="red"))
+        raise typer.Exit(1)
+    try:
         path = mine_reddb_to_grpo(out, hours=hours, limit_actions=limit_actions, include_types=include_types, min_k=min_k, max_k=max_k, mesh_topics=mesh_topics, mesh_limit=mesh_limit)
     except Exception as e:
         console.print(Panel(escape(str(e)), title="grpo mine failed", border_style="red"))
@@ -9306,7 +9312,12 @@ def grpo_train(
 ):
     """Run a one-off GRPO training session and print summary metrics."""
     try:
-        cfg = _GRPOConfig(
+        from .grpo.trainer import GRPOConfig, GRPOTrainer  # local import (torch/numpy heavy)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="grpo trainer unavailable", border_style="red"))
+        raise typer.Exit(1)
+    try:
+        cfg = GRPOConfig(
             dataset_path=dataset_path,
             model_name=model_name,
             reference_model_name=reference_model_name or model_name,
@@ -9324,7 +9335,7 @@ def grpo_train(
             kl_warmup_steps=kl_warmup_steps,
             kl_target=kl_target,
         )
-        trainer = _GRPOTrainer(cfg)
+        trainer = GRPOTrainer(cfg)
     except Exception as e:
         console.print(Panel(escape(str(e)), title="grpo init failed", border_style="red"))
         raise typer.Exit(1)

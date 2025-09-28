@@ -15,6 +15,39 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from .feature_store import FeatureStore
 from ..monitor.hw_profiler import HardwareProfiler
 
+
+def _resolve_bootstrap(raw: Optional[str]) -> str:
+    """Return a comma-separated list of bootstrap addresses that works inside and outside Docker."""
+    def _push(target: List[str], value: Optional[str]) -> None:
+        if not value:
+            return
+        for part in str(value).split(','):
+            token = part.strip()
+            if not token:
+                continue
+            if ':' not in token:
+                token = f"{token}:9092"
+            if token not in target:
+                target.append(token)
+
+    candidates: List[str] = []
+    _push(candidates, raw)
+    _push(candidates, os.getenv('KAFKA_BOOTSTRAP_SERVERS'))
+    _push(candidates, os.getenv('KAFKA_BOOTSTRAP'))
+    _push(candidates, os.getenv('DSPY_KAFKA_BOOTSTRAP'))
+
+    # Ensure both in-cluster and host aliases are represented
+    local_alias = os.getenv('DSPY_KAFKA_LOCAL_ALIAS', 'kafka')
+    _push(candidates, local_alias)
+    host_alias = os.getenv('DSPY_KAFKA_HOST_ALIAS', 'localhost')
+    host_port = os.getenv('DSPY_KAFKA_HOST_PORT', '9092')
+    _push(candidates, f"{host_alias}:{host_port}")
+
+    # Fall back to conventional defaults if nothing resolved
+    if not candidates:
+        candidates.extend(['kafka:9092', 'localhost:9092'])
+    return ','.join(candidates)
+
 # -----------------
 # Config dataclasses
 # -----------------
@@ -90,8 +123,9 @@ class StreamConfig:
             KafkaTopic(name="code.fs.events"),
             KafkaTopic(name="agent.rl.vectorized"),
         ]
+        bootstrap = _resolve_bootstrap(None)
         return StreamConfig(
-            kafka=KafkaConfig(topics=topics),
+            kafka=KafkaConfig(bootstrap_servers=bootstrap, topics=topics),
             spark=SparkConfig(),
             k8s=K8sConfig(),
             containers=[ContainerTopic(container="backend", services=["users", "billing"]), ContainerTopic(container="frontend", services=["web"])],
@@ -101,9 +135,10 @@ class StreamConfig:
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> StreamConfig:
     data = json.loads(path.read_text())
     def _kt(d): return KafkaTopic(**d)
+    kafka_bootstrap = _resolve_bootstrap(data["kafka"].get("bootstrap_servers"))
     return StreamConfig(
         kafka=KafkaConfig(
-            bootstrap_servers=data["kafka"].get("bootstrap_servers", "localhost:9092"),
+            bootstrap_servers=kafka_bootstrap,
             zookeeper=data["kafka"].get("zookeeper"),
             group_id=data["kafka"].get("group_id", "dspy-code"),
             acks=data["kafka"].get("acks", "all"),
@@ -118,6 +153,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> StreamConfig:
 
 
 def save_config(cfg: StreamConfig, path: Path = DEFAULT_CONFIG_PATH) -> Path:
+    cfg.kafka.bootstrap_servers = _resolve_bootstrap(cfg.kafka.bootstrap_servers)
     def _to(d):
         if isinstance(d, list): return [_to(x) for x in d]
         if hasattr(d, "__dataclass_fields__"): return {k: _to(v) for k, v in asdict(d).items()}
@@ -126,7 +162,8 @@ def save_config(cfg: StreamConfig, path: Path = DEFAULT_CONFIG_PATH) -> Path:
 
 
 def render_kafka_topic_commands(cfg: StreamConfig) -> List[str]:
-    return [f"kafka-topics --bootstrap-server {cfg.kafka.bootstrap_servers} --create --topic {t.name} --partitions {t.partitions} --replication-factor {t.replication_factor}" for t in cfg.kafka.topics]
+    bootstrap = _resolve_bootstrap(cfg.kafka.bootstrap_servers)
+    return [f"kafka-topics --bootstrap-server {bootstrap} --create --topic {t.name} --partitions {t.partitions} --replication-factor {t.replication_factor}" for t in cfg.kafka.topics]
 
 
 # -----------------
@@ -1016,7 +1053,7 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
             name = getattr(topic_cfg, 'name', None)
             if name:
                 kafka_topics.add(name)
-        bootstrap = getattr(kafka_cfg, 'bootstrap_servers', 'localhost:9092')
+        bootstrap = _resolve_bootstrap(getattr(kafka_cfg, 'bootstrap_servers', None))
         setattr(bus, 'kafka_inspector', KafkaStreamInspector(bootstrap, sorted(kafka_topics)))
         checkpoint_path = Path(getattr(getattr(cfg, 'spark', None), 'checkpoint_dir', '.dspy_checkpoints'))
         if not checkpoint_path.is_absolute():

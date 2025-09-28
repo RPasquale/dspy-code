@@ -102,13 +102,16 @@ func (o *Orchestrator) Go(name string, fn TaskFunc) {
 	}
 	o.mu.Unlock()
 	o.group.Go(func() error {
+		taskCtx, cancel := context.WithCancel(o.groupCtx)
+		defer cancel()
 		if err := o.limiter.Acquire(o.groupCtx); err != nil {
+			cancel()
+			// Allow task closures that rely on context cancellation to unwind properly.
+			_ = fn(taskCtx)
 			return err
 		}
 		o.inflightGauge.Inc()
 		defer func() { o.inflightGauge.Dec(); o.limiter.Release() }()
-		taskCtx, cancel := context.WithCancel(o.groupCtx)
-		defer cancel()
 		if err := fn(taskCtx); err != nil {
 			o.errorCounter.WithLabelValues(name).Inc()
 			return err

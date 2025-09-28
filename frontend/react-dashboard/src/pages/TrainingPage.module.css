@@ -1,0 +1,14 @@
+ .wrapper { display: flex; flex-direction: column; gap: 16px; }
+ .form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+ .row { display: flex; flex-direction: column; gap: 6px; }
+ .label { color: #a5a08f; font-size: 0.9rem; }
+ .input { background: #0a0a0a; color: #e6decf; border: 1px solid #2b2b2b; padding: 8px 10px; border-radius: 6px; }
+ .select { background: #0a0a0a; color: #e6decf; border: 1px solid #2b2b2b; padding: 8px 10px; border-radius: 6px; }
+ .actions { display: flex; gap: 10px; margin-top: 10px; }
+ .button { background: #22c55e; color: #0b0f19; border: 0; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
+ .button.secondary { background: #334155; color: #e6decf; }
+ .log { background: #0a0a0a; border: 1px solid #2b2b2b; border-radius: 6px; padding: 10px; height: 240px; overflow: auto; }
+
+ @media (max-width: 960px) {
+   .form { grid-template-columns: 1fr; }
+ }

@@ -78,15 +78,23 @@ class SimplePolicy:
         """Select action using epsilon-greedy policy."""
         if not available_actions:
             return "plan"  # Default action
-        
+
         # Epsilon-greedy selection
         if random.random() < self.epsilon:
-            return random.choice(available_actions)
-        
+            preferred = [a for a in available_actions if a in {
+                'patch',
+                'run_tests',
+                'lint',
+                'build',
+                'shell_run',
+            }]
+            pool = preferred or available_actions
+            return random.choice(pool)
+
         # Greedy selection based on action values
         best_action = available_actions[0]
         best_value = self.action_values.get(best_action, 0.0)
-        
+
         for action in available_actions:
             value = self.action_values.get(action, 0.0)
             if value > best_value:

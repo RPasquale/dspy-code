@@ -19,7 +19,7 @@ _DEFAULTS: Dict[str, Any] = {
     },
     "routing": {
         "rules": [
-            {"when": r"(?i)neighbors\s+of\s+([\\w/\\\\.-]+\\.py)", "tool": "neighbors"},
+            {"when": r"(?i)neighbors\s+of\s+([\w/\\\\.-]+\\.py)", "tool": "neighbors"},
             {"when": r"(?i)kafka|topics", "tool": "grep", "args": {"pattern": r"topics|topic|logs\\.ctx|agent\\."}},
         ]
     },

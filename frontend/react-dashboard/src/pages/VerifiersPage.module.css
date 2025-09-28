@@ -1,0 +1,5 @@
+ .wrapper { display: flex; flex-direction: column; gap: 16px; }
+ .table { width: 100%; border-collapse: collapse; }
+ .table th, .table td { padding: 8px 10px; border-bottom: 1px solid #2a2f3a; text-align: left; }
+ .muted { color: #8b93a1; }
+ .select { background: #0f1320; color: #e6edf3; border: 1px solid #273043; padding: 6px 8px; border-radius: 6px; }

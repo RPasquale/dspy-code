@@ -16,13 +16,15 @@ env/
 ENV/
 env.bak/
 venv.bak/
-
+tmp/gocache/*
+pytest-of-agent/pytest-*
 # Build / packaging
 build/
 dist/
 *.egg-info/
 *.egg
 *.whl
+target/
 
 # Editor / OS
 .DS_Store
@@ -103,8 +105,11 @@ Library/**
 uv.lock
 
 
-# Local React frontend (not shared)
-frontend/
+# Frontend build outputs and dependencies
+frontend/**/node_modules/
+frontend/**/dist/
+frontend/**/.vite/
+frontend/**/coverage/
 
 # PyPI Publishing - SENSITIVE FILES (DO NOT COMMIT)
 PYPI_CREDENTIALS_SETUP.md

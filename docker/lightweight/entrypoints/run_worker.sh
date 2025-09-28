@@ -10,8 +10,7 @@ export DSPY_WORKSPACE="${DSPY_WORKSPACE:-/workspace}"
 export HOME="$DSPY_WORKSPACE"
 mkdir -p "$HOME/.dspy_cache" || true
 
-until (echo > /dev/tcp/kafka/9092) >/dev/null 2>&1; do
-  echo "[entrypoint] waiting for kafka..."; sleep 2
-done
+# Use the improved Kafka wait script
+source /entrypoints/wait_for_kafka.sh
 
 exec dspy-agent worker --topic "${topic}" --bootstrap kafka:9092

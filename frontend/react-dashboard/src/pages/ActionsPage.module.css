@@ -1,0 +1,6 @@
+ .wrapper { display: flex; flex-direction: column; gap: 16px; }
+ .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+ .chart { height: 220px; }
+ .table { width: 100%; border-collapse: collapse; }
+ .table th, .table td { padding: 8px 10px; border-bottom: 1px solid #2a2f3a; text-align: left; }
+ .muted { color: #8b93a1; }

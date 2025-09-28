@@ -92,39 +92,7 @@ performance-monitor: stack-env
 .PHONY: intelligent-optimization
 intelligent-optimization: stack-env
 	@echo "[intelligent] Running intelligent optimization analysis..."
-	@python3 -c "
-from dspy_agent.monitor.performance_monitor import PerformanceMonitor
-from dspy_agent.monitor.auto_scaler import AutoScaler
-import asyncio
-import json
-
-async def run_optimization():
-    # Performance analysis
-    perf_monitor = PerformanceMonitor('$$(pwd)')
-    snapshot = await perf_monitor.collect_performance_snapshot()
-    anomalies = perf_monitor.detect_anomalies(snapshot)
-    recommendations = perf_monitor.generate_optimization_recommendations(snapshot)
-    
-    print('=== Intelligent Optimization Report ===')
-    print(f'CPU Usage: {snapshot.cpu_usage:.1f}%')
-    print(f'Memory Usage: {snapshot.memory_usage:.1f}%')
-    print(f'Anomalies Detected: {len(anomalies)}')
-    print(f'Optimization Recommendations: {len(recommendations)}')
-    
-    if anomalies:
-        print('\n=== Anomalies ===')
-        for anomaly in anomalies:
-            print(f'- {anomaly.description} (severity: {anomaly.severity})')
-    
-    if recommendations:
-        print('\n=== Recommendations ===')
-        for rec in recommendations:
-            print(f'- {rec.title} (priority: {rec.priority})')
-            print(f'  Impact: {rec.impact}')
-            print(f'  Effort: {rec.effort}')
-
-asyncio.run(run_optimization())
-"
+	@python3 scripts/intelligent_optimization_analysis.py
 	@echo "[intelligent] Optimization analysis complete"
 
 .PHONY: advanced-features
@@ -244,6 +212,187 @@ stack-smoke: stack-up
 	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) run --rm smoke || true
 	$(MAKE) health-check
 
+.PHONY: local-up local-down local-status local-setup local-test local-clean
+local-up:
+	bash scripts/start_local_system.sh
+
+local-down:
+	bash scripts/stop_local_system.sh
+
+local-status:
+	@echo "[pids]"; ls -l logs/pids 2>/dev/null || true; echo; \
+	  echo "[queue]"; echo pending=$$(ls logs/env_queue/pending 2>/dev/null | wc -l | tr -d ' ') done=$$(ls logs/env_queue/done 2>/dev/null | wc -l | tr -d ' ')
+
+local-setup:
+	@echo "[setup] Setting up complete DSPy Agent system..."
+	bash scripts/setup_complete_system.sh
+	@echo "[setup] System setup complete!"
+
+local-test:
+	@echo "[test] Testing DSPy Agent system..."
+	bash scripts/test_system.sh
+	@echo "[test] System tests complete!"
+
+local-clean:
+	@echo "[clean] Cleaning up local system..."
+	bash scripts/stop_local_system.sh --cleanup
+	@echo "[clean] System cleanup complete!"
+
+# Go/Rust/Slurm specific targets
+.PHONY: go-build go-test rust-build rust-test slurm-test orchestrator-build env-runner-build
+
+go-build:
+	@echo "[go] Building Go orchestrator..."
+	cd orchestrator && GOCACHE=$(pwd)/.gocache GOMODCACHE=$(pwd)/.gomodcache go build -o ../logs/orchestrator ./cmd/orchestrator
+	@echo "[go] Go orchestrator built successfully!"
+
+go-test:
+	@echo "[go] Testing Go orchestrator..."
+	cd orchestrator && GOCACHE=$(pwd)/.gocache GOMODCACHE=$(pwd)/.gomodcache go test ./...
+	@echo "[go] Go tests passed!"
+
+rust-build:
+	@echo "[rust] Building Rust env-runner..."
+	cd env_runner_rs && cargo build --release
+	@echo "[rust] Rust env-runner built successfully!"
+
+rust-test:
+	@echo "[rust] Testing Rust env-runner..."
+	cd env_runner_rs && cargo test
+	@echo "[rust] Rust tests passed!"
+
+slurm-test:
+	@echo "[slurm] Testing Slurm integration..."
+	python3 tests/test_slurm_integration.py
+	@echo "[slurm] Slurm tests passed!"
+
+orchestrator-build: go-build
+	@echo "[orchestrator] Go orchestrator ready!"
+
+env-runner-build: rust-build
+	@echo "[env-runner] Rust env-runner ready!"
+
+# Complete system targets
+.PHONY: system-setup system-start system-stop system-test system-status system-clean
+
+system-setup: local-setup
+	@echo "[system] Complete system setup finished!"
+
+system-start: orchestrator-build env-runner-build local-up
+	@echo "[system] Complete system started!"
+
+system-stop: local-down
+	@echo "[system] Complete system stopped!"
+
+system-test: go-test rust-test slurm-test local-test
+	@echo "[system] All system tests passed!"
+
+system-status: local-status
+	@echo "[system] System status checked!"
+
+system-clean: local-clean
+
+# Package system for distribution
+.PHONY: package package-clean
+
+package:
+	@echo "Creating distribution package..."
+	@bash scripts/dspy_stack_packager.sh
+
+package-clean:
+	@echo "Cleaning distribution packages..."
+	@rm -rf dist/
+	@echo "[system] System cleanup complete!"
+
+# Docker Compose with Go/Rust/Slurm
+.PHONY: stack-up-complete stack-down-complete stack-logs-complete
+
+stack-up-complete: stack-env
+	@echo "[stack] Starting complete stack with Go/Rust/Slurm components..."
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) up -d go-orchestrator rust-env-runner redis
+	@echo "[stack] Complete stack started!"
+
+stack-down-complete:
+	@echo "[stack] Stopping complete stack..."
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) down
+	@echo "[stack] Complete stack stopped!"
+
+stack-logs-complete:
+	@echo "[stack] Showing complete stack logs..."
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) logs -f go-orchestrator rust-env-runner
+
+# Health checks for new components
+.PHONY: health-check-complete
+
+health-check-complete: health-check
+	@echo "[health] Go Orchestrator"; \
+	  (curl -fsS http://127.0.0.1:9097/metrics || echo "unreachable") && echo
+	@echo "[health] Rust Env-Runner"; \
+	  (curl -fsS http://127.0.0.1:8080/health || echo "unreachable") && echo
+	@echo "[health] Queue Status"; \
+	  (curl -fsS http://127.0.0.1:9097/queue/status || echo "unreachable") && echo
+	@echo "[health] Slurm Integration"; \
+	  (curl -fsS http://127.0.0.1:9097/slurm/status/test || echo "unreachable") && echo
+
+# ---------------------
+# Production System Management
+# ---------------------
+.PHONY: build up down logs health status test clean dev quickstart
+
+# Build all components
+build:
+	@echo "🔨 Building all components..."
+	docker compose -f $(STACK_COMPOSE) --env-file $(STACK_ENV) build
+	@echo "✅ All components built successfully"
+
+# Start all services
+up: stack-up
+	@echo "🚀 Starting all services..."
+	@echo "✅ All services started"
+
+# Stop all services
+down: stack-down
+	@echo "🛑 Stopping all services..."
+	@echo "✅ All services stopped"
+
+# View service logs
+logs: stack-logs
+	@echo "📋 Viewing service logs..."
+
+# Check service health
+health: health-check-complete
+	@echo "🏥 Checking service health..."
+
+# Check service status
+status: stack-ps
+	@echo "📊 Service status:"
+
+# Run all tests
+test: go-test rust-test test-lightweight
+	@echo "✅ All tests completed"
+
+# Clean up system
+clean:
+	@echo "🧹 Cleaning up system..."
+	docker system prune -f
+	docker volume prune -f
+	@echo "✅ System cleaned"
+
+# Start development environment
+dev: stack-up
+	@echo "🔧 Starting development environment..."
+	@echo "✅ Development environment started"
+
+# Quick start - build, start, and check health
+quickstart: build up health
+	@echo "🎉 DSPy Agent is ready!"
+	@echo "Services:"
+	@echo "  - RedDB: http://localhost:8082"
+	@echo "  - Go Orchestrator: http://localhost:9097"
+	@echo "  - Rust Env Runner: http://localhost:8080"
+	@echo "  - InferMesh: http://localhost:19000"
+	@echo "  - Redis: localhost:6379"
+
 # ---------------------
 # DB Tools Quick Tests
 # ---------------------
@@ -277,5 +426,5 @@ stack-demo: stack-up
 	echo "\n[demo] Success!"; \
 	echo "- Dashboard:     http://127.0.0.1:18081"; \
 	echo "- FastAPI Backend http://127.0.0.1:8767/api/db/health"; \
-	echo "- RedDB Mock:     http://127.0.0.1:8082/health"; \
-	echo "(Use 'make health-check' for a quick status report)"
+	echo "- RedDB:         http://127.0.0.1:8082/health"; \
+	echo "(Use 'make health' for a quick status report)"

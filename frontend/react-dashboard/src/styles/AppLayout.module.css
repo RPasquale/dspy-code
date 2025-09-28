@@ -1,0 +1,80 @@
+.appShell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 32px;
+  position: sticky;
+  top: 0;
+  background: #0a0a0a;
+  border-bottom: 1px solid #2b2b2b;
+  z-index: 20;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 1.25rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.badgeDanger {
+  margin-left: 12px;
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(248, 113, 113, 0.12);
+  color: #f2c7c7;
+  border: 1px solid rgba(248, 113, 113, 0.25);
+}
+
+.badgeOk {
+  margin-left: 12px;
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(34, 197, 94, 0.12);
+  color: #d7f8e5;
+  border: 1px solid rgba(34, 197, 94, 0.25);
+}
+
+.navLinks {
+  display: flex;
+  gap: 16px;
+}
+
+.link {
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: #0a0a0a;
+  border: 1px solid #2b2b2b;
+  color: rgba(230, 222, 207, 0.8);
+  transition: all 0.2s ease;
+  font-weight: 500;
+}
+
+.link:hover {
+  background: #111;
+  color: #fff2dc;
+}
+
+.activeLink {
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: #111;
+  border: 1px solid #6b7280;
+  color: #fff2dc;
+  font-weight: 600;
+}
+
+.mainContent {
+  flex: 1;
+  padding: 32px;
+  width: min(1200px, 100%);
+  margin: 0 auto;
+}

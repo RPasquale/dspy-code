@@ -1,4 +1,22 @@
-FROM python:3.11-slim
+FROM golang:1.22 AS go-builder
+WORKDIR /src
+COPY orchestrator/go.mod orchestrator/go.sum ./orchestrator/
+RUN cd orchestrator && go mod download
+COPY orchestrator/ ./orchestrator
+RUN cd orchestrator && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/orchestrator ./cmd/orchestrator
+
+FROM rust:1.82 AS rust-builder
+WORKDIR /src
+COPY env_runner_rs/Cargo.toml env_runner_rs/Cargo.lock ./env_runner_rs/
+COPY reddb_rs/Cargo.toml ./reddb_rs/
+RUN cd env_runner_rs && cargo fetch
+RUN cd reddb_rs && cargo fetch
+COPY env_runner_rs/ ./env_runner_rs
+COPY reddb_rs/ ./reddb_rs
+RUN cd env_runner_rs && cargo build --release
+RUN cd reddb_rs && cargo build --release
+
+FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -48,7 +66,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libomp-dev && rm -rf /var/lib/apt/lists/*
 
 # Optionally build raylib from source for x86_64 only (pufferlib dependency)
-# On non-x86_64 (e.g., aarch64), RL extras will be skipped unless user opts in.
 RUN set -eux; \
     arch="$(uname -m)"; \
     if [ "$arch" = "x86_64" ]; then \
@@ -63,7 +80,6 @@ RUN set -eux; \
       echo "[raylib] skipping build on $arch"; \
     fi
 
-# Set environment variables to help PufferLib find raylib when built
 ENV RAYLIB_PATH=/usr/local \
     RAYLIB_LIB_PATH=/usr/local/lib \
     RAYLIB_INCLUDE_PATH=/usr/local/include \
@@ -95,13 +111,12 @@ RUN set -eux; \
 
 WORKDIR /app
 
-COPY entrypoints /entrypoints
+COPY docker/lightweight/entrypoints /entrypoints
 RUN chmod +x /entrypoints/*.sh
 
 COPY pyproject.toml README.md /app/
 COPY dspy_agent /app/dspy_agent
 
-# Install uv and base dependencies
 RUN pip install --no-cache-dir uv && \
     uv pip install --system . && \
     pip install --no-cache-dir fastapi uvicorn
@@ -126,11 +141,15 @@ RUN set -eux; \
       echo "[warn] Skipping RL extras on $arch"; \
     fi
 
-# Create non-root user and set permissions
+COPY --from=go-builder /out/orchestrator /usr/local/bin/orchestrator
+COPY --from=rust-builder /src/env_runner_rs/target/release/env_runner /usr/local/bin/env_runner
+COPY --from=rust-builder /src/reddb_rs/target/release/reddb /usr/local/bin/reddb
+
 RUN useradd -m -u 10001 -s /usr/sbin/nologin agent \
     && mkdir -p /home/agent/.dspy_cache \
     && chown -R agent:agent /app /entrypoints /home/agent
 
 USER agent
 
-ENTRYPOINT ["dspy-agent"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["dspy-agent"]

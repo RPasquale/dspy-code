@@ -20,7 +20,7 @@ services:
         - OLLAMA_API_KEY=
         - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
         - KAFKA_CLIENT_ID=dspy-agent
-        - KAFKA_TOPIC_PREFIX
+        - KAFKA_TOPIC_PREFIX=
         # Advanced features
         - DSPY_ENABLE_AUTO_SCALING=true
         - DSPY_PERFORMANCE_MODE=optimized
@@ -99,42 +99,85 @@ services:
         - ALLOW_ANONYMOUS_LOGIN=yes
       ports:
         - "127.0.0.1:2181:2181"
+      healthcheck:
+        test: ["CMD-SHELL", "echo ruok | nc localhost 2181 || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 20
+        start_period: 15s
+      deploy:
+        resources:
+          limits:
+            memory: 1G
+            cpus: '1.0'
+          reservations:
+            memory: 512M
+            cpus: '0.5'
 
     kafka:
       image: bitnami/kafka:3.6
       depends_on:
-        - zookeeper
+        zookeeper:
+          condition: service_healthy
       environment:
         - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
         - ALLOW_PLAINTEXT_LISTENER=yes
-        - KAFKA_LISTENERS=PLAINTEXT://:9092
-        - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+        - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+        - KAFKA_CFG_LISTENERS=PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+        - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
         - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+        - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+        - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+        - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+        - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+        - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+        - KAFKA_NUM_PARTITIONS=3
+        - KAFKA_DEFAULT_REPLICATION_FACTOR=1
       ports:
-        - "127.0.0.1:9092:9092"
+        - "127.0.0.1:9092:29092"
       healthcheck:
-        test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
-        interval: 10s
-        timeout: 3s
+        test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+        interval: 15s
+        timeout: 10s
         retries: 20
-        start_period: 10s
+        start_period: 30s
+      deploy:
+        resources:
+          limits:
+            memory: 2G
+            cpus: '2.0'
+          reservations:
+            memory: 1G
+            cpus: '1.0'
 
     reddb:
       image: dspy-lightweight:latest
-      container_name: reddb-mock
+      container_name: reddb
       working_dir: /app
-      entrypoint: ["bash", "-lc", "python -m dspy_agent.server.reddb_mock"]
+      entrypoint: ["/usr/local/bin/reddb"]
       restart: unless-stopped
+      user: root
       ports:
         - "127.0.0.1:8082:8080"
       environment:
-        - REDB_ADMIN_TOKEN=${REDDB_ADMIN_TOKEN}
+        - REDDB_ADMIN_TOKEN=${REDDB_ADMIN_TOKEN}
+        - REDDB_DATA_DIR=/data
+      volumes:
+        - ./data/reddb:/data
       healthcheck:
-        test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8080/health')\" >/dev/null 2>&1 || exit 1"]
-        interval: 30s
-        timeout: 10s
+        test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+        interval: 10s
+        timeout: 5s
         retries: 5
-        start_period: 5s
+        start_period: 10s
+      deploy:
+        resources:
+          limits:
+            memory: 1G
+            cpus: '1.0'
+          reservations:
+            memory: 512M
+            cpus: '0.5'
       security_opt:
         - no-new-privileges:true
       read_only: true
@@ -547,6 +590,8 @@ services:
         - VEC_OUTPUT_DIR=/workspace/vectorized/embeddings
         - VEC_CHECKPOINT=/workspace/.dspy_checkpoints/vectorizer
         - SINK_INPUT_TOPIC=embedding_input
+        # Additional startup delay to ensure Kafka is fully ready
+        - SPARK_STARTUP_DELAY=10
       volumes:
         - ${WORKSPACE_DIR}:/workspace
         - ./scripts:/app/scripts:ro
@@ -665,8 +710,114 @@ services:
         timeout: 5s
         retries: 5
         start_period: 10s
+
+    # Go Orchestrator Service
+    go-orchestrator:
+      image: dspy-lightweight:latest
+      build:
+        context: .
+        dockerfile: Dockerfile
+      environment:
+        - ORCHESTRATOR_PORT=9097
+        - INFERMESH_BASE_URL=http://infermesh:9000
+        - INFERMESH_API_KEY=${INFERMESH_API_KEY:-}
+        - INFERMESH_MODEL=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
+        - REDIS_URL=redis://redis:6379
+        - METRICS_ENABLED=true
+        - ORCHESTRATOR_DEMO=0
+        - ENV_QUEUE_DIR=/app/logs/env_queue
+      entrypoint: ["/usr/local/bin/orchestrator"]
+      ports:
+        - "127.0.0.1:9097:9097"
+      volumes:
+        - ./logs:/app/logs
+      depends_on:
+        - redis
+        - infermesh
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "curl -f http://localhost:9097/metrics || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 10s
+      deploy:
+        resources:
+          limits:
+            memory: 2G
+            cpus: '2.0'
+          reservations:
+            memory: 512M
+            cpus: '0.5'
+
+    # Rust Environment Runner Service
+    rust-env-runner:
+      image: dspy-lightweight:latest
+      build:
+        context: .
+        dockerfile: Dockerfile
+      environment:
+        - INFERMESH_BASE_URL=http://infermesh:9000
+        - INFERMESH_API_KEY=${INFERMESH_API_KEY:-}
+        - INFERMESH_MODEL=${INFERMESH_MODEL:-BAAI/bge-small-en-v1.5}
+        - MAX_CONCURRENT_REQUESTS=100
+        - BATCH_SIZE=512
+        - CONNECTION_POOL_SIZE=50
+        - REDIS_URL=redis://redis:6379
+        - ENV_QUEUE_DIR=/app/logs/env_queue
+        - METRICS_PORT=8080
+      entrypoint: ["/usr/local/bin/env_runner"]
+      ports:
+        - "127.0.0.1:8081:8080"
+      volumes:
+        - ./logs:/app/logs
+      depends_on:
+        - redis
+        - infermesh
+        - go-orchestrator
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 15s
+      deploy:
+        resources:
+          limits:
+            memory: 4G
+            cpus: '4.0'
+          reservations:
+            memory: 1G
+            cpus: '1.0'
+
+    # Redis Service
+    redis:
+      image: redis:7-alpine
+      ports:
+        - "127.0.0.1:6379:6379"
+      volumes:
+        - redis-data:/data
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD", "redis-cli", "ping"]
+        interval: 10s
+        timeout: 3s
+        retries: 5
+        start_period: 5s
+      deploy:
+        resources:
+          limits:
+            memory: 2G
+            cpus: '1.0'
+          reservations:
+            memory: 512M
+            cpus: '0.5'
+
 volumes:
   ollama: {}
   dspy-cache: {}
   hf-cache: {}
   reddb_data: {}
+  redis-data: {}
+  infermesh-cache: {}

@@ -1,0 +1,687 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100;200;300;400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Cyberpunk Theme Variables */
+:root {
+  --cyber-primary: #00ff00;
+  --cyber-secondary: #ff00ff;
+  --cyber-accent: #ffff00;
+  --cyber-bg: #0a0a0a;
+  --cyber-surface: #1a1a1a;
+  --cyber-border: #333333;
+  --cyber-text: #ffffff;
+  --cyber-text-muted: #cccccc;
+  --cyber-shadow: rgba(0, 255, 0, 0.3);
+}
+
+/* Cyberpunk Base Styles */
+body {
+  background: #0a0a0a;
+  color: var(--cyber-text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  overflow-x: hidden;
+  will-change: auto;
+}
+
+/* Optimized Neon Glow Effects */
+.neon-glow {
+  box-shadow: 0 0 10px var(--cyber-shadow);
+  transition: box-shadow 0.2s ease;
+}
+
+.neon-glow-pink {
+  box-shadow: 0 0 10px rgba(255, 0, 255, 0.3);
+  transition: box-shadow 0.2s ease;
+}
+
+.neon-glow-yellow {
+  box-shadow: 0 0 10px rgba(255, 255, 0, 0.3);
+  transition: box-shadow 0.2s ease;
+}
+
+/* Optimized Grid Background */
+.cyber-grid {
+  background-image: 
+    linear-gradient(rgba(0, 255, 0, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 255, 0, 0.05) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* Cyberpunk Button Styles */
+.cyber-btn {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(45deg, var(--cyber-primary), var(--cyber-secondary));
+  border: 1px solid var(--cyber-primary);
+  color: var(--cyber-text);
+  transition: all 0.3s ease;
+}
+
+.cyber-btn:hover {
+  box-shadow: 
+    0 0 5px var(--cyber-primary),
+    0 0 10px var(--cyber-primary),
+    0 0 15px var(--cyber-primary),
+    0 0 20px var(--cyber-primary);
+  transform: translateY(-2px);
+}
+
+.cyber-btn::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+  transition: left 0.5s;
+}
+
+.cyber-btn:hover::before {
+  left: 100%;
+}
+
+/* Optimized Cyberpunk Card Styles */
+.cyber-card {
+  background: rgba(26, 26, 26, 0.9);
+  border: 1px solid var(--cyber-border);
+  backdrop-filter: blur(5px);
+  position: relative;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform, box-shadow;
+}
+
+.cyber-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 
+    0 10px 25px rgba(0, 0, 0, 0.5),
+    0 0 20px var(--cyber-shadow);
+  border-color: var(--cyber-primary);
+}
+
+.cyber-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(45deg, var(--cyber-primary), transparent, var(--cyber-secondary));
+  opacity: 0.05;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+
+.cyber-card:hover::before {
+  opacity: 0.1;
+}
+
+/* Cyberpunk Input Styles */
+.cyber-input {
+  background: rgba(26, 26, 26, 0.8);
+  border: 1px solid var(--cyber-border);
+  color: var(--cyber-text);
+  padding: 0.75rem;
+  transition: all 0.3s ease;
+}
+
+.cyber-input:focus {
+  border-color: var(--cyber-primary);
+  box-shadow: 0 0 10px rgba(0, 255, 255, 0.3);
+  outline: none;
+}
+
+/* Cyberpunk Table Styles */
+.cyber-table {
+  background: rgba(26, 26, 26, 0.9);
+  border: 1px solid var(--cyber-border);
+}
+
+.cyber-table th {
+  background: linear-gradient(45deg, var(--cyber-primary), var(--cyber-secondary));
+  color: var(--cyber-bg);
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.cyber-table td {
+  border-bottom: 1px solid var(--cyber-border);
+  transition: background-color 0.3s ease;
+}
+
+.cyber-table tr:hover td {
+  background: rgba(0, 255, 255, 0.1);
+}
+
+/* Cyberpunk Status Indicators */
+.status-online {
+  background: var(--cyber-primary);
+  border-radius: 50%;
+  width: 8px;
+  height: 8px;
+  display: inline-block;
+  box-shadow: 
+    0 0 5px var(--cyber-primary),
+    0 0 10px var(--cyber-primary),
+    0 0 15px var(--cyber-primary),
+    0 0 20px var(--cyber-primary);
+}
+
+.status-warning-indicator {
+  background: var(--cyber-accent);
+  border-radius: 50%;
+  width: 8px;
+  height: 8px;
+  display: inline-block;
+  box-shadow: 
+    0 0 5px var(--cyber-accent),
+    0 0 10px var(--cyber-accent),
+    0 0 15px var(--cyber-accent),
+    0 0 20px var(--cyber-accent);
+}
+
+.status-error-indicator {
+  background: var(--cyber-secondary);
+  border-radius: 50%;
+  width: 8px;
+  height: 8px;
+  display: inline-block;
+  box-shadow: 
+    0 0 5px var(--cyber-secondary),
+    0 0 10px var(--cyber-secondary),
+    0 0 15px var(--cyber-secondary),
+    0 0 20px var(--cyber-secondary);
+}
+
+/* Cyberpunk Animations */
+@keyframes pulse-neon {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.pulse-neon {
+  animation: pulse-neon 2s ease-in-out infinite;
+}
+
+@keyframes matrix-rain {
+  0% { transform: translateY(-100vh); }
+  100% { transform: translateY(100vh); }
+}
+
+.matrix-rain {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: -1;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 255, 0, 0.03) 2px,
+    rgba(0, 255, 0, 0.03) 4px
+  );
+  animation: matrix-rain 20s linear infinite;
+}
+
+/* Cyberpunk Status Pills */
+.status-pill {
+  @apply inline-flex items-center px-3 py-1 rounded-full text-xs font-medium border;
+  transition: all 0.3s ease;
+}
+
+.status-success {
+  background: rgba(0, 255, 255, 0.1);
+  border-color: var(--cyber-primary);
+  color: var(--cyber-primary);
+  box-shadow: 
+    0 0 5px var(--cyber-primary),
+    0 0 10px var(--cyber-primary),
+    0 0 15px var(--cyber-primary),
+    0 0 20px var(--cyber-primary);
+}
+
+.status-warning {
+  background: rgba(255, 255, 0, 0.1);
+  border-color: var(--cyber-accent);
+  color: var(--cyber-accent);
+  box-shadow: 
+    0 0 5px var(--cyber-accent),
+    0 0 10px var(--cyber-accent),
+    0 0 15px var(--cyber-accent),
+    0 0 20px var(--cyber-accent);
+}
+
+.status-error {
+  background: rgba(255, 0, 255, 0.1);
+  border-color: var(--cyber-secondary);
+  color: var(--cyber-secondary);
+  box-shadow: 
+    0 0 5px var(--cyber-secondary),
+    0 0 10px var(--cyber-secondary),
+    0 0 15px var(--cyber-secondary),
+    0 0 20px var(--cyber-secondary);
+}
+
+.status-processing {
+  background: rgba(255, 255, 0, 0.1);
+  border-color: var(--cyber-accent);
+  color: var(--cyber-accent);
+  animation: pulse-neon 1s ease-in-out infinite;
+}
+
+/* Optimized Cyberpunk Card Base */
+.card {
+  @apply rounded-lg p-6;
+  background: rgba(26, 26, 26, 0.9);
+  backdrop-filter: blur(5px);
+  position: relative;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform, box-shadow;
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  box-shadow: 
+    0 8px 20px rgba(0, 0, 0, 0.4),
+    0 0 15px var(--cyber-shadow);
+}
+
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(45deg, var(--cyber-primary), transparent, var(--cyber-secondary));
+  opacity: 0.05;
+  pointer-events: none;
+  border-radius: inherit;
+  transition: opacity 0.3s ease;
+}
+
+.card:hover::before {
+  opacity: 0.1;
+}
+
+.card-header {
+  @apply mb-4;
+}
+
+.card-body {
+  @apply text-white;
+}
+
+/* Performance Optimizations */
+* {
+  box-sizing: border-box;
+}
+
+*:focus {
+  outline: none;
+}
+
+/* GPU Acceleration for smooth animations */
+.cyber-card,
+.card,
+.neon-glow,
+.neon-glow-pink,
+.neon-glow-yellow {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+  perspective: 1000px;
+}
+
+/* Optimize font rendering */
+body, input, textarea, select {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  
+  * {
+    border-color: rgb(226 232 240);
+  }
+  
+  body {
+    background: rgb(248 250 252);
+    color: rgb(15 23 42);
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+  }
+  
+  #root {
+    min-height: 100vh;
+  }
+}
+
+@layer components {
+  .glass {
+    background-color: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+  }
+  
+  .glass-strong {
+    background-color: rgba(255, 255, 255, 0.9);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+  }
+  
+  .gradient-primary {
+    background: linear-gradient(to right, #3b82f6, #8b5cf6);
+  }
+  
+  .gradient-secondary {
+    background: linear-gradient(to right, #64748b, #475569);
+  }
+  
+  .gradient-success {
+    background: linear-gradient(to right, #22c55e, #16a34a);
+  }
+  
+  .gradient-warning {
+    background: linear-gradient(to right, #f59e0b, #d97706);
+  }
+  
+  .gradient-error {
+    background: linear-gradient(to right, #ef4444, #dc2626);
+  }
+  
+  .text-gradient {
+    background: linear-gradient(to right, #3b82f6, #8b5cf6);
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+  }
+  
+  .card-hover {
+    transition: all 0.3s ease;
+  }
+  
+  .card-hover:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+  }
+  
+  .button-primary {
+    background: linear-gradient(to right, #3b82f6, #2563eb);
+    color: white;
+    font-weight: 500;
+    padding: 0.75rem 1.5rem;
+    border-radius: 0.5rem;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    transition: all 0.3s ease;
+    border: none;
+    cursor: pointer;
+  }
+  
+  .button-primary:hover {
+    background: linear-gradient(to right, #2563eb, #1d4ed8);
+    transform: translateY(-1px);
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+  }
+  
+  .button-secondary {
+    background-color: white;
+    color: rgb(71 85 105);
+    font-weight: 500;
+    padding: 0.75rem 1.5rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(226 232 240);
+    transition: all 0.3s ease;
+    cursor: pointer;
+  }
+  
+  .button-secondary:hover {
+    background-color: rgb(248 250 252);
+    border-color: rgb(203 213 225);
+    color: rgb(15 23 42);
+  }
+  
+  .input-field {
+    background-color: white;
+    border: 1px solid rgb(226 232 240);
+    border-radius: 0.5rem;
+    padding: 0.75rem 1rem;
+    color: rgb(15 23 42);
+    transition: all 0.3s ease;
+  }
+  
+  .input-field::placeholder {
+    color: rgb(148 163 184);
+  }
+  
+  .input-field:focus {
+    border-color: #3b82f6;
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  }
+  
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.25rem 0.75rem;
+    border-radius: 9999px;
+    font-size: 0.875rem;
+    font-weight: 500;
+  }
+  
+  .status-success {
+    background-color: rgb(220 252 231);
+    color: rgb(22 101 52);
+    border: 1px solid rgb(187 247 208);
+  }
+  
+  .status-warning {
+    background-color: rgb(254 243 199);
+    color: rgb(146 64 14);
+    border: 1px solid rgb(253 224 71);
+  }
+  
+  .status-error {
+    background-color: rgb(254 226 226);
+    color: rgb(153 27 27);
+    border: 1px solid rgb(252 165 165);
+  }
+  
+  .status-processing {
+    background-color: rgb(219 234 254);
+    color: rgb(30 64 175);
+    border: 1px solid rgb(147 197 253);
+  }
+  
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(148 163 184) transparent;
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: rgb(148 163 184);
+    border-radius: 4px;
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(100 116 139);
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  /* Card components */
+  .card {
+    background: white;
+    border: 1px solid rgb(226 232 240);
+    border-radius: 0.75rem;
+    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+    transition: all 0.3s ease;
+  }
+  
+  .card:hover {
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  }
+  
+  .card-header {
+    padding: 1.5rem 1.5rem 0 1.5rem;
+    border-bottom: 1px solid rgb(226 232 240);
+  }
+  
+  .card-body {
+    padding: 1.5rem;
+  }
+  
+  .card-footer {
+    padding: 0 1.5rem 1.5rem 1.5rem;
+    border-top: 1px solid rgb(226 232 240);
+  }
+  
+  /* Table styles */
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  
+  .table th {
+    background-color: rgb(248 250 252);
+    color: rgb(71 85 105);
+    font-weight: 600;
+    text-align: left;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid rgb(226 232 240);
+  }
+  
+  .table td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid rgb(226 232 240);
+  }
+  
+  .table tbody tr:hover {
+    background-color: rgb(248 250 252);
+  }
+  
+  /* Form styles */
+  .form-group {
+    margin-bottom: 1rem;
+  }
+  
+  .form-label {
+    display: block;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: rgb(71 85 105);
+    margin-bottom: 0.5rem;
+  }
+  
+  .form-input {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    border: 1px solid rgb(226 232 240);
+    border-radius: 0.5rem;
+    background-color: white;
+    color: rgb(15 23 42);
+    transition: all 0.3s ease;
+  }
+  
+  .form-input:focus {
+    border-color: #3b82f6;
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  }
+  
+  .form-select {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    border: 1px solid rgb(226 232 240);
+    border-radius: 0.5rem;
+    background-color: white;
+    color: rgb(15 23 42);
+    transition: all 0.3s ease;
+  }
+  
+  .form-select:focus {
+    border-color: #3b82f6;
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  }
+  
+  /* Animation utilities */
+  .anim-fade-in {
+    animation: fadeIn 0.5s ease-in-out;
+  }
+  
+  .anim-slide-up {
+    animation: slideUp 0.3s ease-out;
+  }
+  
+  .anim-scale-in {
+    animation: scaleIn 0.2s ease-out;
+  }
+  
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  
+  @keyframes slideUp {
+    from { 
+      opacity: 0; 
+      transform: translateY(10px); 
+    }
+    to { 
+      opacity: 1; 
+      transform: translateY(0); 
+    }
+  }
+  
+  @keyframes scaleIn {
+    from { 
+      opacity: 0; 
+      transform: scale(0.95); 
+    }
+    to { 
+      opacity: 1; 
+      transform: scale(1); 
+    }
+  }
+}
+
+@layer utilities {
+  .scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  .scrollbar::-webkit-scrollbar-thumb {
+    background-color: rgb(148 163 184);
+    border-radius: 4px;
+  }
+  
+  .scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  .scrollbar:hover::-webkit-scrollbar-thumb {
+    background-color: rgb(100 116 139);
+  }
+}

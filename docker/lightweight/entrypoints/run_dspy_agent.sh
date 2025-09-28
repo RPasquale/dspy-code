@@ -7,9 +7,8 @@ until curl -sf http://ollama:11434/api/tags >/dev/null 2>&1; do
   echo "[entrypoint] waiting for ollama..."; sleep 2
 done
 
-until (echo > /dev/tcp/kafka/9092) >/dev/null 2>&1; do
-  echo "[entrypoint] waiting for kafka..."; sleep 2
-done
+# Use the improved Kafka wait script
+source /entrypoints/wait_for_kafka.sh
 
 WORKSPACE=${DSPY_WORKSPACE:-/workspace}
 LOGS_DIR=${DSPY_LOGS:-${WORKSPACE}/logs}

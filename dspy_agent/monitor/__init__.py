@@ -10,9 +10,13 @@ try:
 except Exception:  # pragma: no cover - optional
     AutoScaler = None  # type: ignore
 
-try:
-    from .performance_monitor import PerformanceMonitor  # type: ignore
-except Exception:  # pragma: no cover - optional
-    PerformanceMonitor = None  # type: ignore
+# Avoid importing the numpy/scipy-heavy performance monitor at module import
+# time. On sandboxed macOS runners the numpy import path can segfault
+# (Accelerate polyfit check), which previously crashed any code that merely
+# touched dspy_agent.monitor. Downstream callers that truly need the
+# PerformanceMonitor can import dspy_agent.monitor.performance_monitor
+# explicitly; the top-level package now exposes a placeholder to remain
+# backwards compatible.
+PerformanceMonitor = None  # type: ignore
 
 __all__ = ['AutoScaler', 'PerformanceMonitor']

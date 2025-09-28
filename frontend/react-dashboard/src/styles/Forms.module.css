@@ -1,0 +1,23 @@
+.formRow {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 8px;
+  align-items: center;
+}
+.button {
+  grid-column: span 2 / span 2;
+  padding: 8px 12px;
+  border: 1px solid #2aa198;
+  background: #073642;
+  color: #93a1a1;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.table th, .table td {
+  border: 1px solid #073642;
+  padding: 6px 8px;
+}

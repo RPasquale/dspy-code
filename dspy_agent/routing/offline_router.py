@@ -35,7 +35,7 @@ KEYWORDS = {
     # Repo-specific helpers
     "infermesh": ("grep", {"pattern": r"infermesh|embed-worker|vectorizer|INFERMESH|4041|9101"}),
     "metrics": ("grep", {"pattern": r"metrics|/metrics|/health|health-check"}),
-    "kafka": ("grep", {"pattern": r"topic|logs\\.ctx|agent\\.|deploy\\.events|bootstrap\.servers"}),
+    "kafka": ("grep", {"pattern": r"topic|logs\\.ctx|agent\\.|deploy\\.events|bootstrap\\.servers"}),
     "topics": ("grep", {"pattern": r"topics|topic|logs\\.ctx"}),
     "vectorized": ("grep", {"pattern": r"vectorized|vectorizer|embeddings"}),
     "pipeline": ("grep", {"pattern": r"pipeline|stack|compose"}),

@@ -1,0 +1,237 @@
+# Cloud GPU Configuration for DSPy Agent Training
+# This file contains configuration for various cloud GPU providers
+
+# Prime Intellect Configuration
+prime_intellect:
+  enabled: true
+  api_key_env: "PRIME_INTELLECT_API_KEY"
+  base_url: "https://api.primeintellect.com/v1"
+  default_region: "us-east-1"
+  gpu_mapping:
+    # Map memory requirements to GPU types
+    "80+": "H100"      # 80+ GB memory
+    "48+": "RTX6000"   # 48+ GB memory  
+    "24+": "RTX4090"   # 24+ GB memory
+    "16+": "RTX4080"   # 16+ GB memory
+    "8+": "RTX4070"    # 8+ GB memory
+  spot_instances: true
+  max_price_per_hour: 10.0
+
+# RunPod Configuration
+runpod:
+  enabled: true
+  api_key_env: "RUNPOD_API_KEY"
+  base_url: "https://api.runpod.io/v2"
+  default_region: "us-east-1"
+  gpu_mapping:
+    "80+": "A100"
+    "48+": "RTX6000"
+    "24+": "RTX4090"
+    "16+": "RTX4080"
+    "8+": "RTX4070"
+  spot_instances: true
+  max_price_per_hour: 5.0
+
+# Nebius Configuration
+nebius:
+  enabled: true
+  api_key_env: "NEBIUS_API_KEY"
+  base_url: "https://api.nebius.com/v1"
+  default_region: "eu-west-1"
+  gpu_mapping:
+    "80+": "H100"
+    "48+": "RTX6000"
+    "24+": "RTX4090"
+    "16+": "RTX4080"
+    "8+": "RTX4070"
+  spot_instances: true
+  max_price_per_hour: 8.0
+
+# CoreWeave Configuration
+coreweave:
+  enabled: true
+  api_key_env: "COREWEAVE_API_KEY"
+  base_url: "https://api.coreweave.com/v1"
+  default_region: "us-east-1"
+  gpu_mapping:
+    "80+": "H100"
+    "48+": "RTX6000"
+    "24+": "RTX4090"
+    "16+": "RTX4080"
+    "8+": "RTX4070"
+  spot_instances: false
+  max_price_per_hour: 15.0
+
+# Local Slurm Configuration
+local_slurm:
+  enabled: true
+  check_command: "sinfo --version"
+  scripts_dir: "deploy/slurm"
+  default_partition: "gpu"
+  default_time: "24:00:00"
+  default_memory: "32G"
+  default_cpus: 4
+
+# Training Method Configurations
+training_methods:
+  grpo:
+    command: "dspy-agent grpo train"
+    default_model: "gpt2"
+    default_batch_size: 8
+    default_learning_rate: 1e-5
+    default_steps: 1000
+    gpu_requirements:
+      min_memory_gb: 8
+      min_storage_gb: 100
+      recommended_gpus: 2
+  
+  gepa:
+    command: "python -m dspy_agent.training.train_gepa"
+    default_model: "gpt2"
+    default_batch_size: 8
+    default_learning_rate: 1e-5
+    default_steps: 1000
+    gpu_requirements:
+      min_memory_gb: 8
+      min_storage_gb: 100
+      recommended_gpus: 1
+  
+  teleprompt:
+    command: "python -m dspy_agent.training.train_teleprompt"
+    default_model: "gpt2"
+    default_batch_size: 8
+    default_learning_rate: 1e-5
+    default_steps: 1000
+    gpu_requirements:
+      min_memory_gb: 8
+      min_storage_gb: 100
+      recommended_gpus: 1
+  
+  rl:
+    command: "python -m dspy_agent.training.entrypoint"
+    default_model: "gpt2"
+    default_batch_size: 8
+    default_learning_rate: 1e-5
+    default_steps: 200
+    gpu_requirements:
+      min_memory_gb: 8
+      min_storage_gb: 100
+      recommended_gpus: 1
+  
+  codegen:
+    command: "python -m dspy_agent.training.train_codegen"
+    default_model: "gpt2"
+    default_batch_size: 8
+    default_learning_rate: 1e-5
+    default_steps: 1000
+    gpu_requirements:
+      min_memory_gb: 8
+      min_storage_gb: 100
+      recommended_gpus: 1
+  
+  orchestrator:
+    command: "python -m dspy_agent.training.train_orchestrator"
+    default_model: "gpt2"
+    default_batch_size: 8
+    default_learning_rate: 1e-5
+    default_steps: 1000
+    gpu_requirements:
+      min_memory_gb: 8
+      min_storage_gb: 100
+      recommended_gpus: 1
+  
+  prefs:
+    command: "python -m dspy_agent.training.train_prefs"
+    default_model: "gpt2"
+    default_batch_size: 8
+    default_learning_rate: 1e-5
+    default_steps: 1000
+    gpu_requirements:
+      min_memory_gb: 8
+      min_storage_gb: 100
+      recommended_gpus: 1
+
+# Module Configurations
+modules:
+  orchestrator:
+    description: "Main orchestrator module for tool selection"
+    default_training_method: "grpo"
+    gpu_requirements:
+      min_memory_gb: 8
+      recommended_gpus: 1
+  
+  context:
+    description: "Code context understanding module"
+    default_training_method: "gepa"
+    gpu_requirements:
+      min_memory_gb: 8
+      recommended_gpus: 1
+  
+  task:
+    description: "Task planning and decomposition module"
+    default_training_method: "teleprompt"
+    gpu_requirements:
+      min_memory_gb: 8
+      recommended_gpus: 1
+  
+  code:
+    description: "Code generation and modification module"
+    default_training_method: "codegen"
+    gpu_requirements:
+      min_memory_gb: 8
+      recommended_gpus: 1
+  
+  file_locator:
+    description: "File location and discovery module"
+    default_training_method: "gepa"
+    gpu_requirements:
+      min_memory_gb: 8
+      recommended_gpus: 1
+  
+  test_planner:
+    description: "Test planning and generation module"
+    default_training_method: "teleprompt"
+    gpu_requirements:
+      min_memory_gb: 8
+      recommended_gpus: 1
+  
+  patch_verifier:
+    description: "Patch verification and validation module"
+    default_training_method: "gepa"
+    gpu_requirements:
+      min_memory_gb: 8
+      recommended_gpus: 1
+
+# Default Settings
+defaults:
+  backend: "auto_detect"
+  gpu_count: 1
+  memory_gb: 8
+  storage_gb: 100
+  price_limit: 10.0
+  timeout_hours: 24
+  checkpoint_interval: 1000
+  log_level: "INFO"
+  
+# Environment Variables
+environment:
+  # Training environment variables
+  TRAINING_METHOD: "${TRAINING_METHOD}"
+  MODULE_NAME: "${MODULE_NAME}"
+  MODEL_NAME: "${MODEL_NAME}"
+  DATASET_PATH: "${DATASET_PATH}"
+  OUTPUT_DIR: "${OUTPUT_DIR}"
+  WORKSPACE_DIR: "${WORKSPACE_DIR}"
+  BATCH_SIZE: "${BATCH_SIZE}"
+  LEARNING_RATE: "${LEARNING_RATE}"
+  MAX_STEPS: "${MAX_STEPS}"
+  EPOCHS: "${EPOCHS}"
+  
+  # GPU environment variables
+  CUDA_VISIBLE_DEVICES: "0"
+  NCCL_DEBUG: "INFO"
+  NCCL_IB_DISABLE: "1"
+  
+  # Python environment variables
+  PYTHONPATH: "/workspace"
+  PYTHONUNBUFFERED: "1"
