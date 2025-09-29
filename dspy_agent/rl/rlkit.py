@@ -165,8 +165,9 @@ class RLToolEnv:
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[List[float], Dict[str, Any]]:
         self._t = 0
         ctx = self._cfg.context_provider() if self._cfg.context_provider else []
-        # Default to context-only observation on reset for compatibility
-        self._last_obs = list(ctx)
+        # Initialize with zero verifier scores + context for proper observation dimension
+        verifier_scores = [0.0] * len(list(self._cfg.verifiers))
+        self._last_obs = verifier_scores + list(ctx)
         return self._last_obs, {"t": self._t}
 
     def step(self, action: int) -> Tuple[List[float], float, bool, bool, Dict[str, Any]]:

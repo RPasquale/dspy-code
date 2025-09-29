@@ -71,6 +71,9 @@ target/
 .dspy_checkpoints/
 .dspy_stream.json
 
+# Hugging Face cache
+.cache/huggingface*
+
 # Logs
 logs/
 *.log
@@ -81,6 +84,9 @@ dev_tools/
 # Docker / Compose
 docker/lightweight/*.log
 docker/lightweight/.env
+
+# RedDB SQLite database files
+docker/lightweight/data/reddb/reddb.sqlite*
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/

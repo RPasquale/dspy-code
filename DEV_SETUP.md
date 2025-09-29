@@ -73,6 +73,25 @@ python3 enhanced_dashboard_server.py 8080
 python3 enhanced_dashboard_server.py 8081
 ```
 
+### Training Quickstart
+Run a quick RL session and persist analytics locally (no external DB required):
+
+```bash
+python -m dspy_agent.cli rl quick-train --workspace . --signature CodeContextSig --steps 50
+python -m dspy_agent.cli rl report
+python -m dspy_agent.cli rl recent --limit 5
+```
+
+To use RedDB for persistence (optional):
+
+```bash
+export REDDB_URL=http://localhost:8080
+export REDDB_NAMESPACE=dspy
+export REDDB_TOKEN=<token if required>
+```
+
+ 
+
 ## Troubleshooting
 
 ### Docker Issues

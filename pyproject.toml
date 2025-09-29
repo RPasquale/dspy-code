@@ -30,6 +30,7 @@ dependencies = [
     "uvicorn>=0.24.0",
     # External verifiers package (best-effort; optional at runtime if unavailable)
     "verifiers @ git+https://github.com/willccbb/verifiers.git",
+    "pyarrow>=21.0.0",
 ]
 
 [project.scripts]

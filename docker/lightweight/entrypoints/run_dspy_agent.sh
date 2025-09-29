@@ -19,6 +19,13 @@ mkdir -p "$LOGS_DIR"
 # Ensure DSPy cache can write under workspace (root FS is read-only)
 export HOME="$WORKSPACE"
 mkdir -p "$HOME/.dspy_cache" || true
+mkdir -p "/tmp/.dspy_cache" || true
+
+# Set explicit cache directory to avoid diskcache SQLite issues
+export DSPY_CACHE_DIR="$HOME/.dspy_cache"
+
+# Disable diskcache SQLite optimizations that cause syntax errors
+export DISKCACHE_DISABLE_SQLITE_OPTIMIZATIONS=1
 
 dspy-agent stream-topics-create --bootstrap kafka:9092 || true
 

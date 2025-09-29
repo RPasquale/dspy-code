@@ -5,13 +5,22 @@ import os
 from dataclasses import dataclass
 
 
-@dataclass
+# NOTE: Define as simple class to ensure import via
+# importlib.util.spec_from_file_location works reliably in some environments.
 class Config:
-    data_root: str = "/data/train"
-    export_dir: str = "/models/export"
-    batch_size: int = 4
-    epochs: int = 1
-    lr: float = 2e-4
+    def __init__(
+        self,
+        data_root: str = "/data/train",
+        export_dir: str = "/models/export",
+        batch_size: int = 4,
+        epochs: int = 1,
+        lr: float = 2e-4,
+    ) -> None:
+        self.data_root = data_root
+        self.export_dir = export_dir
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.lr = lr
 
 
 def _has_torch() -> bool:
@@ -77,4 +86,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

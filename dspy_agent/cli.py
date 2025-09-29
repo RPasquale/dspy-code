@@ -39,6 +39,10 @@ except Exception:
 # before importing dspy or any module that depends on it.
 def _ensure_writable_dspy_cache() -> None:
     try:
+        # Set environment variables to fix diskcache SQLite issues
+        os.environ.setdefault("DISKCACHE_DISABLE_SQLITE_OPTIMIZATIONS", "1")
+        os.environ.setdefault("DISKCACHE_DISABLE_SQLITE_PRAGMA", "1")
+        
         # Prefer an explicit cache dir if provided
         explicit = os.getenv("DSPY_CACHE_DIR")
         candidates: List[str] = []
@@ -90,11 +94,27 @@ def _ensure_writable_dspy_cache() -> None:
             os.environ["HOME"] = home_dir
             # Also set DSPY_CACHE_DIR for newer DSPy versions that honor it.
             os.environ.setdefault("DSPY_CACHE_DIR", chosen)
+            
+        # Additional environment variables to prevent SQLite syntax errors
+        os.environ.setdefault("DISKCACHE_DISABLE_SQLITE_WAL", "1")
+        os.environ.setdefault("DISKCACHE_DISABLE_SQLITE_JOURNAL", "1")
+        
     except Exception:
         # Do not block CLI startup due to cache setup issues.
         pass
 
 _ensure_writable_dspy_cache()
+
+# Apply diskcache patches before importing dspy (only if diskcache is installed)
+try:
+    import importlib.util as _ilut
+    if _ilut.find_spec('diskcache') is not None:
+        from .cache.disk_cache_patch import patch_diskcache, configure_safe_cache_environment
+        configure_safe_cache_environment()
+        patch_diskcache()
+except Exception:
+    # Don't block startup if patches fail
+    pass
 
 import dspy
 import logging
@@ -216,6 +236,163 @@ rl_app.add_typer(prefs_app, name="prefs")
 config_app = typer.Typer(no_args_is_help=True, help="Agent config helpers (routing, embeddings)")
 stack_app = typer.Typer(no_args_is_help=True, help="Docker stack helper commands")
 feedback_app = typer.Typer(no_args_is_help=True, help="Capture feedback and scaffold tests")
+
+
+@rl_app.command("quick-train")
+def rl_quick_train(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, dir_okay=True, help="Workspace directory"),
+    signature: str = typer.Option("CodeContextSig", "--signature", help="Signature name for labeling analytics"),
+    verifiers: str = typer.Option("dspy_agent.verifiers.custom", "--verifiers", help="Module path exporting get_verifiers()"),
+    steps: int = typer.Option(200, "--steps", help="Number of steps"),
+    n_envs: int = typer.Option(1, "--n-envs", help="Parallel envs"),
+    policy: str = typer.Option("epsilon-greedy", "--policy", help="Bandit policy"),
+    environment: str = typer.Option("development", "--env", help="Environment label for analytics"),
+):
+    """Run a quick RL bandit training loop and persist analytics."""
+    try:
+        import importlib
+        mod = importlib.import_module(verifiers)
+        if not hasattr(mod, 'get_verifiers'):
+            console.print(Panel(f"Module {verifiers} missing get_verifiers()", title="rl quick-train", border_style="red"))
+            raise typer.Exit(1)
+        vlist = list(mod.get_verifiers())
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="verifiers load failed", border_style="red"))
+        raise typer.Exit(1)
+
+    weights = {getattr(v, 'kind', f'v{i}'): 1.0 for i, v in enumerate(vlist)}
+    rc = RewardConfig(weights=weights)
+
+    def reward_fn(result, vlist, wmap):
+        return aggregate_reward(result, vlist, rc)
+
+    tcfg = detect_toolchain(workspace)
+    execu = ToolchainExecutor(tcfg)
+
+    def executor(tool, args) -> Any:
+        return execu(tool, args)
+
+    env_cfg = EnvConfig(
+        verifiers=vlist,
+        reward_fn=reward_fn,
+        weights=weights,
+        context_provider=None,
+        action_args=None,
+        allowed_actions=None,
+    )
+
+    def make_env() -> RLToolEnv:
+        env = RLToolEnv(executor, env_cfg, episode_len=1)
+        try:
+            env.set_signature_name(signature)
+        except Exception:
+            pass
+        return env
+
+    # Import here to avoid issues if top-level import is optimized out in some environments
+    try:
+        from .rl.rlkit import make_default_analytics_cb as _mk_cb  # type: ignore
+        cb = _mk_cb(signature, env=environment)
+    except Exception:
+        # Fallback to previously imported symbol if present
+        cb = make_default_analytics_cb(signature, env=environment)  # type: ignore[name-defined]
+    cfg = _RLTrainerConfig(steps=int(steps), policy=policy, policy_kwargs={}, n_envs=max(1, int(n_envs)))
+    res = bandit_trainer(make_env, cfg, analytics_cb=cb)
+    # Summarize
+    try:
+        avg = sum(res.rewards) / len(res.rewards) if getattr(res, 'rewards', None) else 0.0
+        console.print(Panel.fit(f"steps={steps} avg_reward={avg:.3f}", title="rl quick-train", border_style="green"))
+    except Exception:
+        pass
+
+
+@rl_app.command("report")
+def rl_report(
+    limit: int = typer.Option(20, "--limit", help="Recent actions to scan"),
+):
+    """Print a short report of recent RL actions and average reward."""
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        dm = get_enhanced_data_manager()
+        actions = dm.get_recent_actions(limit)
+        avg = sum(a.reward for a in actions) / len(actions) if actions else 0.0
+        body = f"recent_actions={len(actions)} avg_reward={avg:.3f}"
+        console.print(Panel.fit(body, title="rl report", border_style="cyan"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="rl report failed", border_style="red"))
+        raise typer.Exit(1)
+
+
+@rl_app.command("verify-storage")
+def rl_verify_storage():
+    """Check underlying storage health (RedDB or in-memory fallback)."""
+    try:
+        from .dbkit import get_storage
+        st = get_storage()
+        hc = st.health_check()
+        ok = bool(hc.get('ok'))
+        style = 'green' if ok else 'red'
+        console.print(Panel(escape(str(hc)), title="storage health", border_style=style))
+        raise typer.Exit(0 if ok else 1)
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="storage health failed", border_style="red"))
+        raise typer.Exit(1)
+
+
+@rl_app.command("verifiers")
+def rl_list_verifiers(
+    module: str = typer.Option("dspy_agent.verifiers.custom", "--module", help="Module exporting get_verifiers()"),
+):
+    """List available verifiers in a module."""
+    try:
+        import importlib
+        mod = importlib.import_module(module)
+        if not hasattr(mod, 'get_verifiers'):
+            console.print(Panel(f"Module {module} missing get_verifiers()", title="rl verifiers", border_style="red"))
+            raise typer.Exit(1)
+        vs = list(mod.get_verifiers())
+        lines = [f"- {getattr(v, 'name', type(v).__name__)} (kind={getattr(v, 'kind', 'unknown')})" for v in vs]
+        console.print(Panel("\n".join(lines) or "<none>", title="verifiers", border_style="green"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="rl verifiers failed", border_style="red"))
+        raise typer.Exit(1)
+
+
+@rl_app.command("recent")
+def rl_recent_actions(
+    limit: int = typer.Option(10, "--limit", help="Number of actions to show"),
+):
+    """Show recent actions (id, reward, signature)."""
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        dm = get_enhanced_data_manager()
+        acts = dm.get_recent_actions(limit)
+        rows = []
+        for a in acts:
+            sig = None
+            for src in (a.parameters, a.result, a.state_before, a.state_after):
+                if isinstance(src, dict) and isinstance(src.get('signature_name'), str):
+                    sig = src['signature_name']; break
+            rows.append(f"{a.action_id or '?'}  reward={a.reward:.3f}  sig={sig or '-'}")
+        console.print(Panel("\n".join(rows) or "<none>", title="recent actions", border_style="cyan"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="rl recent failed", border_style="red"))
+        raise typer.Exit(1)
+
+
+@rl_app.command("summary")
+def rl_summary(
+    hours: int = typer.Option(24, "--hours", help="Time window in hours"),
+):
+    """Show a performance summary across signatures/verifiers/actions."""
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        dm = get_enhanced_data_manager()
+        summary = dm.get_performance_summary(hours=hours)
+        console.print(Panel(escape(str(summary)), title="rl summary", border_style="green"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="rl summary failed", border_style="red"))
+        raise typer.Exit(1)
 
 
 def _rl_build_make_env(
@@ -9074,6 +9251,582 @@ def code_entry() -> None:
         structured=False,
         approval=None,
     )
+
+
+@app.command("train-easy")
+def train_easy(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, dir_okay=True, help="Workspace directory"),
+    signature: str = typer.Option("CodeContextSig", "--signature", help="Signature for labeling analytics"),
+    rl_steps: int = typer.Option(100, "--rl-steps", help="Steps for tool-selection RL phase"),
+    grpo_dataset: Optional[Path] = typer.Option(None, "--grpo-dataset", exists=False, help="Path to GRPO JSONL dataset (if provided and exists, runs GRPO phase)"),
+    grpo_steps: int = typer.Option(300, "--grpo-steps", help="Max steps for GRPO phase"),
+    n_envs: int = typer.Option(1, "--n-envs", help="Parallel envs for RL"),
+    actions: Optional[str] = typer.Option(None, "--actions", help="Comma-separated allowed actions (optional)"),
+    environment: str = typer.Option("development", "--env", help="Environment label for analytics"),
+    episode_len: int = typer.Option(1, "--episode-len", help="Multi-step episode length for sequential policies"),
+    streaming: bool = typer.Option(False, "--streaming", help="Enable streaming data integration (Kafka/Spark/RedDB)"),
+    multi_policy: bool = typer.Option(False, "--multi-policy", help="Enable multi-policy training (tool selection + usage optimization)"),
+    kafka_bootstrap: str = typer.Option("localhost:9092", "--kafka-bootstrap", help="Kafka bootstrap servers"),
+    reddb_url: str = typer.Option("http://localhost:8080", "--reddb-url", help="RedDB URL for analytics"),
+):
+    """Super simple end-to-end training: RL bandit for tool selection, then optional GRPO with streaming support."""
+    
+    # ---------------- Streaming Integration Setup ----------------
+    import time
+    streaming_bus = None
+    if streaming:
+        console.print(Panel.fit("Setting up streaming integration (Kafka/Spark/RedDB)", title="train-easy", border_style="blue"))
+        try:
+            from .streaming.event_bus import get_event_bus
+            from .streaming.kafka_log import get_kafka_logger
+            import os
+            os.environ.setdefault('KAFKA_BOOTSTRAP_SERVERS', kafka_bootstrap)
+            os.environ.setdefault('REDDB_URL', reddb_url)
+            streaming_bus = get_event_bus()
+            console.print("✅ Streaming integration ready")
+        except Exception as e:
+            console.print(f"⚠️ Streaming setup failed: {e}")
+            streaming = False
+    
+    # ---------------- Multi-Policy Context Provider ----------------
+    def create_context_provider():
+        """Enhanced context provider for multi-policy training"""
+        if not streaming:
+            return None
+        
+        def context_fn():
+            try:
+                # Get recent streaming data for context
+                from .db.enhanced_storage import get_enhanced_data_manager
+                dm = get_enhanced_data_manager()
+                recent_actions = dm.get_recent_actions(5)  # Reduced to avoid large context
+                context = []
+                for action in recent_actions:
+                    context.extend([action.reward, float(action.timestamp)])
+                # Ensure consistent context size - use smaller, fixed size
+                while len(context) < 10:
+                    context.append(0.0)
+                return context[:10]  # Fixed context size
+            except Exception:
+                # Return default context to avoid dimension issues
+                return [0.0] * 10
+        return context_fn
+
+    # ---------------- RL tool-selection phase ----------------
+    console.print(Panel.fit("RL (bandit) phase: training tool-selection policy", title="train-easy", border_style="cyan"))
+    try:
+        import importlib
+        from .rl.rlkit import RLToolEnv, EnvConfig, RewardConfig, aggregate_reward, bandit_trainer, detect_toolchain, ToolchainExecutor
+        from .rl.rlkit import make_default_analytics_cb as _mk_cb, train_puffer_policy
+        # Default verifiers
+        vmod = importlib.import_module('dspy_agent.verifiers.custom')
+        verifiers = list(vmod.get_verifiers()) if hasattr(vmod, 'get_verifiers') else []
+        weights = {getattr(v, 'kind', f'v{i}'): 1.0 for i, v in enumerate(verifiers)}
+        rc = RewardConfig(weights=weights)
+
+        def reward_fn(result, vlist, wmap):
+            reward = aggregate_reward(result, vlist, rc)
+            # Publish to streaming if enabled
+            if streaming and streaming_bus:
+                try:
+                    streaming_bus.publish("agent.rewards", {
+                        "reward": reward,
+                        "timestamp": time.time(),
+                        "signature": signature,
+                        "environment": environment
+                    })
+                except Exception:
+                    pass
+            return reward
+
+        tcfg = detect_toolchain(workspace)
+        execu = ToolchainExecutor(tcfg)
+
+        def executor(tool, args) -> Any:
+            result = execu(tool, args)
+            # Publish tool usage to streaming
+            if streaming and streaming_bus:
+                try:
+                    streaming_bus.publish("agent.tool_usage", {
+                        "tool": tool,
+                        "args": args,
+                        "result": str(result)[:500],  # Truncate for storage
+                        "timestamp": time.time(),
+                        "signature": signature
+                    })
+                except Exception:
+                    pass
+            return result
+
+        allowed_actions = None
+        if actions:
+            arr = [a.strip() for a in actions.split(',') if a.strip()]
+            allowed_actions = arr or None
+
+        # Create context provider with fallback
+        context_provider = create_context_provider()
+        if context_provider is None:
+            # Fallback context provider for non-streaming mode
+            def fallback_context():
+                return [0.0] * 10  # Default context size
+            context_provider = fallback_context
+        
+        # Ensure context provider always returns consistent size
+        def safe_context_provider():
+            try:
+                ctx = context_provider()
+                # Ensure context is exactly 10 elements
+                while len(ctx) < 10:
+                    ctx.append(0.0)
+                return ctx[:10]
+            except Exception:
+                return [0.0] * 10
+
+        env_cfg = EnvConfig(
+            verifiers=verifiers,
+            reward_fn=reward_fn,
+            weights=weights,
+            context_provider=None,  # Temporarily disable context to fix dimension issue
+            action_args=None,
+            allowed_actions=allowed_actions,
+        )
+
+        def make_env() -> RLToolEnv:
+            env = RLToolEnv(executor, env_cfg, episode_len=episode_len)
+            try:
+                env.set_signature_name(signature)
+            except Exception:
+                pass
+            return env
+
+        cb = _mk_cb(signature, env=environment)
+        
+        # Choose training method based on multi-policy flag
+        if multi_policy and episode_len > 1:
+            console.print(Panel.fit("Multi-step PPO training for sequential policies", title="train-easy", border_style="magenta"))
+            from .rl.rlkit import TrainerConfig as _RLTC
+            cfg = _RLTC(steps=int(rl_steps), policy='puffer', policy_kwargs={}, n_envs=max(1, int(n_envs)))
+            res = train_puffer_policy(make_env=make_env, steps=int(rl_steps), n_envs=max(1, int(n_envs)))
+        else:
+            from .rl.rlkit import TrainerConfig as _RLTC
+            cfg = _RLTC(steps=int(rl_steps), policy='epsilon-greedy', policy_kwargs={}, n_envs=max(1, int(n_envs)))
+            res = bandit_trainer(make_env, cfg, analytics_cb=cb)
+        
+        avg = sum(res.rewards) / len(res.rewards) if getattr(res, 'rewards', None) else 0.0
+        console.print(Panel.fit(f"RL phase: steps={rl_steps} avg_reward={avg:.3f} episode_len={episode_len}", title="train-easy", border_style="green"))
+    except Exception as e:
+        console.print(Panel(escape(str(e)), title="rl phase failed", border_style="red"))
+        raise typer.Exit(1)
+
+    # ---------------- Optional GRPO phase ----------------
+    if grpo_dataset and grpo_dataset.exists():
+        console.print(Panel.fit("GRPO phase: training LM policy on dataset", title="train-easy", border_style="cyan"))
+        try:
+            from .grpo.trainer import GRPOConfig, GRPOTrainer  # local import (torch-heavy)
+            cfg = GRPOConfig(
+                dataset_path=grpo_dataset,
+                model_name='Qwen/Qwen2.5-3B-Instruct',
+                reference_model_name='Qwen/Qwen2.5-3B-Instruct',
+                device='cpu',  # Use CPU for compatibility
+                batch_groups=1,
+                lr=1e-5,
+                max_steps=int(grpo_steps),
+                log_interval=20,
+                ckpt_interval=200,
+                out_dir=Path('.grpo'),
+                adv_clip=5.0,
+                kl_coeff=0.02,
+                lr_step_size=None,
+                lr_gamma=None,
+                kl_warmup_steps=None,
+                kl_target=None,
+            )
+            trainer = GRPOTrainer(cfg)
+            recent = []
+            def on_metrics(m):
+                nonlocal recent
+                recent.append(m)
+                if len(recent) > 10:
+                    recent[:] = recent[-10:]
+                console.print(f"step={m.step} loss={m.loss:.4f} kl={m.kl:.4f} adv={m.adv_mean:.3f}±{m.adv_std:.3f}")
+                # Publish GRPO metrics to streaming
+                if streaming and streaming_bus:
+                    try:
+                        streaming_bus.publish("agent.grpo_metrics", {
+                            "step": m.step,
+                            "loss": m.loss,
+                            "kl": m.kl,
+                            "adv_mean": m.adv_mean,
+                            "adv_std": m.adv_std,
+                            "timestamp": time.time(),
+                            "signature": signature
+                        })
+                    except Exception:
+                        pass
+            trainer.train(on_metrics=on_metrics)
+            if recent:
+                last = recent[-1]
+                body = f"steps={last.step} loss={last.loss:.4f} kl={last.kl:.4f} adv={last.adv_mean:.3f}±{last.adv_std:.3f}\nckpts={cfg.out_dir / 'checkpoints'}\nmetrics={cfg.out_dir / 'metrics.jsonl'}"
+            else:
+                body = f"No metrics collected. ckpts={Path('.grpo') / 'checkpoints'} metrics={Path('.grpo') / 'metrics.jsonl'}"
+            console.print(Panel.fit(body, title="train-easy (grpo)", border_style="green"))
+        except Exception as e:
+            console.print(Panel(escape(str(e)), title="grpo phase failed", border_style="red"))
+            raise typer.Exit(1)
+    elif streaming and multi_policy:
+        # Auto-generate GRPO dataset from streaming data
+        console.print(Panel.fit("Auto-generating GRPO dataset from streaming data", title="train-easy", border_style="cyan"))
+        try:
+            # Try to import mine function, fallback to basic dataset creation
+            try:
+                from .grpo.mine import mine_grpo_dataset
+                auto_dataset = Path('.grpo_auto.jsonl')
+                mine_grpo_dataset(
+                    out_path=auto_dataset,
+                    signature=signature,
+                    environment=environment,
+                    limit=1000
+                )
+            except ImportError:
+                # Fallback: create basic dataset from recent actions
+                from .db.enhanced_storage import get_enhanced_data_manager
+                dm = get_enhanced_data_manager()
+                recent_actions = dm.get_recent_actions(100)
+                auto_dataset = Path('.grpo_auto.jsonl')
+                with auto_dataset.open('w') as f:
+                    for action in recent_actions:
+                        f.write(f'{{"prompt": "Tool usage", "candidates": [{{"text": "{action.tool}", "reward": {action.reward}}}]}}\n')
+            if auto_dataset.exists():
+                grpo_dataset = auto_dataset
+                console.print(f"✅ Generated dataset: {auto_dataset}")
+            else:
+                console.print("⚠️ Could not generate dataset from streaming data")
+        except Exception as e:
+            console.print(f"⚠️ Auto-dataset generation failed: {e}")
+    else:
+        console.print(Panel.fit("Skipping GRPO phase (no --grpo-dataset provided or file missing)", title="train-easy", border_style="yellow"))
+
+    # Final report
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        dm = get_enhanced_data_manager()
+        acts = dm.get_recent_actions(50)
+        avg = sum(a.reward for a in acts) / len(acts) if acts else 0.0
+        console.print(Panel.fit(f"recent_actions={len(acts)} avg_reward={avg:.3f}", title="train-easy done", border_style="cyan"))
+    except Exception:
+        pass
+
+
+@app.command("train-streaming")
+def train_streaming(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, dir_okay=True, help="Workspace directory"),
+    signature: str = typer.Option("CodeContextSig", "--signature", help="Signature for labeling analytics"),
+    rl_steps: int = typer.Option(500, "--rl-steps", help="Steps for tool-selection RL phase"),
+    grpo_steps: int = typer.Option(1000, "--grpo-steps", help="Max steps for GRPO phase"),
+    n_envs: int = typer.Option(4, "--n-envs", help="Parallel envs for RL"),
+    episode_len: int = typer.Option(5, "--episode-len", help="Multi-step episode length for sequential policies"),
+    actions: Optional[str] = typer.Option(None, "--actions", help="Comma-separated allowed actions (optional)"),
+    environment: str = typer.Option("development", "--env", help="Environment label for analytics"),
+    kafka_bootstrap: str = typer.Option("localhost:9092", "--kafka-bootstrap", help="Kafka bootstrap servers"),
+    reddb_url: str = typer.Option("http://localhost:8080", "--reddb-url", help="RedDB URL for analytics"),
+    spark_master: str = typer.Option("local[*]", "--spark-master", help="Spark master URL"),
+    continuous: bool = typer.Option(False, "--continuous", help="Run continuous training loop"),
+    max_iterations: int = typer.Option(10, "--max-iterations", help="Max continuous training iterations"),
+):
+    """Advanced streaming-based multi-policy training with real-time data integration."""
+    import time
+    import threading
+    from pathlib import Path
+    
+    console.print(Panel.fit("🚀 Streaming Multi-Policy Training System", title="train-streaming", border_style="bold cyan"))
+    
+    # ---------------- Streaming Infrastructure Setup ----------------
+    console.print(Panel.fit("Setting up streaming infrastructure", title="train-streaming", border_style="blue"))
+    
+    # Set environment variables for streaming
+    import os
+    os.environ.setdefault('KAFKA_BOOTSTRAP_SERVERS', kafka_bootstrap)
+    os.environ.setdefault('REDDB_URL', reddb_url)
+    os.environ.setdefault('SPARK_MASTER', spark_master)
+    
+    # Initialize streaming components
+    streaming_bus = None
+    spark_session = None
+    
+    try:
+        from .streaming.event_bus import get_event_bus
+        from .streaming.kafka_log import get_kafka_logger
+        streaming_bus = get_event_bus()
+        console.print("✅ Event bus ready")
+    except Exception as e:
+        console.print(f"⚠️ Event bus setup failed: {e}")
+        raise typer.Exit(1)
+    
+    # Initialize Spark for real-time processing
+    try:
+        import pyspark
+        from pyspark.sql import SparkSession
+        spark_session = SparkSession.builder \
+            .appName("DSPyStreamingTraining") \
+            .master(spark_master) \
+            .config("spark.sql.shuffle.partitions", "4") \
+            .config("spark.streaming.kafka.maxRatePerPartition", "1000") \
+            .getOrCreate()
+        console.print("✅ Spark session ready")
+    except ImportError:
+        console.print("⚠️ PySpark not available, skipping Spark integration")
+        spark_session = None
+    except Exception as e:
+        console.print(f"⚠️ Spark setup failed: {e}")
+        spark_session = None
+    
+    # ---------------- Multi-Policy Training Loop ----------------
+    def run_training_iteration(iteration: int):
+        """Run a single training iteration with streaming data"""
+        console.print(Panel.fit(f"Training Iteration {iteration}", title="train-streaming", border_style="magenta"))
+        
+        # Phase 1: RL Tool Selection with Streaming Context
+        console.print("Phase 1: RL Tool Selection with Streaming Context")
+        try:
+            from .rl.rlkit import RLToolEnv, EnvConfig, RewardConfig, aggregate_reward, train_puffer_policy, detect_toolchain, ToolchainExecutor
+            from .rl.rlkit import make_default_analytics_cb as _mk_cb
+            
+            # Enhanced context provider using streaming data
+            def streaming_context_provider():
+                try:
+                    from .db.enhanced_storage import get_enhanced_data_manager
+                    dm = get_enhanced_data_manager()
+                    recent_actions = dm.get_recent_actions(5)  # Reduced to avoid large context
+                    context = []
+                    for action in recent_actions:
+                        context.extend([action.reward, float(action.timestamp)])
+                    # Ensure consistent context size - use smaller, fixed size
+                    while len(context) < 10:
+                        context.append(0.0)
+                    return context[:10]  # Fixed context size
+                except Exception:
+                    # Return default context to avoid dimension issues
+                    return [0.0] * 10
+            
+            # Default verifiers
+            import importlib
+            vmod = importlib.import_module('dspy_agent.verifiers.custom')
+            verifiers = list(vmod.get_verifiers()) if hasattr(vmod, 'get_verifiers') else []
+            weights = {getattr(v, 'kind', f'v{i}'): 1.0 for i, v in enumerate(verifiers)}
+            rc = RewardConfig(weights=weights)
+
+            def enhanced_reward_fn(result, vlist, wmap):
+                reward = aggregate_reward(result, vlist, rc)
+                # Publish to streaming with enhanced metadata
+                if streaming_bus:
+                    try:
+                        streaming_bus.publish("agent.enhanced_rewards", {
+                            "reward": reward,
+                            "timestamp": time.time(),
+                            "signature": signature,
+                            "environment": environment,
+                            "iteration": iteration,
+                            "phase": "rl_tool_selection"
+                        })
+                    except Exception:
+                        pass
+                return reward
+
+            tcfg = detect_toolchain(workspace)
+            execu = ToolchainExecutor(tcfg)
+
+            def enhanced_executor(tool, args) -> Any:
+                result = execu(tool, args)
+                # Enhanced tool usage logging
+                if streaming_bus:
+                    try:
+                        streaming_bus.publish("agent.enhanced_tool_usage", {
+                            "tool": tool,
+                            "args": args,
+                            "result": str(result)[:1000],
+                            "timestamp": time.time(),
+                            "signature": signature,
+                            "iteration": iteration,
+                            "phase": "rl_tool_selection"
+                        })
+                    except Exception:
+                        pass
+                return result
+
+            allowed_actions = None
+            if actions:
+                arr = [a.strip() for a in actions.split(',') if a.strip()]
+                allowed_actions = arr or None
+
+            # Ensure context provider has proper fallback
+            def safe_context_provider():
+                try:
+                    return streaming_context_provider()
+                except Exception:
+                    return [0.0] * 10
+
+            env_cfg = EnvConfig(
+                verifiers=verifiers,
+                reward_fn=enhanced_reward_fn,
+                weights=weights,
+                context_provider=safe_context_provider,
+                action_args=None,
+                allowed_actions=allowed_actions,
+            )
+
+            def make_env() -> RLToolEnv:
+                env = RLToolEnv(enhanced_executor, env_cfg, episode_len=episode_len)
+                try:
+                    env.set_signature_name(signature)
+                except Exception:
+                    pass
+                return env
+
+            cb = _mk_cb(signature, env=environment)
+            
+            # Multi-step PPO training
+            res = train_puffer_policy(
+                make_env=make_env, 
+                steps=int(rl_steps), 
+                n_envs=max(1, int(n_envs)),
+                lr=1e-4,
+                entropy_coef=0.01
+            )
+            
+            avg_reward = sum(res.rewards) / len(res.rewards) if getattr(res, 'rewards', None) else 0.0
+            console.print(f"✅ RL Phase: avg_reward={avg_reward:.3f} episode_len={episode_len}")
+            
+        except Exception as e:
+            console.print(f"❌ RL Phase failed: {e}")
+            return False
+        
+        # Phase 2: GRPO with Streaming Data Mining
+        console.print("Phase 2: GRPO with Streaming Data Mining")
+        try:
+            from .grpo.trainer import GRPOConfig, GRPOTrainer
+            
+            # Mine dataset from streaming data
+            streaming_dataset = Path(f'.grpo_streaming_{iteration}.jsonl')
+            try:
+                from .grpo.mine import mine_grpo_dataset
+                mine_grpo_dataset(
+                    out_path=streaming_dataset,
+                    signature=signature,
+                    environment=environment,
+                    limit=2000  # Larger dataset for streaming
+                )
+            except ImportError:
+                # Fallback: create dataset from recent actions
+                from .db.enhanced_storage import get_enhanced_data_manager
+                dm = get_enhanced_data_manager()
+                recent_actions = dm.get_recent_actions(200)
+                with streaming_dataset.open('w') as f:
+                    for action in recent_actions:
+                        f.write(f'{{"prompt": "Tool usage", "candidates": [{{"text": "{action.tool}", "reward": {action.reward}}}]}}\n')
+            
+            if streaming_dataset.exists():
+                cfg = GRPOConfig(
+                    dataset_path=streaming_dataset,
+                    model_name='Qwen/Qwen2.5-3B-Instruct',
+                    reference_model_name='Qwen/Qwen2.5-3B-Instruct',
+                    device='cpu',  # Use CPU for compatibility
+                    batch_groups=2,  # Larger batches for streaming
+                    lr=5e-6,  # Lower LR for stability
+                    max_steps=int(grpo_steps),
+                    log_interval=50,
+                    ckpt_interval=500,
+                    out_dir=Path(f'.grpo_streaming_{iteration}'),
+                    adv_clip=3.0,
+                    kl_coeff=0.01,
+                )
+                
+                trainer = GRPOTrainer(cfg)
+                recent = []
+                
+                def on_metrics(m):
+                    nonlocal recent
+                    recent.append(m)
+                    if len(recent) > 20:
+                        recent[:] = recent[-20:]
+                    console.print(f"GRPO step={m.step} loss={m.loss:.4f} kl={m.kl:.4f} adv={m.adv_mean:.3f}±{m.adv_std:.3f}")
+                    
+                    # Publish GRPO metrics to streaming
+                    if streaming_bus:
+                        try:
+                            streaming_bus.publish("agent.grpo_streaming_metrics", {
+                                "step": m.step,
+                                "loss": m.loss,
+                                "kl": m.kl,
+                                "adv_mean": m.adv_mean,
+                                "adv_std": m.adv_std,
+                                "timestamp": time.time(),
+                                "signature": signature,
+                                "iteration": iteration,
+                                "phase": "grpo_streaming"
+                            })
+                        except Exception:
+                            pass
+                
+                trainer.train(on_metrics=on_metrics)
+                console.print(f"✅ GRPO Phase: completed {grpo_steps} steps")
+                
+                # Cleanup dataset
+                try:
+                    streaming_dataset.unlink()
+                except Exception:
+                    pass
+                    
+            else:
+                console.print("⚠️ Could not generate streaming dataset")
+                
+        except Exception as e:
+            console.print(f"❌ GRPO Phase failed: {e}")
+            return False
+        
+        return True
+    
+    # ---------------- Main Training Loop ----------------
+    if continuous:
+        console.print(Panel.fit(f"Starting continuous training for {max_iterations} iterations", title="train-streaming", border_style="bold green"))
+        
+        for iteration in range(1, max_iterations + 1):
+            try:
+                success = run_training_iteration(iteration)
+                if not success:
+                    console.print(f"❌ Iteration {iteration} failed, stopping")
+                    break
+                    
+                # Brief pause between iterations
+                if iteration < max_iterations:
+                    console.print("⏳ Pausing before next iteration...")
+                    time.sleep(5)
+                    
+            except KeyboardInterrupt:
+                console.print("🛑 Training interrupted by user")
+                break
+            except Exception as e:
+                console.print(f"❌ Iteration {iteration} failed with error: {e}")
+                break
+    else:
+        # Single iteration
+        run_training_iteration(1)
+    
+    # ---------------- Final Report ----------------
+    try:
+        from .db.enhanced_storage import get_enhanced_data_manager
+        dm = get_enhanced_data_manager()
+        acts = dm.get_recent_actions(100)
+        avg = sum(a.reward for a in acts) / len(acts) if acts else 0.0
+        console.print(Panel.fit(f"Streaming Training Complete: recent_actions={len(acts)} avg_reward={avg:.3f}", title="train-streaming", border_style="bold green"))
+    except Exception:
+        pass
+    
+    # Cleanup
+    if spark_session:
+        try:
+            spark_session.stop()
+        except Exception:
+            pass
 
 
 @app.command()

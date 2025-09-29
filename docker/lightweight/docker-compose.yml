@@ -21,6 +21,12 @@ services:
         - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
         - KAFKA_CLIENT_ID=dspy-agent
         - KAFKA_TOPIC_PREFIX=
+        # Cache configuration to fix SQLite syntax errors
+        - DSPY_CACHE_DIR=/workspace/.dspy_cache
+        - DISKCACHE_DISABLE_SQLITE_OPTIMIZATIONS=1
+        - DISKCACHE_DISABLE_SQLITE_PRAGMA=1
+        - DISKCACHE_DISABLE_SQLITE_WAL=1
+        - DISKCACHE_DISABLE_SQLITE_JOURNAL=1
         # Advanced features
         - DSPY_ENABLE_AUTO_SCALING=true
         - DSPY_PERFORMANCE_MODE=optimized
@@ -430,6 +436,13 @@ services:
       depends_on:
         kafka:
           condition: service_healthy
+      environment:
+        # Cache configuration to fix SQLite syntax errors
+        - DSPY_CACHE_DIR=/workspace/.dspy_cache
+        - DISKCACHE_DISABLE_SQLITE_OPTIMIZATIONS=1
+        - DISKCACHE_DISABLE_SQLITE_PRAGMA=1
+        - DISKCACHE_DISABLE_SQLITE_WAL=1
+        - DISKCACHE_DISABLE_SQLITE_JOURNAL=1
       entrypoint: ["/entrypoints/run_worker.sh", "app"]
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
@@ -484,6 +497,13 @@ services:
       depends_on:
         kafka:
           condition: service_healthy
+      environment:
+        # Cache configuration to fix SQLite syntax errors
+        - DSPY_CACHE_DIR=/workspace/.dspy_cache
+        - DISKCACHE_DISABLE_SQLITE_OPTIMIZATIONS=1
+        - DISKCACHE_DISABLE_SQLITE_PRAGMA=1
+        - DISKCACHE_DISABLE_SQLITE_WAL=1
+        - DISKCACHE_DISABLE_SQLITE_JOURNAL=1
       entrypoint: ["/entrypoints/run_worker.sh", "frontend"]
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
