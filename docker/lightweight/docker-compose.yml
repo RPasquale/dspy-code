@@ -1,7 +1,8 @@
 services:
     dspy-agent:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
+      working_dir: /workspace
       build:
         context: ../..
         dockerfile: docker/lightweight/Dockerfile
@@ -13,11 +14,21 @@ services:
         - REDDB_URL=http://reddb:8080
         - REDDB_NAMESPACE=dspy
         - REDDB_TOKEN=${REDDB_ADMIN_TOKEN}
-        - MODEL_NAME=qwen3:1.7b
+        - MODEL_NAME=${MODEL_NAME:-deepseek-coder:1.3b}
         - OPENAI_API_KEY=
         - OPENAI_BASE_URL=http://ollama:11434
-        - OLLAMA_MODEL=qwen3:1.7b
+        - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-coder:1.3b}
         - OLLAMA_API_KEY=
+        - OLLAMA_MODELS=${OLLAMA_MODELS:-deepseek-coder:1.3b,qwen3:1.7b}
+        - OLLAMA_MAX_TOKENS=${OLLAMA_MAX_TOKENS:-1024}
+        - OLLAMA_KEEP_ALIVE
+        - OLLAMA_ALLOW_MISSING_MODEL
+        - OLLAMA_TAG_TIMEOUT
+        - DSPY_LM_TIMEOUT
+        - DSPY_OLLAMA_TIMEOUT
+        - DSPY_OPENAI_TIMEOUT
+        - DSPY_LM_MAX_RETRIES
+        - DSPY_LM_NUM_RETRIES
         - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
         - KAFKA_CLIENT_ID=dspy-agent
         - KAFKA_TOPIC_PREFIX=
@@ -32,10 +43,15 @@ services:
         - DSPY_PERFORMANCE_MODE=optimized
         - DSPY_INTELLIGENT_CACHING=true
         - DSPY_ADAPTIVE_LEARNING=true
+        - PYTHONPATH=/workspace
+        # Docker environment flag to override dspy.IS_STUB
+        - DOCKER_ENV=true
+        # Disable background auto-training loops for interactive sessions
+        - DSPY_AUTO_TRAIN=0
       entrypoint: ["/entrypoints/run_dspy_agent.sh"]
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
-        - ${WORKSPACE_DIR}/logs:/workspace/logs:ro
+        - ${WORKSPACE_DIR}/logs:/workspace/logs:rw
         - ./entrypoints:/entrypoints:ro
         - dspy-cache:/home/agent/.dspy_cache:rw
       ports:
@@ -79,6 +95,8 @@ services:
         - OLLAMA_MAX_LOADED_MODELS=1
         - OLLAMA_NUM_PARALLEL=1
         - OLLAMA_MAX_QUEUE=512
+        - OLLAMA_MODELS=${OLLAMA_MODELS:-deepseek-coder:1.3b,qwen3:1.7b}
+        - OLLAMA_STARTUP_DELAY
       deploy:
         resources:
           limits:
@@ -217,7 +235,7 @@ services:
 
     fastapi-backend:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       working_dir: /app
       entrypoint: ["/bin/sh", "-lc", "python -m dspy_agent.server.fastapi_backend"]
       environment:
@@ -227,6 +245,7 @@ services:
         - DSPY_WORKSPACE=/workspace
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
       ports:
         - "127.0.0.1:8767:8767"
       depends_on:
@@ -330,14 +349,16 @@ services:
     # Dedicated dashboard service (serves enhanced_dashboard_server on port 8081)
     dashboard:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       working_dir: /app
-      entrypoint: ["bash", "-lc", "cd /workspace && python3 enhanced_dashboard_server.py 8081"]
+      entrypoint: ["bash", "-lc", "python3 -m enhanced_dashboard_server 8081"]
       environment:
         - WORKSPACE_DIR=/workspace
         - DSPY_WORKSPACE=/workspace
+        - PYTHONPATH=/workspace
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
       ports:
         - "127.0.0.1:18081:8081"
       restart: unless-stopped
@@ -372,7 +393,7 @@ services:
         - EMBED_MAX_WAIT_SEC=${EMBED_MAX_WAIT_SEC:-0.5}
         - EMBED_WRITE_PARQUET=1
         - EMBED_NORMALIZE=${EMBED_NORMALIZE:-0}
-        - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings_imesh
+        - EMBED_PARQUET_DIR=/workspace/vectorized/embeddings
         - INFERMESH_ROUTING_STRATEGY=${INFERMESH_ROUTING_STRATEGY:-hybrid}
         - INFERMESH_CACHE_TTL=${INFERMESH_CACHE_TTL:-300}
         - REDDB_URL
@@ -393,9 +414,8 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -432,7 +452,7 @@ services:
 
     dspy-worker:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       depends_on:
         kafka:
           condition: service_healthy
@@ -452,9 +472,8 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -466,7 +485,7 @@ services:
 
     dspy-worker-backend:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       depends_on:
         kafka:
           condition: service_healthy
@@ -479,9 +498,8 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -493,7 +511,7 @@ services:
 
     dspy-worker-frontend:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       depends_on:
         kafka:
           condition: service_healthy
@@ -513,9 +531,8 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -542,38 +559,35 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
+      profiles:
+        - testing
 
     dspy-code-watch:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       depends_on:
         kafka:
           condition: service_healthy
-      entrypoint: ["/bin/bash", "-lc"]
-      command: >-
-        python - <<'PY'
-        from dspy_agent.code_tools.code_watch import CodeWatcher
-        from pathlib import Path
-        CodeWatcher(Path('/workspace')).run()
-        PY
+      environment:
+        - PYTHONPATH=/workspace
+      entrypoint: ["/entrypoints/run_code_watch.sh"]
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
       healthcheck:
-        test: ["CMD-SHELL", "pgrep -f 'code_watch' >/dev/null 2>&1 || exit 1"]
+        test: ["CMD-SHELL", "pgrep -f 'python' >/dev/null 2>&1 || exit 1"]
         interval: 15s
         timeout: 5s
         retries: 10
@@ -581,29 +595,26 @@ services:
 
     dspy-code-indexer:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       depends_on:
         kafka:
           condition: service_healthy
-      entrypoint: ["/bin/bash", "-lc"]
-      command: >-
-        python - <<'PY'
-        from dspy_agent.code_tools.code_indexer_worker import CodeIndexerWorker
-        CodeIndexerWorker('kafka:9092').run()
-        PY
+      environment:
+        - PYTHONPATH=/workspace
+      entrypoint: ["/entrypoints/run_code_indexer.sh"]
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
+        - ./entrypoints:/entrypoints:ro
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
       healthcheck:
-        test: ["CMD-SHELL", "pgrep -f 'code_indexer_worker' >/dev/null 2>&1 || exit 1"]
+        test: ["CMD-SHELL", "pgrep -f 'python' >/dev/null 2>&1 || exit 1"]
         interval: 15s
         timeout: 5s
         retries: 10
@@ -611,7 +622,7 @@ services:
 
     dspy-router:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       depends_on:
         kafka:
           condition: service_healthy
@@ -627,7 +638,7 @@ services:
 
     rl-trainer:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       entrypoint: ["/bin/bash","-lc"]
       command: >-
         python -m dspy_agent.training.entrypoint \
@@ -642,11 +653,13 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
+      profiles:
+        - testing
+
     emb-indexer:
       build:
         context: ../..
@@ -671,9 +684,8 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
     spark-vectorizer:
@@ -692,7 +704,7 @@ services:
         - SPARK_LOCAL_DIRS=/tmp
         - SPARK_CONF_DIR=/opt/bitnami/spark/conf
         - KAFKA_BOOTSTRAP=kafka:9092
-        - SPARK_KAFKA_TOPICS=agent.results
+        - SPARK_KAFKA_TOPICS=code.fs.events
         - VEC_OUTPUT_DIR=/workspace/vectorized/embeddings
         - VEC_CHECKPOINT=/workspace/.dspy_checkpoints/vectorizer
         - SINK_INPUT_TOPIC=embedding_input
@@ -709,9 +721,6 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: false
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
       cap_drop:
         - ALL
       healthcheck:
@@ -747,11 +756,12 @@ services:
       security_opt:
         - no-new-privileges:true
       read_only: true
-      # tmpfs disabled for compatibility; uncomment if needed
-      # tmpfs:
-      #   - /tmp
+      tmpfs:
+        - /tmp
       cap_drop:
         - ALL
+      profiles:
+        - testing
 
     test-suite:
       build:
@@ -771,20 +781,9 @@ services:
     # Intelligent auto-scaling service
     auto-scaler:
       image: dspy-lightweight:latest
-      user: "10001:10001"
+      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
       working_dir: /app
-      entrypoint: ["/bin/bash", "-lc"]
-      command: >-
-        python - <<'PY'
-        from dspy_agent.monitor.auto_scaler import AutoScaler
-        import os
-        scaler = AutoScaler(
-            workspace=os.getenv('WORKSPACE_DIR', '/workspace'),
-            kafka_bootstrap=os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092'),
-            reddb_url=os.getenv('REDDB_URL', 'http://reddb:8080')
-        )
-        scaler.start_monitoring()
-        PY
+      entrypoint: ["/entrypoints/run_auto_scaler.sh"]
       environment:
         - WORKSPACE_DIR=/workspace
         - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -793,6 +792,7 @@ services:
         - AUTO_SCALER_INTERVAL=30
         - AUTO_SCALER_CPU_THRESHOLD=80
         - AUTO_SCALER_MEMORY_THRESHOLD=85
+        - PYTHONPATH=/workspace
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
         - ./entrypoints:/entrypoints:ro
@@ -810,7 +810,7 @@ services:
       cap_drop:
         - ALL
       healthcheck:
-        test: ["CMD-SHELL", "pgrep -f 'auto_scaler' >/dev/null 2>&1 || exit 1"]
+        test: ["CMD-SHELL", "pgrep -f 'python' >/dev/null 2>&1 || exit 1"]
         interval: 30s
         timeout: 5s
         retries: 5
@@ -870,10 +870,10 @@ services:
         - CONNECTION_POOL_SIZE=50
         - REDIS_URL=redis://redis:6379
         - ENV_QUEUE_DIR=/app/logs/env_queue
-        - METRICS_PORT=8080
+        - METRICS_PORT=8083
       entrypoint: ["/usr/local/bin/env_runner"]
       ports:
-        - "127.0.0.1:8081:8080"
+        - "127.0.0.1:8081:8083"
       volumes:
         - ./logs:/app/logs
       depends_on:
@@ -882,7 +882,7 @@ services:
         - go-orchestrator
       restart: unless-stopped
       healthcheck:
-        test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+        test: ["CMD-SHELL", "curl -f http://localhost:8083/health || exit 1"]
         interval: 10s
         timeout: 5s
         retries: 5

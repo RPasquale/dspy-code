@@ -10,8 +10,10 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .llm import get_default_ollama_model, detect_available_ollama_models
 
-DEFAULT_MODEL = "qwen3:1.7b"
+
+DEFAULT_MODEL = get_default_ollama_model()
 
 
 def _print_success(message: str) -> None:
@@ -81,8 +83,12 @@ def _export_environment(args: argparse.Namespace) -> dict[str, str]:
     else:
         if shutil.which("ollama"):
             env.setdefault("USE_OLLAMA", "true")
-        if args.model:
-            env.setdefault("OLLAMA_MODEL", args.model)
+        model = args.model or DEFAULT_MODEL
+        env.setdefault("OLLAMA_MODEL", model)
+        env.setdefault("MODEL_NAME", model)
+        available = detect_available_ollama_models()
+        if available:
+            env.setdefault("OLLAMA_MODELS", ",".join(available))
     return env
 
 

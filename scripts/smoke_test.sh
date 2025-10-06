@@ -10,7 +10,7 @@ set -euo pipefail
 # Environment variables:
 #   WORKSPACE       (default: current dir)
 #   LOGS            (default: $WORKSPACE/logs)
-#   MODEL           (default: qwen3:1.7b)
+#   MODEL           (default: deepseek-coder:1.3b)
 #   OLLAMA          (default: 1)
 #   BASE_URL        (default: empty)
 #   API_KEY         (default: empty)
@@ -19,7 +19,7 @@ set -euo pipefail
 
 WORKSPACE=${WORKSPACE:-"$(pwd)"}
 LOGS=${LOGS:-"$WORKSPACE/logs"}
-MODEL=${MODEL:-"qwen3:1.7b"}
+MODEL=${MODEL:-"deepseek-coder:1.3b"}
 OLLAMA=${OLLAMA:-1}
 BASE_URL=${BASE_URL:-""}
 API_KEY=${API_KEY:-""}
@@ -89,4 +89,3 @@ for path in ['/api/status','/api/signatures','/api/metrics']:
 PY
 
 echo "[9/9] Success: basic smoke tests completed"
-

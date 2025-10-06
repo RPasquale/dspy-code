@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional, Tuple, List, Dict
 
@@ -17,6 +18,37 @@ except Exception:  # pragma: no cover - optional
 import json as _json
 import urllib.request as _req
 import urllib.error as _err
+
+
+logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Best-effort float parsing for environment overrides."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Best-effort int parsing for environment overrides."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except Exception:
+        return default
 
 
 def _clamp_litellm_timeout(max_seconds: int = 120) -> None:
@@ -37,12 +69,24 @@ def _clamp_litellm_timeout(max_seconds: int = 120) -> None:
     os.environ.setdefault("LITELLM_NUM_RETRIES", "2")
 
 
-def _ollama_tags(api_base: str, timeout: float = 0.5) -> List[str]:
+def _split_model_list(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    models: List[str] = []
+    for chunk in str(raw).replace(";", ",").split(","):
+        token = chunk.strip()
+        if token:
+            models.append(token)
+    return models
+
+
+def _ollama_tags(api_base: str, timeout: Optional[float] = None) -> List[str]:
     """Fetch available model tags from Ollama. Returns [] on error."""
     try:
         url = api_base.rstrip("/") + "/api/tags"
         req = _req.Request(url, method="GET")
-        with _req.urlopen(req, timeout=timeout) as resp:
+        eff_timeout = timeout if timeout is not None else _env_float("OLLAMA_TAG_TIMEOUT", 2.0)
+        with _req.urlopen(req, timeout=eff_timeout) as resp:
             raw = resp.read().decode("utf-8", errors="ignore")
             data = _json.loads(raw)
             models = data.get("models") or []
@@ -75,6 +119,70 @@ def check_ollama_ready(api_base: str, model: Optional[str]) -> Tuple[bool, bool]
     base = m.split(":", 1)[0]
     found = any((t == m) or (t.split(":", 1)[0] == base) for t in tags)
     return True, bool(found)
+
+
+def detect_available_ollama_models(preferred: Optional[List[str]] = None) -> List[str]:
+    """Return a best-effort ordered list of Ollama model tags to use."""
+
+    # Start with explicit env overrides
+    env_models = _split_model_list(os.getenv("OLLAMA_MODELS"))
+    if env_models:
+        return env_models
+    single = os.getenv("OLLAMA_MODEL") or os.getenv("MODEL_NAME")
+    if single:
+        models = _split_model_list(single)
+        if models:
+            return models
+
+    preferred = preferred or ["deepseek-coder:1.3b", "qwen3:1.7b"]
+
+    base_hint = os.getenv("OPENAI_BASE_URL") or os.getenv("OLLAMA_BASE_URL")
+    base_urls: List[str] = []
+    if base_hint:
+        base_urls.append(base_hint)
+    base_urls.extend([
+        "http://127.0.0.1:11435",
+        "http://127.0.0.1:11434",
+        "http://ollama:11434",
+    ])
+
+    seen: set[str] = set()
+    tags: List[str] = []
+    for base in base_urls:
+        key = base.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        tags = _ollama_tags(key)
+        if tags:
+            break
+
+    if tags:
+        ordered: List[str] = []
+        for pref in preferred:
+            if pref in ordered:
+                continue
+            if any(tag == pref for tag in tags):
+                ordered.append(pref)
+                continue
+            pref_base = pref.split(":", 1)[0]
+            for tag in tags:
+                if tag.split(":", 1)[0] == pref_base and tag not in ordered:
+                    ordered.append(tag)
+                    break
+        for tag in tags:
+            if tag not in ordered:
+                ordered.append(tag)
+        return ordered
+
+    return list(preferred)
+
+
+def get_default_ollama_model() -> str:
+    """Return the preferred Ollama model tag to use by default."""
+
+    models = detect_available_ollama_models()
+    return models[0] if models else "deepseek-coder:1.3b"
 
 
 def _truthy(env: str, default: bool = False) -> bool:
@@ -123,9 +231,14 @@ def configure_lm(
     clip_higher: Optional[float] = None,
 ) -> Optional[dspy.LM]:
     # If running with the lightweight local stub, skip LM entirely
+    # However, in Docker environments, we need to override this to allow LM configuration
     try:
         if getattr(dspy, 'IS_STUB', False):
-            return None
+            # In Docker environments, override IS_STUB to allow LM configuration
+            if os.getenv('DOCKER_ENV', 'false').lower() in {'true', '1', 'yes', 'on'}:
+                dspy.IS_STUB = False
+            else:
+                return None
     except Exception:
         pass
     settings = get_settings()
@@ -157,22 +270,41 @@ def configure_lm(
             effective_api_key = os.getenv("OLLAMA_API_KEY", "ollama")
         # Common default model name for Ollama
         if effective_model in (None, "gpt-4o-mini"):
-            effective_model = os.getenv("OLLAMA_MODEL", "llama3")
+            preferred = os.getenv("OLLAMA_MODEL")
+            if not preferred:
+                raw_models = os.getenv("OLLAMA_MODELS", "")
+                for candidate in raw_models.replace(",", " ").split():
+                    c = candidate.strip()
+                    if c:
+                        preferred = c
+                        break
+            effective_model = preferred or "llama3"
 
-        # Fast readiness probe to avoid 10-minute hangs when server/model missing
+        # Fast readiness probe for insight; proceed even if warnings fire
         server_ok, model_ok = check_ollama_ready(effective_base_url, effective_model)
         if not server_ok:
-            # No server → skip LM entirely
-            return None
-        if not model_ok:
-            # Server up but model missing → also skip; user can pull model or change name
-            return None
+            logger.warning(
+                "Ollama server at %s not responding to /api/tags probe; continuing setup anyway",
+                effective_base_url,
+            )
+        if server_ok and not model_ok and not _truthy("OLLAMA_ALLOW_MISSING_MODEL"):
+            logger.warning(
+                "Ollama model '%s' not found in tags; continuing (set OLLAMA_ALLOW_MISSING_MODEL=1 to suppress)",
+                effective_model,
+            )
 
         provider_model = f"ollama/{effective_model}"
         lm_kwargs.update({
             "api_key": effective_api_key,
             "api_base": effective_base_url,
         })
+
+        max_tokens = _env_int("OLLAMA_MAX_TOKENS", 0)
+        if max_tokens > 0:
+            lm_kwargs["max_tokens"] = max_tokens
+        keep_alive = os.getenv("OLLAMA_KEEP_ALIVE")
+        if keep_alive:
+            lm_kwargs["keep_alive"] = keep_alive
     else:
         # Default to OpenAI
         provider = "openai"
@@ -184,12 +316,22 @@ def configure_lm(
             lm_kwargs["api_base"] = effective_base_url
 
     # Instantiate the LM using DSPy v3 API (via LiteLLM)
-    _clamp_litellm_timeout(60)
+    timeout_default = 180 if provider == "ollama" else 60
+    timeout_seconds = _env_float("DSPY_LM_TIMEOUT", float(timeout_default))
+    if provider == "ollama":
+        timeout_seconds = _env_float("DSPY_OLLAMA_TIMEOUT", timeout_seconds)
+    else:
+        timeout_seconds = _env_float("DSPY_OPENAI_TIMEOUT", timeout_seconds)
+
+    retries_default = _env_int("DSPY_LM_MAX_RETRIES", 3)
+    num_retries_default = _env_int("DSPY_LM_NUM_RETRIES", retries_default)
+
+    _clamp_litellm_timeout(int(timeout_seconds))
     lm_kwargs.update({
-        "timeout": 60,            # DSPy/LiteLLM timeout - increased for better reliability
-        "request_timeout": 60,    # Some LiteLLM adapters use this key
-        "max_retries": 3,         # Increased retries
-        "num_retries": 3,
+        "timeout": timeout_seconds,
+        "request_timeout": timeout_seconds,
+        "max_retries": retries_default,
+        "num_retries": num_retries_default,
     })
 
     if temperature is not None:

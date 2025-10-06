@@ -101,13 +101,13 @@ setup_ollama() {
     if command -v ollama &> /dev/null; then
         print_status "Ollama is already installed"
         
-        # Check if qwen3:1.7b model is available
-        if ollama list | grep -q "qwen3:1.7b"; then
-            print_status "qwen3:1.7b model is available"
+        # Check if deepseek-coder:1.3b model is available
+        if ollama list | grep -q "deepseek-coder:1.3b"; then
+            print_status "deepseek-coder:1.3b model is available"
         else
-            print_warning "qwen3:1.7b model not found. Pulling it..."
-            ollama pull qwen3:1.7b
-            print_status "qwen3:1.7b model pulled"
+            print_warning "deepseek-coder:1.3b model not found. Pulling it..."
+            ollama pull deepseek-coder:1.3b
+            print_status "deepseek-coder:1.3b model pulled"
         fi
     else
         print_warning "Ollama not installed. You can install it from: https://ollama.com/download"

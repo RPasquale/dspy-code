@@ -31,12 +31,16 @@ dependencies = [
     # External verifiers package (best-effort; optional at runtime if unavailable)
     "verifiers @ git+https://github.com/willccbb/verifiers.git",
     "pyarrow>=21.0.0",
+    "pandas>=2.3.2",
+    "kafka-python>=2.2.15",
 ]
 
 [project.scripts]
 # New primary entrypoints
+dspy-code = "scripts.agent_launcher:main"
+dspy-stack = "scripts.manage_stack:main"
 dspy-agent = "dspy_agent.cli:app"
-dspy-code = "dspy_agent.cli:app"
+dspy-cli = "dspy_agent.cli:app"
 dspy-code-agent = "dspy_agent.cli:app"
 dspy-code-coder = "dspy_agent.cli:app"
 dspy-code-monitor = "scripts.realtime_monitoring_server:main"

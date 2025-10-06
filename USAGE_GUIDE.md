@@ -91,7 +91,7 @@ Options:
   --workspace PATH     Set workspace directory (default: current directory)
   --logs PATH          Set logs directory (default: workspace/logs)
   --ollama/--no-ollama Use Ollama by default (default: True)
-  --model TEXT         Default model (default: qwen3:1.7b)
+  --model TEXT         Override model (default: auto-detected)
   --base-url TEXT      Override base URL for LLM
   --api-key TEXT       API key for LLM
   --force-json         Force simple JSON outputs

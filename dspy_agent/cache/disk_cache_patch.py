@@ -19,7 +19,7 @@ def patch_diskcache():
         original_reset = diskcache.core.Cache.reset
         original_sql = diskcache.core.Cache._sql
         
-        def safe_reset(self, key, value, update=False):
+        def safe_reset(self, key, value=diskcache.core.ENOVAL, update=True):
             """Safe reset method that handles SQLite syntax errors."""
             try:
                 return original_reset(self, key, value, update)
@@ -30,21 +30,28 @@ def patch_diskcache():
                 raise
         
         def safe_sql(self):
-            """Safe SQL method that handles syntax errors."""
-            try:
-                return original_sql(self)
-            except Exception as e:
-                if "syntax error" in str(e).lower():
-                    logger.warning(f"Skipping problematic SQL: {e}")
-                    # Return a dummy SQL function
-                    def dummy_sql(*args, **kwargs):
-                        return type('Result', (), {'fetchall': lambda: []})()
-                    return dummy_sql
-                raise
+            """Return a wrapper around the original SQL executor that catches syntax errors."""
+            executor = original_sql.__get__(self, type(self))
+
+            def wrapped(statement, *args, **kwargs):
+                try:
+                    return executor(statement, *args, **kwargs)
+                except Exception as e:
+                    if "syntax error" in str(e).lower() or "pragma" in str(e).lower():
+                        logger.warning(f"Skipping problematic SQL: {e}")
+
+                        class _Result:
+                            def fetchall(self_inner):
+                                return []
+
+                        return _Result()
+                    raise
+
+            return wrapped
         
         # Apply patches
         diskcache.core.Cache.reset = safe_reset
-        diskcache.core.Cache._sql = safe_sql
+        diskcache.core.Cache._sql = property(safe_sql)
         
         logger.info("Applied diskcache SQLite syntax error patches")
         

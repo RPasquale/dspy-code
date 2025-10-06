@@ -119,7 +119,12 @@ except Exception:
 import dspy
 import logging
 from .config import get_settings
-from .llm import configure_lm, check_ollama_ready, temporary_lm
+from .llm import (
+    configure_lm,
+    check_ollama_ready,
+    temporary_lm,
+    get_default_ollama_model,
+)
 from .streaming.log_reader import extract_key_events, load_logs
 from .skills.context_builder import ContextBuilder
 from .skills.code_context import CodeContext
@@ -855,7 +860,7 @@ class AutoTrainingLoop:
         except Exception:
             self.rl_steps = 200
         self.ollama = bool(ollama)
-        self.model = model or os.getenv('DSPY_AUTO_MODEL', 'qwen3:1.7b')
+        self.model = model or os.getenv('DSPY_AUTO_MODEL') or get_default_ollama_model()
         self.base_url = base_url or os.getenv('DSPY_AUTO_BASE_URL')
         self.api_key = api_key or os.getenv('DSPY_AUTO_API_KEY')
         self._module_index = 0
@@ -1611,6 +1616,11 @@ def rl_neural(
     checkpoint_dir: Optional[Path] = typer.Option(None, '--checkpoint-dir', help="Checkpoint directory"),
     checkpoint_interval: int = typer.Option(0, '--checkpoint-interval', help="Checkpoint interval (steps, 0=off)"),
     early_stop_patience: int = typer.Option(0, '--early-stop', help="Early stop patience (0=off)"),
+    log_interval: int = typer.Option(10, '--log-interval', min=1, help="Steps between console log lines"),
+    echo_actions: bool = typer.Option(False, '--echo-actions/--no-echo-actions', help="Print each environment action detail"),
+    log_jsonl: Optional[Path] = typer.Option(None, '--log-jsonl', help="Write per-step JSON logs to this file"),
+    skip_gepa: bool = typer.Option(False, '--skip-gepa', help="Skip GEPA signature training before RL"),
+    gepa_module: List[str] = typer.Option([], '--gepa-module', help="GEPA module to train before RL (repeatable, default: context, task, code)"),
 ):
     """Delegate to trainers module to avoid duplication."""
     from .cli_rl_trainers import neural as _neural  # local import
@@ -1626,6 +1636,11 @@ def rl_neural(
         checkpoint_dir=checkpoint_dir,
         checkpoint_interval=checkpoint_interval,
         early_stop_patience=early_stop_patience,
+        log_interval=log_interval,
+        echo_actions=echo_actions,
+        log_jsonl=log_jsonl,
+        skip_gepa=skip_gepa,
+        gepa_module=gepa_module,
     )
 
 
@@ -2263,7 +2278,7 @@ def main(
     workspace: Optional[Path] = typer.Option(None, '--workspace', dir_okay=True, exists=True, help="Initial workspace"),
     logs: Optional[Path] = typer.Option(None, '--logs', dir_okay=True, file_okay=True, exists=False, help="Initial logs path"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama by default"),
-    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Default model"),
+    model: Optional[str] = typer.Option(None, '--model', help="Override default model (auto-detected)"),
     base_url: Optional[str] = typer.Option(None, '--base-url', help="Override base URL"),
     api_key: Optional[str] = typer.Option(None, '--api-key', help="API key"),
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs"),
@@ -2299,11 +2314,13 @@ def main(
         
         # Disable auto-training by default to avoid threading issues
         os.environ.setdefault('DSPY_AUTO_TRAIN', 'false')
+        resolved_model = model or get_default_ollama_model()
+
         _start_interactive_session(
             workspace=workspace,
             logs=logs,
             ollama=ollama,
-            model=model,
+            model=resolved_model,
             base_url=base_url,
             api_key=api_key,
             force_json=force_json,
@@ -2317,7 +2334,7 @@ def _start_interactive_session(
     workspace: Optional[Path] = None,
     logs: Optional[Path] = None,
     ollama: bool = True,
-    model: Optional[str] = "qwen3:1.7b",
+    model: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     force_json: bool = False,
@@ -2331,7 +2348,7 @@ def _start_interactive_session(
         workspace=workspace,
         logs=logs,
         ollama=ollama,
-        model=model,
+        model=model or get_default_ollama_model(),
         base_url=base_url,
         api_key=api_key,
         force_json=force_json,
@@ -2678,6 +2695,9 @@ def _maybe_configure_lm(use_lm: bool, ollama: bool, model: Optional[str], base_u
             clip_higher = float(cfg_dict.get('clip_higher')) if cfg_dict.get('clip_higher') is not None else None
         except Exception:
             clip_higher = None
+
+    if ollama and not model:
+        model = get_default_ollama_model()
 
     return configure_lm(
         provider="ollama" if ollama else None,
@@ -6725,7 +6745,7 @@ def start_command(
     workspace: Optional[Path] = typer.Option(None, '--workspace', dir_okay=True, exists=True, help="Initial workspace"),
     logs: Optional[Path] = typer.Option(None, '--logs', dir_okay=True, file_okay=True, exists=False, help="Initial logs path (defaults to <ws>/logs)"),
     ollama: bool = typer.Option(True, '--ollama/--no-ollama', help="Use Ollama by default in session"),
-    model: Optional[str] = typer.Option("qwen3:1.7b", '--model', help="Default model for session"),
+    model: Optional[str] = typer.Option(None, '--model', help="Override default model (auto-detected)"),
     base_url: Optional[str] = typer.Option(None, '--base-url', help="Override base URL"),
     api_key: Optional[str] = typer.Option(None, '--api-key', help="API key (unused for Ollama)"),
     force_json: bool = typer.Option(False, '--force-json', help="Force simple JSON outputs; skip structured-outputs"),
@@ -6778,9 +6798,11 @@ def start_command(
     if use_lm:
         try:
             provider = "ollama" if provider_is_ollama else "openai"
+            effective_model = model or get_default_ollama_model()
+            model = effective_model
             lm = configure_lm(
                 provider=provider,
-                model_name=model,
+                model_name=effective_model,
                 base_url=base_url,
                 api_key=api_key
             )
@@ -6814,7 +6836,7 @@ def start_command(
         eff_base = (base_url or os.getenv("OPENAI_BASE_URL") or "http://localhost:11434").rstrip("/")
         if eff_base.endswith("/v1"):
             eff_base = eff_base[:-3]
-        eff_model = model or os.getenv("MODEL_NAME") or os.getenv("OLLAMA_MODEL") or "llama3"
+        eff_model = model or os.getenv("MODEL_NAME") or os.getenv("OLLAMA_MODEL") or get_default_ollama_model()
         server_ok, model_ok = check_ollama_ready(eff_base, eff_model)
         if not server_ok:
             llm_label = "disabled (Ollama offline)"

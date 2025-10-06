@@ -7,12 +7,24 @@ echo "[entrypoint] starting ollama server"
 ollama serve &
 SERVE_PID=$!
 
-# Wait a moment for server to start
-sleep 10
+# Allow configurable startup delay before attempting pulls
+STARTUP_DELAY="${OLLAMA_STARTUP_DELAY:-8}"
+if [ "$STARTUP_DELAY" -gt 0 ] 2>/dev/null; then
+  sleep "$STARTUP_DELAY"
+fi
 
-# Pull the model if it doesn't exist
-echo "[entrypoint] pulling qwen3:1.7b model"
-ollama pull qwen3:1.7b || true
+# Determine which models to ensure are available
+RAW_MODELS="${OLLAMA_MODELS:-${OLLAMA_MODEL:-deepseek-coder:1.3b}}"
+NORMALIZED_MODELS=$(printf '%s' "$RAW_MODELS" | tr ',' ' ')
+
+for MODEL in $NORMALIZED_MODELS; do
+  CLEAN_MODEL=$(printf '%s' "$MODEL" | xargs)
+  if [ -z "$CLEAN_MODEL" ]; then
+    continue
+  fi
+  echo "[entrypoint] ensuring ollama model '$CLEAN_MODEL' is available"
+  ollama pull "$CLEAN_MODEL" || true
+done
 
 echo "[entrypoint] ollama ready, keeping server running"
 

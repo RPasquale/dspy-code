@@ -170,6 +170,9 @@ class StrictJSONAdapter(JSONAdapter):
         # Force simple JSON object mode; skip structured outputs completely.
         lm_kwargs = dict(lm_kwargs)
         lm_kwargs["response_format"] = {"type": "json_object"}
+        model_id = getattr(lm, "model", "")
+        if isinstance(model_id, str) and model_id.startswith("ollama/"):
+            lm_kwargs.setdefault("format", "json")
         
         # Add better error handling for empty responses
         # Circuit breaker: short-circuit if open

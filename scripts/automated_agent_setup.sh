@@ -225,8 +225,8 @@ setup_ollama() {
     sleep 5
     
     # Pull default model
-    log_info "Pulling default model (qwen3:1.7b)..."
-    ollama pull qwen3:1.7b || log_warning "Failed to pull model, continuing without it"
+    log_info "Pulling default model (deepseek-coder:1.3b)..."
+    ollama pull deepseek-coder:1.3b || log_warning "Failed to pull model, continuing without it"
     
     log_success "Ollama setup completed"
 }
@@ -255,7 +255,7 @@ WORKSPACE_DIR=$PROJECT_ROOT
 DSPY_LOG_LEVEL=INFO
 DSPY_AUTO_TRAIN=false
 USE_OLLAMA=true
-OLLAMA_MODEL=qwen3:1.7b
+OLLAMA_MODEL=deepseek-coder:1.3b
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 REDDB_URL=http://localhost:8080
 REDDB_NAMESPACE=dspy

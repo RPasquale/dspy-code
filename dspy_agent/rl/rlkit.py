@@ -20,6 +20,7 @@ import shutil
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -581,13 +582,135 @@ def bandit_trainer_puffer(make_env: Callable[[], RLToolEnv], cfg: TrainerConfig,
         return bandit_trainer(make_env, cfg, analytics_cb=analytics_cb)
 
 
-def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000, n_envs: int = 4, lr: float = 1e-3, seed: Optional[int] = None, verbose: bool = False, log_interval: int = 10, grad_clip: float = 1.0, checkpoint_dir: Optional[str] = None, checkpoint_interval: int = 0, early_stop_patience: int = 0, entropy_coef: float = 0.01, replay_capacity: int = 2048, replay_batch: int = 128) -> EpisodeStats:
+def train_puffer_policy(
+    *,
+    make_env: Callable[[], RLToolEnv],
+    steps: int = 1000,
+    n_envs: int = 4,
+    lr: float = 1e-3,
+    seed: Optional[int] = None,
+    verbose: bool = False,
+    log_interval: int = 10,
+    grad_clip: float = 1.0,
+    checkpoint_dir: Optional[str] = None,
+    checkpoint_interval: int = 0,
+    early_stop_patience: int = 0,
+    entropy_coef: float = 0.01,
+    replay_capacity: int = 2048,
+    replay_batch: int = 128,
+    echo_actions: bool = False,
+    log_jsonl: Optional[str] = None,
+) -> EpisodeStats:
     try:
         import torch
         import torch.nn as nn
         import torch.optim as optim
     except Exception as e:  # pragma: no cover - optional
         raise RuntimeError("Neural training requires torch. Install with 'pip install .[rl]'") from e
+    log_interval = max(1, int(log_interval or 1))
+    jsonl_handle = None
+    if log_jsonl:
+        log_path = Path(log_jsonl)
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            jsonl_handle = log_path.open('a', encoding='utf-8')
+        except Exception:
+            jsonl_handle = None
+    def _new_sig_stats():
+        return {"count": 0, "reward_sum": 0.0, "verifiers": defaultdict(float)}
+    signature_stats: defaultdict[str, Dict[str, Any]] = defaultdict(_new_sig_stats)
+
+    def _record_signature(signature: str, reward: float, verifiers: Mapping[str, Any]) -> None:
+        stats = signature_stats[signature]
+        stats["count"] += 1
+        stats["reward_sum"] += reward
+        if isinstance(verifiers, Mapping):
+            for name, value in verifiers.items():
+                if isinstance(value, (int, float)):
+                    stats["verifiers"][name] += float(value)
+
+    def _emit_logs(step_idx: int, avg_reward: float, rewards: Iterable[float], infos: Any) -> None:
+        info_list = infos if isinstance(infos, list) else [infos]
+        reward_iter = rewards if isinstance(rewards, (list, tuple)) else [rewards]
+        reward_list = [float(r) for r in reward_iter]
+        if len(reward_list) < len(info_list):
+            if reward_list:
+                reward_list.extend([reward_list[-1]] * (len(info_list) - len(reward_list)))
+            else:
+                reward_list = [0.0] * len(info_list)
+        step_sig_totals = defaultdict(lambda: {"count": 0, "reward_sum": 0.0, "verifiers": defaultdict(float)})
+        ts = time.time()
+        for env_idx, raw_info in enumerate(info_list):
+            info = raw_info if isinstance(raw_info, dict) else {}
+            reward_val = reward_list[env_idx] if env_idx < len(reward_list) else 0.0
+            signature = str(info.get("signature_name") or "default")
+            verifiers = info.get("verifier_scores") or info.get("verifiers") or {}
+            _record_signature(signature, reward_val, verifiers if isinstance(verifiers, Mapping) else {})
+            step_sig = step_sig_totals[signature]
+            step_sig["count"] += 1
+            step_sig["reward_sum"] += reward_val
+            if isinstance(verifiers, Mapping):
+                for name, value in verifiers.items():
+                    if isinstance(value, (int, float)):
+                        step_sig["verifiers"][name] += float(value)
+            if jsonl_handle:
+                entry = {
+                    "timestamp": ts,
+                    "step": step_idx,
+                    "env": env_idx,
+                    "tool": info.get("tool"),
+                    "signature": signature,
+                    "reward": reward_val,
+                    "avg_reward": avg_reward,
+                    "verifiers": {
+                        name: float(value)
+                        for name, value in (verifiers or {}).items()
+                        if isinstance(value, (int, float))
+                    },
+                }
+                try:
+                    jsonl_handle.write(json.dumps(entry) + "\n")
+                except Exception:
+                    pass
+        if jsonl_handle:
+            try:
+                jsonl_handle.flush()
+            except Exception:
+                pass
+        if not verbose:
+            return
+        if not echo_actions and (step_idx % log_interval != 0):
+            return
+        summary_parts = []
+        for signature, data in step_sig_totals.items():
+            count = data["count"] or 1
+            avg_sig = data["reward_sum"] / count
+            verifiers_avg = ", ".join(
+                f"{name}={data['verifiers'][name] / count:.3f}"
+                for name in sorted(data["verifiers"].keys())
+            )
+            if verifiers_avg:
+                summary_parts.append(f"{signature}:avg={avg_sig:.3f} [{verifiers_avg}]")
+            else:
+                summary_parts.append(f"{signature}:avg={avg_sig:.3f}")
+        summary = "; ".join(summary_parts) if summary_parts else "-"
+        print(f"[rl] step={step_idx} avg_reward={avg_reward:.3f} signatures={summary}")
+        if echo_actions:
+            for env_idx, raw_info in enumerate(info_list):
+                info = raw_info if isinstance(raw_info, dict) else {}
+                reward_val = reward_list[env_idx] if env_idx < len(reward_list) else 0.0
+                verifiers = info.get("verifier_scores") or info.get("verifiers") or {}
+                verifiers_str = ", ".join(
+                    f"{name}={float(value):.3f}"
+                    for name, value in (verifiers or {}).items()
+                    if isinstance(value, (int, float))
+                )
+                signature = str(info.get("signature_name") or "default")
+                tool = info.get("tool")
+                detail = f"    env={env_idx} signature={signature} tool={tool} reward={reward_val:.3f}"
+                if verifiers_str:
+                    detail += f" verifiers={verifiers_str}"
+                print(detail)
     # Try PufferLib vectorized env for speed
     using_vec = False
     try:
@@ -613,150 +736,190 @@ def train_puffer_policy(*, make_env: Callable[[], RLToolEnv], steps: int = 1000,
     running_mean = 0.0; beta = 0.9
     rewards_all: List[float] = []; infos_all: List[dict] = []
 
-    if using_vec:
-        # On-policy experience buffer for auxiliary replay steps
-        from collections import deque
-        replay = deque(maxlen=int(max(1, replay_capacity)))
-        for step_idx in range(1, steps + 1):
-            obs, _ = venv.reset()
-            import torch
-            obs_t = torch.tensor(obs, dtype=torch.float32)
-            logits = policy(obs_t)
-            m = torch.distributions.Categorical(logits=logits)
-            actions = m.sample(); logp = m.log_prob(actions); ent = m.entropy()
-            obs2, rewards, terms, truncs, infos = venv.step(actions.tolist())
-            r_t = torch.tensor(rewards, dtype=torch.float32)
-            avg_r = float(r_t.mean().item()); running_mean = beta * running_mean + (1 - beta) * avg_r
-            _rn = RewardNormalizer(); _rn.update(avg_r); adv = (r_t - running_mean) / max(1e-6, _rn.std)
-            # Entropy regularization
-            loss = (-(logp * adv).mean()) - float(entropy_coef) * ent.mean()
-            opt.zero_grad(); loss.backward()
-            try:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
-            except Exception:
-                pass
-            opt.step()
-            # Push to replay
-            try:
-                for i in range(len(obs)):
-                    replay.append((obs_t[i].detach(), int(actions[i].item()), float(r_t[i].item())))
-            except Exception:
-                pass
-            # Auxiliary replay step if buffer has enough
-            try:
-                if len(replay) >= max(8, replay_batch):
-                    idx = torch.randperm(len(replay))[: int(replay_batch)]
-                    batch = [replay[i] for i in idx.tolist()]
-                    b_obs = torch.stack([b[0] for b in batch])
-                    b_act = torch.tensor([b[1] for b in batch], dtype=torch.long)
-                    b_rew = torch.tensor([b[2] for b in batch], dtype=torch.float32)
-                    b_logits = policy(b_obs); bm = torch.distributions.Categorical(logits=b_logits)
-                    b_logp = bm.log_prob(b_act); b_ent = bm.entropy()
-                    b_adv = (b_rew - running_mean) / max(1e-6, _rn.std)
-                    aux_loss = (-(b_logp * b_adv).mean()) - float(entropy_coef) * b_ent.mean()
-                    opt.zero_grad(); aux_loss.backward()
-                    try:
-                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
-                    except Exception:
-                        pass
-                    opt.step()
-            except Exception:
-                pass
-            rewards_all.extend([float(x) for x in r_t.tolist()]); infos_all.extend(infos if isinstance(infos, list) else [infos])
-            if verbose and (step_idx % max(1, int(log_interval)) == 0):
-                # Summarize tool usage from infos if present
+    try:
+        if using_vec:
+            # On-policy experience buffer for auxiliary replay steps
+            from collections import deque
+            replay = deque(maxlen=int(max(1, replay_capacity)))
+            for step_idx in range(1, steps + 1):
+                obs, _ = venv.reset()
+                import torch
+                obs_t = torch.tensor(obs, dtype=torch.float32)
+                logits = policy(obs_t)
+                m = torch.distributions.Categorical(logits=logits)
+                actions = m.sample(); logp = m.log_prob(actions); ent = m.entropy()
+                obs2, rewards, terms, truncs, infos = venv.step(actions.tolist())
+                r_t = torch.tensor(rewards, dtype=torch.float32)
+                avg_r = float(r_t.mean().item()); running_mean = beta * running_mean + (1 - beta) * avg_r
+                _rn = RewardNormalizer(); _rn.update(avg_r); adv = (r_t - running_mean) / max(1e-6, _rn.std)
+                # Entropy regularization
+                loss = (-(logp * adv).mean()) - float(entropy_coef) * ent.mean()
+                opt.zero_grad(); loss.backward()
                 try:
-                    from collections import Counter as _C
-                    tools = _C([str(it.get("tool", "")) for it in (infos if isinstance(infos, list) else [infos]) if isinstance(it, dict)])
-                    print(f"[rl] step={step_idx} avg_r={avg_r:.3f} tools={dict(tools)}")
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
                 except Exception:
-                    print(f"[rl] step={step_idx} avg_r={avg_r:.3f}")
-        try: venv.close()
-        except Exception: pass
-    else:
-        import torch
-        ckpt = CheckpointManager(Path(checkpoint_dir) if checkpoint_dir else Path('.dspy_checkpoints') / 'rl', interval=int(checkpoint_interval or 0))
-        rn = RewardNormalizer()
-        best_avg = float('-inf')
-        stagnant = 0
-        from collections import deque
-        replay = deque(maxlen=int(max(1, replay_capacity)))
-        def select_action(o: List[float]):
-            # Compute logits with grad so REINFORCE can backprop through log-prob
-            obs = torch.tensor(o, dtype=torch.float32).unsqueeze(0)
-            logits = policy(obs)
-            m = torch.distributions.Categorical(logits=logits)
-            a_t = m.sample()
-            logp = m.log_prob(a_t)
-            return int(a_t.item()), logp.squeeze()
-        obses: List[List[float]] = []
-        for e in envs: o, _ = e.reset(); obses.append(o)
-        for step_idx in range(1, steps + 1):
-            batch_lp: List[torch.Tensor] = []; batch_r: List[float] = []
-            batch_ent: List[torch.Tensor] = []
-            batch_obs_t: List[torch.Tensor] = []
-            batch_act: List[int] = []
-            for i, e in enumerate(envs):
-                a, lp = select_action(obses[i]); o2, r, done, trunc, info = e.step(a)
-                rewards_all.append(float(r)); infos_all.append(info)
-                obses[i] = o2 if not (done or trunc) else e.reset()[0]
-                batch_lp.append(lp); batch_r.append(float(r))
-                # Recompute dist to get entropy and record obs/action for replay
-                obs_t = torch.tensor(o2, dtype=torch.float32).unsqueeze(0)
-                batch_obs_t.append(obs_t.squeeze(0)); batch_act.append(a)
-                logits = policy(obs_t); m = torch.distributions.Categorical(logits=logits)
-                batch_ent.append(m.entropy().squeeze())
-            avg_r = sum(batch_r) / max(1, len(batch_r)); running_mean = beta * running_mean + (1 - beta) * avg_r
-            rn.update(avg_r)
-            norm_adv = [(r - running_mean) / max(1e-6, rn.std) for r in batch_r]
-            # Add entropy regularization
-            pol_loss = -sum(lp * adv for lp, adv in zip(batch_lp, norm_adv)) / max(1, len(batch_lp))
-            ent_term = -float(entropy_coef) * (sum(batch_ent) / max(1, len(batch_ent)))
-            loss = pol_loss + ent_term
-            opt.zero_grad(); loss.backward()
+                    pass
+                opt.step()
+                # Push to replay
+                try:
+                    for i in range(len(obs)):
+                        replay.append((obs_t[i].detach(), int(actions[i].item()), float(r_t[i].item())))
+                except Exception:
+                    pass
+                # Auxiliary replay step if buffer has enough
+                try:
+                    if len(replay) >= max(8, replay_batch):
+                        idx = torch.randperm(len(replay))[: int(replay_batch)]
+                        batch = [replay[i] for i in idx.tolist()]
+                        b_obs = torch.stack([b[0] for b in batch])
+                        b_act = torch.tensor([b[1] for b in batch], dtype=torch.long)
+                        b_rew = torch.tensor([b[2] for b in batch], dtype=torch.float32)
+                        b_logits = policy(b_obs); bm = torch.distributions.Categorical(logits=b_logits)
+                        b_logp = bm.log_prob(b_act); b_ent = bm.entropy()
+                        b_adv = (b_rew - running_mean) / max(1e-6, _rn.std)
+                        aux_loss = (-(b_logp * b_adv).mean()) - float(entropy_coef) * b_ent.mean()
+                        opt.zero_grad(); aux_loss.backward()
+                        try:
+                            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+                        except Exception:
+                            pass
+                        opt.step()
+                except Exception:
+                    pass
+                rewards_all.extend([float(x) for x in r_t.tolist()]); infos_all.extend(infos if isinstance(infos, list) else [infos])
+                _emit_logs(step_idx, avg_r, r_t.tolist(), infos)
+            try: venv.close()
+            except Exception: pass
+        else:
+            import torch
+            ckpt_path = Path(checkpoint_dir) if checkpoint_dir else Path('.dspy_checkpoints') / 'rl'
+            ckpt = CheckpointManager(ckpt_path, interval=int(checkpoint_interval or 0))
+            rn = RewardNormalizer()
+            best_avg = float('-inf')
+            stagnant = 0
+            from collections import deque
+            replay = deque(maxlen=int(max(1, replay_capacity)))
+            # Optional resume from checkpoint
+            start_step = 1
             try:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
-            except Exception:
-                pass
-            opt.step()
-            # Push batch into replay buffer
-            try:
-                for obs_t, act, rew in zip(batch_obs_t, batch_act, batch_r):
-                    replay.append((obs_t.detach(), int(act), float(rew)))
-            except Exception:
-                pass
-            # Auxiliary replay pass if buffer has enough
-            try:
-                if len(replay) >= max(8, replay_batch):
-                    idx = torch.randperm(len(replay))[: int(replay_batch)]
-                    batch = [replay[i] for i in idx.tolist()]
-                    b_obs = torch.stack([b[0] for b in batch])
-                    b_act = torch.tensor([b[1] for b in batch], dtype=torch.long)
-                    b_rew = torch.tensor([b[2] for b in batch], dtype=torch.float32)
-                    b_logits = policy(b_obs); bm = torch.distributions.Categorical(logits=b_logits)
-                    b_logp = bm.log_prob(b_act); b_ent = bm.entropy().mean()
-                    b_adv = (b_rew - running_mean) / max(1e-6, rn.std)
-                    aux_loss = (-(b_logp * b_adv).mean()) - float(entropy_coef) * b_ent
-                    opt.zero_grad(); aux_loss.backward()
+                import torch  # type: ignore
+                latest_meta = ckpt_path / 'latest.json'
+                if latest_meta.exists():
                     try:
-                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+                        meta = json.loads(latest_meta.read_text())
+                        start_step = int(meta.get('step', start_step)) + 1
                     except Exception:
-                        pass
-                    opt.step()
+                        start_step = 1
+                latest_policy = ckpt_path / 'latest.pt'
+                if latest_policy.exists():
+                    state = torch.load(latest_policy, map_location='cpu')  # type: ignore[arg-type]
+                    if isinstance(state, dict) and 'policy' in state:
+                        policy.load_state_dict(state['policy'])
+                latest_opt = ckpt_path / 'latest_opt.pt'
+                if latest_opt.exists():
+                    state = torch.load(latest_opt, map_location='cpu')  # type: ignore[arg-type]
+                    if isinstance(state, dict) and 'optimizer' in state:
+                        opt.load_state_dict(state['optimizer'])
+            except Exception:
+                start_step = 1
+
+            def select_action(o: List[float]):
+                # Compute logits with grad so REINFORCE can backprop through log-prob
+                obs = torch.tensor(o, dtype=torch.float32).unsqueeze(0)
+                logits = policy(obs)
+                m = torch.distributions.Categorical(logits=logits)
+                a_t = m.sample()
+                logp = m.log_prob(a_t)
+                return int(a_t.item()), logp.squeeze()
+
+            obses: List[List[float]] = []
+            for e in envs: o, _ = e.reset(); obses.append(o)
+            for step_idx in range(start_step, start_step + steps):
+                batch_lp: List[torch.Tensor] = []; batch_r: List[float] = []
+                batch_ent: List[torch.Tensor] = []
+                batch_obs_t: List[torch.Tensor] = []
+                batch_act: List[int] = []
+                step_infos: List[Any] = []
+                for i, e in enumerate(envs):
+                    a, lp = select_action(obses[i]); o2, r, done, trunc, info = e.step(a)
+                    rewards_all.append(float(r)); infos_all.append(info)
+                    obses[i] = o2 if not (done or trunc) else e.reset()[0]
+                    batch_lp.append(lp); batch_r.append(float(r))
+                    step_infos.append(info)
+                    # Recompute dist to get entropy and record obs/action for replay
+                    obs_t = torch.tensor(o2, dtype=torch.float32).unsqueeze(0)
+                    batch_obs_t.append(obs_t.squeeze(0)); batch_act.append(a)
+                    logits = policy(obs_t); m = torch.distributions.Categorical(logits=logits)
+                    batch_ent.append(m.entropy().squeeze())
+                avg_r = sum(batch_r) / max(1, len(batch_r)); running_mean = beta * running_mean + (1 - beta) * avg_r
+                rn.update(avg_r)
+                norm_adv = [(r - running_mean) / max(1e-6, rn.std) for r in batch_r]
+                # Add entropy regularization
+                pol_loss = -sum(lp * adv for lp, adv in zip(batch_lp, norm_adv)) / max(1, len(batch_lp))
+                ent_term = -float(entropy_coef) * (sum(batch_ent) / max(1, len(batch_ent)))
+                loss = pol_loss + ent_term
+                opt.zero_grad(); loss.backward()
+                try:
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+                except Exception:
+                    pass
+                opt.step()
+                # Push batch into replay buffer
+                try:
+                    for obs_t, act, rew in zip(batch_obs_t, batch_act, batch_r):
+                        replay.append((obs_t.detach(), int(act), float(rew)))
+                except Exception:
+                    pass
+                # Auxiliary replay pass if buffer has enough
+                try:
+                    if len(replay) >= max(8, replay_batch):
+                        idx = torch.randperm(len(replay))[: int(replay_batch)]
+                        batch = [replay[i] for i in idx.tolist()]
+                        b_obs = torch.stack([b[0] for b in batch])
+                        b_act = torch.tensor([b[1] for b in batch], dtype=torch.long)
+                        b_rew = torch.tensor([b[2] for b in batch], dtype=torch.float32)
+                        b_logits = policy(b_obs); bm = torch.distributions.Categorical(logits=b_logits)
+                        b_logp = bm.log_prob(b_act); b_ent = bm.entropy().mean()
+                        b_adv = (b_rew - running_mean) / max(1e-6, rn.std)
+                        aux_loss = (-(b_logp * b_adv).mean()) - float(entropy_coef) * b_ent
+                        opt.zero_grad(); aux_loss.backward()
+                        try:
+                            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip))
+                        except Exception:
+                            pass
+                        opt.step()
+                except Exception:
+                    pass
+                _emit_logs(step_idx, avg_r, batch_r, step_infos)
+                ckpt.maybe_save(step_idx, avg_r, policy=policy, opt=opt)
+                if early_stop_patience and avg_r <= best_avg + 1e-6:
+                    stagnant += 1
+                    if stagnant >= early_stop_patience:
+                        if verbose:
+                            print(f"[rl] early stop at step={step_idx} best_avg={best_avg:.3f}")
+                        break
+                else:
+                    best_avg = max(best_avg, avg_r)
+                    stagnant = 0
+    finally:
+        if jsonl_handle:
+            try:
+                jsonl_handle.close()
             except Exception:
                 pass
-            if verbose and (step_idx % max(1, int(log_interval)) == 0):
-                print(f"[rl] step={step_idx} avg_r={avg_r:.3f}")
-            ckpt.maybe_save(step_idx, avg_r, policy=policy, opt=opt)
-            if early_stop_patience and avg_r <= best_avg + 1e-6:
-                stagnant += 1
-                if stagnant >= early_stop_patience:
-                    if verbose:
-                        print(f"[rl] early stop at step={step_idx} best_avg={best_avg:.3f}")
-                    break
-            else:
-                best_avg = max(best_avg, avg_r)
-                stagnant = 0
+
+    if signature_stats:
+        print("[rl] signature summary:")
+        for signature, data in signature_stats.items():
+            count = data["count"] or 1
+            avg_sig = data["reward_sum"] / count
+            verifiers_avg = ", ".join(
+                f"{name}={value / count:.3f}" for name, value in sorted(data["verifiers"].items())
+            )
+            line = f"  {signature}: samples={data['count']} avg_reward={avg_sig:.3f}"
+            if verifiers_avg:
+                line += f" verifiers={verifiers_avg}"
+            print(line)
     return EpisodeStats(rewards=rewards_all, infos=infos_all)
 
 

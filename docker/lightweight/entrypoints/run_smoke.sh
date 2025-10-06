@@ -9,4 +9,11 @@ export EMBED_PARQUET_DIR="${EMBED_PARQUET_DIR:-/workspace/vectorized/embeddings_
 export N_MESSAGES="${N_MESSAGES:-5}"
 export SLEEP_SEC="${SLEEP_SEC:-5}"
 
+WORKSPACE=${DSPY_WORKSPACE:-/workspace}
+if [ -z "${PYTHONPATH:-}" ]; then
+  export PYTHONPATH="$WORKSPACE"
+else
+  export PYTHONPATH="$WORKSPACE:$PYTHONPATH"
+fi
+
 python -m dspy_agent.embedding.smoke_embed_pipeline

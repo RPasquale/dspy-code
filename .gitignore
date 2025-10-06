@@ -129,3 +129,49 @@ scripts/publish_package.sh
 
 # Generated files during development
 transformer.py
+.docker/
+
+# Spark metadata and auxiliary files
+**/_spark_metadata/
+**/*.crc
+**/.part-*.parquet.crc
+**/.part-*.snappy.parquet.crc
+
+# Vectorized embeddings and data files
+vectorized/
+**/embeddings/
+**/*.parquet
+**/*.snappy.parquet
+
+# Database files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Test and temporary files
+test_*.py
+fresh_test.py
+*_test.py
+*_test_*.py
+test_results.json
+validation_results.json
+real_training_results.json
+rl_test_results.json
+sample_data.json
+
+# Cache and temporary directories
+diskcache/
+tmp/
+tmp_*/
+pytest-of-*/
+test-results/
+test_lightweight/
+
+# Logs and monitoring
+training.log
+monitor_agent.sh
+*.log
+
+# Development and workspace files
+enhanced_dashboard_server.py

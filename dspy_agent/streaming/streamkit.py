@@ -1127,6 +1127,9 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
     vector_topics.update(extra_topics)
     vector_topics.update(getattr(kafka_cfg, 'vector_topics', []) if kafka_cfg else [])
     vector_topics.discard(out_topic)
+    # Always include file-system change events so code edits stream into the RL vectorizer
+    vector_topics.add('code.fs.events')
+
     if vector_topics:
         try:
             from .vectorized_pipeline import RLVectorizer, VectorizedStreamOrchestrator

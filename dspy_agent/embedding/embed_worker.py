@@ -442,6 +442,14 @@ def main():
     metrics_port = int(os.getenv('EMBED_METRICS_PORT', '9100'))
     start_metrics_server(metrics_port)
 
+    # Start parquet monitor in background thread
+    try:
+        from .parquet_monitor import start_parquet_monitor
+        parquet_monitor_thread = start_parquet_monitor()
+        log("Started parquet monitor in background thread")
+    except Exception as e:
+        log(f"Failed to start parquet monitor: {e}")
+
     # Optional: cache warmup from recent Parquet files to reduce duplicate embeds
     warmup_n = int(os.getenv('EMBED_CACHE_WARMUP', '0') or '0')
     if warmup_n > 0 and write_parquet:

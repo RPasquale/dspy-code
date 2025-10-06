@@ -36,12 +36,12 @@ echo -e "${GREEN}✅ Dependencies ready${NC}"
 if command -v ollama &> /dev/null; then
     echo -e "${GREEN}✅ Ollama is available${NC}"
     
-    # Check if qwen3:1.7b model is available
-    if ollama list | grep -q "qwen3:1.7b"; then
-        echo -e "${GREEN}✅ qwen3:1.7b model is ready${NC}"
+    # Check if deepseek-coder:1.3b model is available
+    if ollama list | grep -q "deepseek-coder:1.3b"; then
+        echo -e "${GREEN}✅ deepseek-coder:1.3b model is ready${NC}"
     else
-        echo -e "${YELLOW}⚠️  qwen3:1.7b model not found. You can pull it with:${NC}"
-        echo "  ollama pull qwen3:1.7b"
+        echo -e "${YELLOW}⚠️  deepseek-coder:1.3b model not found. You can pull it with:${NC}"
+        echo "  ollama pull deepseek-coder:1.3b"
         echo ""
         echo -e "${YELLOW}Continuing without the model...${NC}"
     fi
@@ -78,7 +78,7 @@ else
     echo ""
     echo -e "${YELLOW}💡 Troubleshooting tips:${NC}"
     echo "1. Check if Ollama is running: ollama list"
-    echo "2. Try pulling the model: ollama pull qwen3:1.7b"
+    echo "2. Try pulling the model: ollama pull deepseek-coder:1.3b"
     echo "3. Check logs in the logs/ directory"
     echo "4. Run the simple test: uv run python scripts/test_agent_simple.py"
     echo ""

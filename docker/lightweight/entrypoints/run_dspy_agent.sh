@@ -15,9 +15,21 @@ LOGS_DIR=${DSPY_LOGS:-${WORKSPACE}/logs}
 
 mkdir -p "$WORKSPACE"
 mkdir -p "$LOGS_DIR"
+mkdir -p "$LOGS_DIR/backend" || true
+
+# Drop leftover synthetic test noise so fresh sessions don't read stale errors
+LIVE_BACKEND_LOG="$LOGS_DIR/backend/live_backend.log"
+if [ -f "$LIVE_BACKEND_LOG" ]; then
+  : > "$LIVE_BACKEND_LOG" || true
+fi
 
 # Ensure DSPy cache can write under workspace (root FS is read-only)
 export HOME="$WORKSPACE"
+if [ -z "${PYTHONPATH:-}" ]; then
+  export PYTHONPATH="$WORKSPACE"
+else
+  export PYTHONPATH="$WORKSPACE:$PYTHONPATH"
+fi
 mkdir -p "$HOME/.dspy_cache" || true
 mkdir -p "/tmp/.dspy_cache" || true
 
@@ -33,9 +45,9 @@ AUTO=${DSPY_AUTO_START:-false}
 shopt -s nocasematch || true
 if [[ "$AUTO" == "1" || "$AUTO" == "true" || "$AUTO" == "yes" || "$AUTO" == "on" ]]; then
   echo "[entrypoint] auto-start enabled; launching interactive agent"
-  exec dspy-agent start --workspace "$WORKSPACE" --logs "$LOGS_DIR" --approval auto
+  exec dspy-agent start --workspace "$WORKSPACE" --logs "$LOGS_DIR" --approval auto --model "${MODEL_NAME:-deepseek-coder:1.3b}"
 fi
 shopt -u nocasematch || true
 
-echo "[entrypoint] bootstrap complete; container idle. Exec into it to run 'dspy-agent --workspace $WORKSPACE'"
+echo "[entrypoint] bootstrap complete; container idle. Exec into it to run 'dspy-agent start --workspace $WORKSPACE --model ${MODEL_NAME:-deepseek-coder:1.3b}'"
 exec tail -f /dev/null

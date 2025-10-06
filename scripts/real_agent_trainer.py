@@ -103,12 +103,12 @@ class RealAgentTrainer:
         try:
             # Use DSPy LM with Ollama configuration
             self.lm = dspy.LM(
-                model="ollama/qwen3:1.7b",
+                model="ollama/deepseek-coder:1.3b",
                 api_base="http://localhost:11435",
                 max_tokens=4000
             )
             dspy.settings.configure(lm=self.lm)
-            logger.info("Connected to Ollama service with qwen3:1.7b model")
+            logger.info("Connected to Ollama service with deepseek-coder:1.3b model")
         except Exception as e:
             logger.error(f"Failed to connect to Ollama: {e}")
             self.lm = None

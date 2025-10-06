@@ -8,6 +8,11 @@ echo "[entrypoint] starting dspy-agent worker for topic: ${topic}"
 # Containers run with read-only root; only volumes and tmpfs are writable.
 export DSPY_WORKSPACE="${DSPY_WORKSPACE:-/workspace}"
 export HOME="$DSPY_WORKSPACE"
+if [ -z "${PYTHONPATH:-}" ]; then
+  export PYTHONPATH="${DSPY_WORKSPACE}"
+else
+  export PYTHONPATH="${DSPY_WORKSPACE}:$PYTHONPATH"
+fi
 
 # Create cache directories with proper permissions
 mkdir -p "$HOME/.dspy_cache" || true

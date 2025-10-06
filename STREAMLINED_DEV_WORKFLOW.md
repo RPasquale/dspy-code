@@ -55,7 +55,7 @@ When using the enhanced coding mode, you can run all these commands directly:
 
 ```bash
 # Start the agent in coding mode
-uv run dspy-code --coding-mode
+uv run dspy-cli --coding-mode
 
 # Then use the dev commands
 dspy-code> dev quick "Add new feature"
@@ -160,7 +160,7 @@ The agent learns from your development patterns:
 ### **Use the Agent for Everything**
 ```bash
 # Start the agent
-uv run dspy-code --coding-mode
+uv run dspy-cli --coding-mode
 
 # Do all your development through the agent
 dspy-code> dev quick "Fix bug"

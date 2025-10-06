@@ -126,7 +126,7 @@ class AgentWorkspaceManager:
                 "version": "1.0.0",
                 "learning_rate": 0.001,
                 "max_iterations": 5,
-                "model": "qwen3:1.7b",
+                "model": "deepseek-coder:1.3b",
                 "ollama_url": "http://localhost:11435"
             },
             "streaming": {

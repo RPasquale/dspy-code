@@ -179,7 +179,8 @@ def main():
         spark.readStream.format('kafka')
         .option('kafka.bootstrap.servers', bootstrap)
         .option('subscribe', topics)
-        .option('startingOffsets', 'latest')
+        .option('startingOffsets', 'earliest')
+        .option('failOnDataLoss', 'false')
         # Enhanced timeout and retry configuration
         .option('kafka.request.timeout.ms', '30000')
         .option('kafka.metadata.max.age.ms', '300000')
@@ -197,17 +198,32 @@ def main():
     # Parse messages (JSON if possible)
     def parse_value(b):
         try:
+            print(f"[DEBUG] Processing message: {b}")
             s = b.decode('utf-8', errors='ignore')
+            print(f"[DEBUG] Decoded string: {s}")
             j = json.loads(s)
+            print(f"[DEBUG] Parsed JSON: {j}")
             # Common fields for text-like payloads
             for k in ('text', 'message', 'content', 'prompt', 'body'):
                 if isinstance(j, dict) and k in j and isinstance(j[k], str):
-                    return j[k]
+                    result = j[k]
+                    print(f"[DEBUG] Found text field '{k}': {result}")
+                    return result
+            # Handle code.fs.events messages - use path as text content
+            if isinstance(j, dict) and 'path' in j:
+                result = f"File {j['path']} was {j.get('event', 'modified')}"
+                print(f"[DEBUG] Code.fs.events message: {result}")
+                return result
+            print(f"[DEBUG] No recognized fields, returning raw string: {s}")
             return s
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] JSON parsing failed: {e}")
             try:
-                return b.decode('utf-8', errors='ignore')
-            except Exception:
+                result = b.decode('utf-8', errors='ignore')
+                print(f"[DEBUG] Fallback to raw decode: {result}")
+                return result
+            except Exception as e2:
+                print(f"[DEBUG] Raw decode also failed: {e2}")
                 return ''
 
     parse_value_udf = F.udf(lambda b: parse_value(b) if b is not None else '', StringType())
@@ -258,15 +274,18 @@ def main():
 
     # We need to access the original 'value' column from the base DataFrame
     # Let's modify the base selection to include both value and text
+    print("[DEBUG] Creating base DataFrame...")
     base = df.select(
         F.col('topic'),
         F.col('timestamp').alias('kafka_ts'),
         F.col('value'),  # Keep original value for doc_id extraction
         parse_value_udf(F.col('value')).alias('text')
     )
+    print("[DEBUG] Base DataFrame created, adding doc_id columns...")
     
     typed = base.withColumn('doc_id_raw', doc_from_raw_udf(F.col('value')))
     typed = typed.withColumn('doc_id', F.when(F.length(F.col('doc_id_raw')) > 0, F.col('doc_id_raw')).otherwise(sha_udf(F.col('text'))))
+    print("[DEBUG] Doc ID columns added")
 
     # Optional: learned embeddings via sentence-transformers
     use_st = os.getenv('USE_SENTENCE_TRANSFORMERS', '0').lower() in ('1', 'true', 'yes', 'on')
@@ -292,9 +311,12 @@ def main():
         vec_col = hash_vec_udf(F.col('text'))
 
     # Build vectors
+    print("[DEBUG] Building vectors...")
     vec = typed.withColumn('vector', vec_col)
+    print("[DEBUG] Vectors built")
 
     # Write to Parquet sink for training
+    print(f"[DEBUG] Starting Parquet sink to {out_dir} with checkpoint {ckpt_dir}")
     (vec
         .writeStream
         .format('parquet')
@@ -303,38 +325,30 @@ def main():
         .outputMode('append')
         .start()
     )
+    print("[DEBUG] Parquet sink started")
 
     # Optional: also publish parsed text to an input topic for external embed service
     tx_base = os.getenv('KAFKA_TX_ID_BASE', 'spark-vectorizer')
     if input_topic:
-        parsed = typed.select(F.to_json(F.struct('topic', 'kafka_ts', 'text', 'doc_id')).alias('value'))
-        (parsed
-            .writeStream
-            .format('kafka')
-            .option('kafka.bootstrap.servers', bootstrap)
-            .option('topic', input_topic)
-            .option('kafka.transactional.id', f"{tx_base}-input")
-            .option('kafka.enable.idempotence', 'true')
-            .option('kafka.acks', 'all')
-            .option('checkpointLocation', ckpt_dir + '_input')
-            .outputMode('append')
-            .start())
+        print(f"[DEBUG] Kafka sink disabled - using separate parquet-to-kafka script instead")
+        # Kafka sink disabled due to transaction issues - using separate script
+        # The parquet-to-kafka.py script will read from Parquet files and publish to Kafka
 
     # Optional: also publish to Kafka embeddings topic (vector serialized as JSON)
     if sink_kafka:
-        out_kafka = (vec
-                     .select(F.to_json(F.struct('topic', 'kafka_ts', 'text', 'doc_id', 'vector')).alias('value'))
-                     .writeStream
-                     .format('kafka')
-                     .option('kafka.bootstrap.servers', bootstrap)
-                     .option('topic', embeddings_topic)
-                     .option('kafka.transactional.id', f"{tx_base}-embeddings")
-                     .option('kafka.enable.idempotence', 'true')
-                     .option('kafka.acks', 'all')
-                     .option('checkpointLocation', ckpt_dir + '_kafka')
-                     .outputMode('append')
-                     .start())
-        out_kafka.awaitTermination()
+        print(f"[DEBUG] Second Kafka sink disabled for debugging - focusing on Parquet sink only")
+        # Temporarily disable second Kafka sink to debug the issue
+        # out_kafka = (vec
+        #              .select(F.to_json(F.struct('topic', 'kafka_ts', 'text', 'doc_id', 'vector')).alias('value'))
+        #              .writeStream
+        #              .format('kafka')
+        #              .option('kafka.bootstrap.servers', bootstrap)
+        #              .option('topic', embeddings_topic)
+        #              .option('kafka.acks', 'all')
+        #              .option('checkpointLocation', ckpt_dir + '_kafka')
+        #              .outputMode('append')
+        #              .start())
+        # out_kafka.awaitTermination()
 
     spark.streams.awaitAnyTermination()
 
