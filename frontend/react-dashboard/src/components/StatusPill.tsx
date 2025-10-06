@@ -2,13 +2,15 @@ interface StatusPillProps {
   status: string | undefined;
   text?: string;
   className?: string;
+  size?: 'sm' | 'md' | 'lg';
+  showIcon?: boolean;
 }
 
 const normalizeStatus = (status: string | undefined) => {
   if (!status) return 'unknown';
   const normalized = status.toLowerCase();
   if (['healthy', 'running', 'ready', 'active', 'training', 'ok'].some((token) => normalized.includes(token))) {
-    return 'success';
+    return 'online';
   }
   if (['warn', 'degraded', 'paused', 'standby'].some((token) => normalized.includes(token))) {
     return 'warning';
@@ -19,16 +21,28 @@ const normalizeStatus = (status: string | undefined) => {
   if (['processing', 'loading', 'pending'].some((token) => normalized.includes(token))) {
     return 'processing';
   }
-  return 'unknown';
+  return 'offline';
 };
 
-const StatusPill = ({ status, text, className = '' }: StatusPillProps) => {
+const StatusPill = ({ 
+  status, 
+  text, 
+  className = '', 
+  size = 'md',
+  showIcon = true 
+}: StatusPillProps) => {
   const kind = normalizeStatus(status);
   
+  const sizeClasses = {
+    sm: 'px-2 py-1 text-xs',
+    md: 'px-3 py-1 text-sm',
+    lg: 'px-4 py-2 text-base'
+  };
+
   const getStatusClasses = () => {
     switch (kind) {
-      case 'success':
-        return 'status-pill status-success';
+      case 'online':
+        return 'status-pill status-online';
       case 'warning':
         return 'status-pill status-warning';
       case 'error':
@@ -36,14 +50,16 @@ const StatusPill = ({ status, text, className = '' }: StatusPillProps) => {
       case 'processing':
         return 'status-pill status-processing';
       default:
-        return 'status-pill bg-slate-500/20 text-slate-300 border border-slate-500/30';
+        return 'status-pill status-offline';
     }
   };
 
   return (
-    <span className={`${getStatusClasses()} ${className}`}>
-      <span className="w-2 h-2 rounded-full bg-current mr-2 animate-pulse" />
-      {text ?? status ?? 'Unknown'}
+    <span className={`${getStatusClasses()} ${sizeClasses[size]} ${className}`}>
+      {showIcon && (
+        <span className="w-2 h-2 rounded-full bg-current animate-pulse" />
+      )}
+      <span>{text ?? status ?? 'Unknown'}</span>
     </span>
   );
 };

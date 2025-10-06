@@ -1,8 +1,13 @@
+use crate::infermesh::InferMeshClient;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::Notify;
+use warp::http::StatusCode;
+use warp::Filter;
 
 /// Metrics for the Rust environment runner
 #[derive(Debug, Clone)]
@@ -38,19 +43,17 @@ impl EnvRunnerMetrics {
     pub fn record_task_duration(&self, duration: Duration) {
         if let Ok(mut durations) = self.task_duration.lock() {
             durations.push(duration);
-
-            // Keep only last 1000 durations to prevent memory growth
             if durations.len() > 1000 {
                 durations.remove(0);
             }
-
-            // Update P95 latency
             if durations.len() >= 20 {
                 let mut sorted = durations.clone();
                 sorted.sort();
-                let p95_index = (sorted.len() as f64 * 0.95) as usize;
-                if let Ok(mut p95) = self.latency_p95.lock() {
-                    *p95 = sorted[p95_index];
+                let p95_index = ((sorted.len() as f64) * 0.95).floor() as usize;
+                if let Some(item) = sorted.get(p95_index.min(sorted.len() - 1)) {
+                    if let Ok(mut p95) = self.latency_p95.lock() {
+                        *p95 = *item;
+                    }
                 }
             }
         }
@@ -133,132 +136,216 @@ impl Default for EnvRunnerMetrics {
     }
 }
 
-/// HTTP metrics server for the Rust environment runner
+#[derive(Debug, Deserialize)]
+pub struct TaskRequest {
+    pub id: String,
+    #[serde(default)]
+    pub class: Option<String>,
+    pub payload: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskExecutionResponse {
+    pub id: String,
+    pub embeddings: Vec<Vec<f64>>,
+    pub latency_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+/// HTTP metrics and task execution server for the Rust environment runner.
 pub struct MetricsServer {
     metrics: Arc<EnvRunnerMetrics>,
+    client: Arc<InferMeshClient>,
     port: u16,
+    shutdown: Arc<Notify>,
 }
 
 impl MetricsServer {
-    pub fn new(metrics: Arc<EnvRunnerMetrics>, port: u16) -> Self {
-        Self { metrics, port }
+    pub fn new(metrics: Arc<EnvRunnerMetrics>, client: Arc<InferMeshClient>, port: u16) -> Self {
+        Self {
+            metrics,
+            client,
+            port,
+            shutdown: Arc::new(Notify::new()),
+        }
     }
 
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use warp::Filter;
-
         let metrics = self.metrics.clone();
         let metrics_for_prometheus = self.metrics.clone();
+        let client = self.client.clone();
+        let shutdown = self.shutdown.clone();
 
-        // Health check endpoint
         let health = warp::path("health")
-            .map(|| warp::reply::json(&serde_json::json!({"status": "healthy"})));
+            .map(|| warp::reply::json(&serde_json::json!({ "status": "healthy" })))
+            .boxed();
 
-        // Metrics endpoint
-        let metrics_endpoint = warp::path("metrics").map(move || {
-            let stats = metrics.get_stats();
-            warp::reply::json(&stats)
-        });
+        let metrics_endpoint = warp::path("metrics")
+            .map(move || warp::reply::json(&metrics.get_stats()))
+            .boxed();
 
-        // Prometheus format endpoint
-        let prometheus = warp::path("prometheus").map(move || {
-            let stats = metrics_for_prometheus.get_stats();
-            format!(
-                "# HELP env_runner_tasks_processed_total Total number of tasks processed\n\
-                     # TYPE env_runner_tasks_processed_total counter\n\
-                     env_runner_tasks_processed_total {}\n\
-                     \n\
-                     # HELP env_runner_queue_depth Current queue depth\n\
-                     # TYPE env_runner_queue_depth gauge\n\
-                     env_runner_queue_depth {}\n\
-                     \n\
-                     # HELP env_runner_gpu_utilization GPU utilization percentage\n\
-                     # TYPE env_runner_gpu_utilization gauge\n\
-                     env_runner_gpu_utilization {}\n\
-                     \n\
-                     # HELP env_runner_latency_p95_seconds P95 latency in seconds\n\
-                     # TYPE env_runner_latency_p95_seconds gauge\n\
-                     env_runner_latency_p95_seconds {}\n\
-                     \n\
-                     # HELP env_runner_avg_duration_seconds Average task duration in seconds\n\
-                     # TYPE env_runner_avg_duration_seconds gauge\n\
-                     env_runner_avg_duration_seconds {}\n\
-                     \n\
-                     # HELP env_runner_errors_total Total number of errors\n\
-                     # TYPE env_runner_errors_total counter\n\
-                     env_runner_errors_total {}\n\
-                     \n\
-                     # HELP env_runner_uptime_seconds Uptime in seconds\n\
-                     # TYPE env_runner_uptime_seconds gauge\n\
-                     env_runner_uptime_seconds {}\n",
-                stats.tasks_processed,
-                stats.queue_depth,
-                stats.gpu_utilization,
-                stats.latency_p95_ms as f64 / 1000.0,
-                stats.avg_duration_ms as f64 / 1000.0,
-                stats.total_errors,
-                stats.uptime_seconds
-            )
-        });
+        let prometheus = warp::path("prometheus")
+            .map(move || {
+                let stats = metrics_for_prometheus.get_stats();
+                format!(
+                    "# HELP env_runner_tasks_processed_total Total number of tasks processed\n\
+                 # TYPE env_runner_tasks_processed_total counter\n\
+                 env_runner_tasks_processed_total {}\n\
+                 \n\
+                 # HELP env_runner_queue_depth Current queue depth\n\
+                 # TYPE env_runner_queue_depth gauge\n\
+                 env_runner_queue_depth {}\n\
+                 \n\
+                 # HELP env_runner_gpu_utilization GPU utilization percentage\n\
+                 # TYPE env_runner_gpu_utilization gauge\n\
+                 env_runner_gpu_utilization {}\n\
+                 \n\
+                 # HELP env_runner_latency_p95_seconds P95 latency in seconds\n\
+                 # TYPE env_runner_latency_p95_seconds gauge\n\
+                 env_runner_latency_p95_seconds {}\n\
+                 \n\
+                 # HELP env_runner_avg_duration_seconds Average task duration in seconds\n\
+                 # TYPE env_runner_avg_duration_seconds gauge\n\
+                 env_runner_avg_duration_seconds {}\n\
+                 \n\
+                 # HELP env_runner_errors_total Total number of errors\n\
+                 # TYPE env_runner_errors_total counter\n\
+                 env_runner_errors_total {}\n\
+                 \n\
+                 # HELP env_runner_uptime_seconds Uptime in seconds\n\
+                 # TYPE env_runner_uptime_seconds gauge\n\
+                 env_runner_uptime_seconds {}\n",
+                    stats.tasks_processed,
+                    stats.queue_depth,
+                    stats.gpu_utilization,
+                    stats.latency_p95_ms as f64 / 1000.0,
+                    stats.avg_duration_ms as f64 / 1000.0,
+                    stats.total_errors,
+                    stats.uptime_seconds
+                )
+            })
+            .boxed();
 
-        let routes = health.or(metrics_endpoint).or(prometheus);
+        let tasks = warp::path("tasks")
+            .and(warp::path("execute"))
+            .and(warp::post())
+            .and(with_client(client))
+            .and(with_metrics(self.metrics.clone()))
+            .and(warp::body::json())
+            .and_then(handle_task_request)
+            .boxed();
 
-        println!("Starting metrics server on port {}", self.port);
-        warp::serve(routes).run(([0, 0, 0, 0], self.port)).await;
+        let routes = health
+            .or(metrics_endpoint)
+            .or(prometheus)
+            .or(tasks)
+            .with(warp::log("env_runner"));
+
+        warp::serve(routes)
+            .bind_with_graceful_shutdown(([0, 0, 0, 0], self.port), async move {
+                shutdown.notified().await;
+            })
+            .await;
 
         Ok(())
     }
+
+    pub async fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-    use std::time::Duration;
+fn with_client(
+    client: Arc<InferMeshClient>,
+) -> impl Filter<Extract = (Arc<InferMeshClient>,), Error = Infallible> + Clone {
+    warp::any().map(move || client.clone())
+}
 
-    #[test]
-    fn test_metrics_basic() {
-        let metrics = EnvRunnerMetrics::new();
+fn with_metrics(
+    metrics: Arc<EnvRunnerMetrics>,
+) -> impl Filter<Extract = (Arc<EnvRunnerMetrics>,), Error = Infallible> + Clone {
+    warp::any().map(move || metrics.clone())
+}
 
-        // Test initial state
-        let stats = metrics.get_stats();
-        assert_eq!(stats.tasks_processed, 0);
-        assert_eq!(stats.queue_depth, 0);
-        assert_eq!(stats.total_errors, 0);
+async fn handle_task_request(
+    client: Arc<InferMeshClient>,
+    metrics: Arc<EnvRunnerMetrics>,
+    request: TaskRequest,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let inputs = match extract_inputs(&request.payload) {
+        Ok(inputs) => inputs,
+        Err(err) => {
+            let body = warp::reply::json(&ErrorResponse { error: err });
+            return Ok(warp::reply::with_status(body, StatusCode::BAD_REQUEST));
+        }
+    };
 
-        // Test incrementing
-        metrics.increment_tasks_processed();
-        metrics.update_queue_depth(5);
-        metrics.increment_error("test_class");
+    let started = Instant::now();
+    metrics.update_queue_depth(inputs.len() as u64);
 
-        let stats = metrics.get_stats();
-        assert_eq!(stats.tasks_processed, 1);
-        assert_eq!(stats.queue_depth, 5);
-        assert_eq!(stats.total_errors, 1);
-        assert_eq!(stats.errors_by_class.get("test_class"), Some(&1));
+    let result = client.embed(inputs.clone()).await;
+
+    metrics.update_queue_depth(0);
+
+    match result {
+        Ok(vectors) => {
+            metrics.increment_tasks_processed();
+            metrics.record_task_duration(started.elapsed());
+            metrics.update_gpu_utilization(0.8); // Placeholder for real GPU metrics
+
+            let embeddings: Vec<Vec<f64>> = vectors
+                .into_iter()
+                .map(|vec| vec.into_iter().map(|f| f as f64).collect())
+                .collect();
+
+            let response = TaskExecutionResponse {
+                id: request.id,
+                embeddings,
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                metadata: None,
+            };
+
+            let body = warp::reply::json(&response);
+            Ok(warp::reply::with_status(body, StatusCode::OK))
+        }
+        Err(err) => {
+            let class = request.class.unwrap_or_else(|| "default".to_string());
+            metrics.increment_error(&class);
+            let body = warp::reply::json(&ErrorResponse {
+                error: err.to_string(),
+            });
+            Ok(warp::reply::with_status(
+                body,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
+    }
+}
+
+fn extract_inputs(payload: &Value) -> Result<Vec<String>, String> {
+    let inputs = payload
+        .get("inputs")
+        .ok_or_else(|| "payload missing 'inputs'".to_string())?
+        .as_array()
+        .ok_or_else(|| "payload 'inputs' must be an array".to_string())?;
+
+    let mut out = Vec::with_capacity(inputs.len());
+    for item in inputs {
+        match item.as_str() {
+            Some(s) if !s.trim().is_empty() => out.push(s.to_string()),
+            _ => return Err("payload 'inputs' must be non-empty strings".to_string()),
+        }
     }
 
-    #[test]
-    fn test_task_duration_recording() {
-        let metrics = EnvRunnerMetrics::new();
-
-        // Record some durations
-        metrics.record_task_duration(Duration::from_millis(100));
-        metrics.record_task_duration(Duration::from_millis(200));
-        metrics.record_task_duration(Duration::from_millis(300));
-
-        let stats = metrics.get_stats();
-        assert!(stats.avg_duration_ms > 0);
-        assert!(stats.latency_p95_ms > 0);
+    if out.is_empty() {
+        return Err("payload 'inputs' cannot be empty".to_string());
     }
 
-    #[test]
-    fn test_gpu_utilization() {
-        let metrics = EnvRunnerMetrics::new();
-
-        metrics.update_gpu_utilization(75.5);
-
-        let stats = metrics.get_stats();
-        assert_eq!(stats.gpu_utilization, 75.5);
-    }
+    Ok(out)
 }

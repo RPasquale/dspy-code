@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """One-command launcher for the full DSPy lightweight agent stack.
 
-This utility mirrors the simplicity of the ``codex`` command: run ``dspy-code`` to
+command: run ``dspy`` to
 boot all microservices (Kafka, Redis, Ollama, RL workers, dashboards, etc.),
 wait for them to become healthy, preload the configured Ollama models, and then
 drop into an interactive ``dspy-agent`` session inside the container. When you
 exit the agent, the stack stays up by default so dashboards and background
-workers keep running; use ``dspy-code stop`` to shut everything down.
+workers keep running; use ``dspy stop`` to shut everything down.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -25,59 +24,18 @@ from typing import Iterable, List, Sequence
 import scripts.manage_stack as manage_stack
 
 
-def _detect_local_models() -> List[str]:
-    env_models = _split_models(os.getenv("OLLAMA_MODELS"))
-    if env_models:
-        return env_models
-    single = os.getenv("OLLAMA_MODEL") or os.getenv("MODEL_NAME")
-    if single:
-        models = _split_models(single)
-        if models:
-            return models
-    exe = shutil.which("ollama")
-    if exe:
-        try:
-            result = subprocess.run(
-                [exe, "list"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            models: List[str] = []
-            for line in result.stdout.splitlines()[1:]:  # skip header
-                parts = line.split()
-                if parts:
-                    tag = parts[0].strip()
-                    if tag:
-                        models.append(tag)
-            if models:
-                # Prefer deepseek-coder if present
-                preferred = "deepseek-coder:1.3b"
-                if preferred in models:
-                    models = [preferred] + [m for m in models if m != preferred]
-                return models
-        except Exception:
-            pass
-    # Fallback preference
-    return ["deepseek-coder:1.3b", "qwen3:1.7b"]
+DEFAULT_MODELS = ["deepseek-r1:1.5b", "qwen3:1.7b"]
 
 
 def _compose_env(use_gpu: bool = False) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("WORKSPACE_DIR", str(manage_stack.ROOT))
     env.setdefault("DSPY_WORKSPACE", str(manage_stack.ROOT))
-    models = _detect_local_models()
-    primary = models[0] if models else "deepseek-coder:1.3b"
-    env.setdefault("OLLAMA_MODEL", primary)
-    env.setdefault("OLLAMA_MODELS", ",".join(models))
-    env.setdefault("MODEL_NAME", primary)
+    env.setdefault("OLLAMA_MODEL", DEFAULT_MODELS[0])
+    env.setdefault("OLLAMA_MODELS", ",".join(DEFAULT_MODELS))
+    env.setdefault("MODEL_NAME", DEFAULT_MODELS[0])
     env.setdefault("USE_OLLAMA", "true")
     env.setdefault("DOCKER_ENV", "true")
-    env.setdefault("DSPY_AUTO_TRAIN", "0")
-    # Match container user to the invoking host user so workspace mounts stay writable.
-    if hasattr(os, "getuid") and hasattr(os, "getgid"):
-        env.setdefault("DSPY_UID", str(os.getuid()))
-        env.setdefault("DSPY_GID", str(os.getgid()))
     if use_gpu:
         env.setdefault("DSPY_GPU_COUNT", "1")
         env.setdefault("NVIDIA_VISIBLE_DEVICES", "all")
@@ -115,7 +73,7 @@ def _expected_models() -> List[str]:
     legacy = os.getenv("OLLAMA_MODEL")
     if legacy:
         return _split_models(legacy)
-    return _detect_local_models()
+    return DEFAULT_MODELS
 
 
 def _base_model_name(tag: str) -> str:
@@ -255,17 +213,17 @@ def handle_start(args: argparse.Namespace) -> None:
     env = _compose_env(args.gpu)
     runner = manage_stack.ComposeRunner(extra_files=_extra_files(args.gpu))
     compose_up(runner, env=env, force_recreate=args.force_recreate)
-    print("[dspy-code] waiting for Ollama health...")
+    print("[dspy] waiting for Ollama health...")
     _wait_for_service(runner, "ollama", timeout=args.timeout, env=env)
-    print("[dspy-code] waiting for Ollama models...")
+    print("[dspy] waiting for Ollama models...")
     _wait_for_models(timeout=args.timeout)
-    print("[dspy-code] waiting for agent container...")
+    print("[dspy] waiting for agent container...")
     _wait_for_service(runner, "dspy-agent", timeout=args.timeout, env=env)
     if args.attach:
-        print("[dspy-code] launching interactive agent session (Ctrl+C to exit)")
+        print("[dspy] launching interactive agent session (Ctrl+C to exit)")
         _interactive_exec(runner, args.agent_args, env=env)
     else:
-        print("[dspy-code] stack is running. Use 'dspy-code attach' to open an agent session or 'dspy-code logs' to tail logs.")
+        print("[dspy] stack is running. Use 'dspy attach' to open an agent session or 'dspy logs' to tail logs.")
 
 
 def handle_attach(args: argparse.Namespace) -> None:
@@ -284,7 +242,7 @@ def handle_stop(args: argparse.Namespace) -> None:
     env = _compose_env()
     runner = manage_stack.ComposeRunner()
     compose_down(runner, env=env, volumes=args.volumes)
-    print("[dspy-code] stack stopped")
+    print("[dspy] stack stopped")
 
 
 def handle_status(_: argparse.Namespace) -> None:
@@ -303,7 +261,7 @@ def handle_logs(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dspy-code",
+        prog="dspy",
         description="Convenience launcher for the DSPy lightweight agent stack",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -351,7 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args.func(args)
     except KeyboardInterrupt:
-        print("\n[dspy-code] interrupted", file=sys.stderr)
+        print("\n[dspy] interrupted", file=sys.stderr)
         return 130
     return 0
 

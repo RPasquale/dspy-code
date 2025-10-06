@@ -18,6 +18,9 @@ type QueueWatcher struct {
 	doneDir    string
 	registry   *telemetry.Registry
 	queueDepth *telemetry.Gauge
+	submitted  *telemetry.Counter
+	processed  *telemetry.Counter
+	completed  *telemetry.Counter
 	mu         sync.RWMutex
 	stopCh     chan struct{}
 }
@@ -28,25 +31,28 @@ func NewQueueWatcher(pendDir, doneDir string, registry *telemetry.Registry) (*Qu
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Watch the pending directory
 	if err := watcher.Add(pendDir); err != nil {
 		watcher.Close()
 		return nil, err
 	}
-	
+
 	// Watch the done directory
 	if err := watcher.Add(doneDir); err != nil {
 		watcher.Close()
 		return nil, err
 	}
-	
+
 	return &QueueWatcher{
 		watcher:    watcher,
 		pendDir:    pendDir,
 		doneDir:    doneDir,
 		registry:   registry,
 		queueDepth: telemetry.NewGauge(registry, "queue_depth", "Number of pending tasks in queue"),
+		submitted:  registry.Counter("queue_tasks_submitted_total"),
+		processed:  registry.Counter("queue_tasks_processed_total"),
+		completed:  registry.Counter("queue_tasks_completed_total"),
 		stopCh:     make(chan struct{}),
 	}, nil
 }
@@ -89,22 +95,28 @@ func (qw *QueueWatcher) handleEvent(event fsnotify.Event) {
 		if filepath.Dir(event.Name) == qw.pendDir {
 			// New task added to pending queue
 			qw.queueDepth.Inc()
-			qw.registry.Counter("queue_tasks_submitted_total").Inc()
+			if qw.submitted != nil {
+				qw.submitted.Inc()
+			}
 		}
 	}
-	
+
 	if event.Op&fsnotify.Remove == fsnotify.Remove {
 		if filepath.Dir(event.Name) == qw.pendDir {
 			// Task removed from pending queue
 			qw.queueDepth.Dec()
-			qw.registry.Counter("queue_tasks_processed_total").Inc()
+			if qw.processed != nil {
+				qw.processed.Inc()
+			}
 		}
 	}
-	
+
 	if event.Op&fsnotify.Write == fsnotify.Write {
 		if filepath.Dir(event.Name) == qw.doneDir {
 			// Task completed
-			qw.registry.Counter("queue_tasks_completed_total").Inc()
+			if qw.completed != nil {
+				qw.completed.Inc()
+			}
 		}
 	}
 }
@@ -113,7 +125,7 @@ func (qw *QueueWatcher) handleEvent(event fsnotify.Event) {
 func (qw *QueueWatcher) updateMetricsLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -134,7 +146,7 @@ func (qw *QueueWatcher) updateQueueDepth() {
 		log.Printf("Failed to count pending files: %v", err)
 		return
 	}
-	
+
 	// Update gauge
 	qw.queueDepth.Set(float64(count))
 }
@@ -145,7 +157,7 @@ func (qw *QueueWatcher) countFiles(dir string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	
+
 	return len(entries), nil
 }
 
@@ -153,20 +165,20 @@ func (qw *QueueWatcher) countFiles(dir string) (int, error) {
 func (qw *QueueWatcher) GetQueueDepth() int {
 	qw.mu.RLock()
 	defer qw.mu.RUnlock()
-	
+
 	count, err := qw.countFiles(qw.pendDir)
 	if err != nil {
 		return 0
 	}
-	
+
 	return count
 }
 
 // GetQueueStats returns queue statistics
 func (qw *QueueWatcher) GetQueueStats() QueueStats {
 	return QueueStats{
-		Pending:  qw.GetQueueDepth(),
-		Done:     qw.getDoneCount(),
+		Pending:   qw.GetQueueDepth(),
+		Done:      qw.getDoneCount(),
 		Submitted: qw.getSubmittedCount(),
 		Processed: qw.getProcessedCount(),
 		Completed: qw.getCompletedCount(),
@@ -184,22 +196,34 @@ func (qw *QueueWatcher) getDoneCount() int {
 
 // getSubmittedCount gets the submitted counter value
 func (qw *QueueWatcher) getSubmittedCount() float64 {
-	// This would need to be implemented in the telemetry package
-	// For now, return 0
+	if qw.submitted == nil {
+		return 0
+	}
+	if v, ok := qw.registry.Value("queue_tasks_submitted_total"); ok {
+		return v
+	}
 	return 0
 }
 
 // getProcessedCount gets the processed counter value
 func (qw *QueueWatcher) getProcessedCount() float64 {
-	// This would need to be implemented in the telemetry package
-	// For now, return 0
+	if qw.processed == nil {
+		return 0
+	}
+	if v, ok := qw.registry.Value("queue_tasks_processed_total"); ok {
+		return v
+	}
 	return 0
 }
 
 // getCompletedCount gets the completed counter value
 func (qw *QueueWatcher) getCompletedCount() float64 {
-	// This would need to be implemented in the telemetry package
-	// For now, return 0
+	if qw.completed == nil {
+		return 0
+	}
+	if v, ok := qw.registry.Value("queue_tasks_completed_total"); ok {
+		return v
+	}
 	return 0
 }
 

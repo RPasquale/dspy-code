@@ -4,22 +4,31 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/dspy/orchestrator/pkg/telemetry"
 )
 
-// EventBus handles event publishing to various backends
+// EventBus handles event publishing to various backends including RedDB and Kafka spools.
 type EventBus struct {
-	registry    *telemetry.Registry
+	registry     *telemetry.Registry
 	kafkaEnabled bool
 	reddbEnabled bool
-	logFile     *os.File
+	logFile      *os.File
+	kafkaTopic   string
+	vectorTopic  string
+	kafkaWriter  *spoolWriter
+	vectorWriter *spoolWriter
+	reddbClient  *http.Client
+	reddbURL     string
 }
 
-// Event represents a system event
+// Event represents a system event.
 type Event struct {
 	Type      string                 `json:"type"`
 	Timestamp time.Time              `json:"timestamp"`
@@ -27,35 +36,52 @@ type Event struct {
 	Source    string                 `json:"source"`
 }
 
-// NewEventBus creates a new event bus
+// NewEventBus creates a new event bus instance.
 func NewEventBus(registry *telemetry.Registry, kafkaEnabled, reddbEnabled bool) (*EventBus, error) {
-	// Ensure logs directory exists
 	logsDir := "logs"
-	if err := os.MkdirAll(logsDir, 0755); err != nil {
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
 		return nil, err
 	}
 
-	// Open log file for agent actions
-	logFile, err := os.OpenFile(
-		filepath.Join(logsDir, "agent_action.jsonl"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0644,
-	)
+	logFile, err := os.OpenFile(filepath.Join(logsDir, "agent_action.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
 
-	return &EventBus{
+	eb := &EventBus{
 		registry:     registry,
 		kafkaEnabled: kafkaEnabled,
 		reddbEnabled: reddbEnabled,
-		logFile:     logFile,
-	}, nil
+		logFile:      logFile,
+	}
+
+	if kafkaEnabled {
+		spoolDir := os.Getenv("KAFKA_SPOOL_DIR")
+		if spoolDir == "" {
+			spoolDir = filepath.Join("logs", "kafka")
+		}
+		if err := os.MkdirAll(spoolDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create kafka spool dir: %w", err)
+		}
+		eb.kafkaTopic = envOrDefault("KAFKA_EVENT_TOPIC", "agent.events")
+		eb.vectorTopic = envOrDefault("KAFKA_VECTOR_TOPIC", "agent.vectorized")
+		eb.kafkaWriter = newSpoolWriter(filepath.Join(spoolDir, eb.kafkaTopic+".jsonl"))
+		eb.vectorWriter = newSpoolWriter(filepath.Join(spoolDir, eb.vectorTopic+".jsonl"))
+	}
+
+	if reddbEnabled {
+		eb.reddbURL = strings.TrimRight(os.Getenv("REDDB_URL"), "/")
+		if eb.reddbURL != "" {
+			eb.reddbClient = &http.Client{Timeout: 10 * time.Second}
+		}
+	}
+
+	return eb, nil
 }
 
-// PublishTaskSubmitted publishes a task submitted event
+// PublishTaskSubmitted publishes a task submitted event.
 func (eb *EventBus) PublishTaskSubmitted(ctx context.Context, taskID string, taskData map[string]interface{}) error {
-	event := Event{
+	return eb.publishEvent(ctx, Event{
 		Type:      "task_submitted",
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
@@ -63,14 +89,12 @@ func (eb *EventBus) PublishTaskSubmitted(ctx context.Context, taskID string, tas
 			"task_data": taskData,
 		},
 		Source: "orchestrator",
-	}
-
-	return eb.publishEvent(ctx, event)
+	})
 }
 
-// PublishTaskCompleted publishes a task completed event
+// PublishTaskCompleted publishes task completion events.
 func (eb *EventBus) PublishTaskCompleted(ctx context.Context, taskID string, result map[string]interface{}) error {
-	event := Event{
+	return eb.publishEvent(ctx, Event{
 		Type:      "task_completed",
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
@@ -78,29 +102,25 @@ func (eb *EventBus) PublishTaskCompleted(ctx context.Context, taskID string, res
 			"result":  result,
 		},
 		Source: "orchestrator",
-	}
-
-	return eb.publishEvent(ctx, event)
+	})
 }
 
-// PublishTaskFailed publishes a task failed event
-func (eb *EventBus) PublishTaskFailed(ctx context.Context, taskID string, error string) error {
-	event := Event{
+// PublishTaskFailed publishes failure events.
+func (eb *EventBus) PublishTaskFailed(ctx context.Context, taskID string, failure string) error {
+	return eb.publishEvent(ctx, Event{
 		Type:      "task_failed",
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
 			"task_id": taskID,
-			"error":   error,
+			"error":   failure,
 		},
 		Source: "orchestrator",
-	}
-
-	return eb.publishEvent(ctx, event)
+	})
 }
 
-// PublishSlurmJobSubmitted publishes a Slurm job submitted event
+// PublishSlurmJobSubmitted emits slurm submission events.
 func (eb *EventBus) PublishSlurmJobSubmitted(ctx context.Context, taskID, jobID string) error {
-	event := Event{
+	return eb.publishEvent(ctx, Event{
 		Type:      "slurm_job_submitted",
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
@@ -108,12 +128,10 @@ func (eb *EventBus) PublishSlurmJobSubmitted(ctx context.Context, taskID, jobID 
 			"job_id":  jobID,
 		},
 		Source: "slurm_bridge",
-	}
-
-	return eb.publishEvent(ctx, event)
+	})
 }
 
-// PublishSlurmJobCompleted publishes a Slurm job completed event
+// PublishSlurmJobCompleted emits slurm completion events.
 func (eb *EventBus) PublishSlurmJobCompleted(ctx context.Context, taskID, jobID string, result map[string]interface{}) error {
 	event := Event{
 		Type:      "slurm_job_completed",
@@ -125,70 +143,117 @@ func (eb *EventBus) PublishSlurmJobCompleted(ctx context.Context, taskID, jobID 
 		},
 		Source: "slurm_bridge",
 	}
-
 	return eb.publishEvent(ctx, event)
 }
 
-// publishEvent publishes an event to all enabled backends
+// PublishVectorizedMessage writes vectorized payloads for Spark/Kafka workers.
+func (eb *EventBus) PublishVectorizedMessage(ctx context.Context, key string, payload any) error {
+	if eb.vectorWriter == nil {
+		return fmt.Errorf("vector writer not configured")
+	}
+	record := map[string]interface{}{
+		"topic":     eb.vectorTopic,
+		"key":       key,
+		"value":     payload,
+		"timestamp": time.Now().UnixMilli(),
+	}
+	return eb.vectorWriter.Append(record)
+}
+
 func (eb *EventBus) publishEvent(ctx context.Context, event Event) error {
-	// Always log to file
 	if err := eb.logToFile(event); err != nil {
-		return fmt.Errorf("failed to log event to file: %w", err)
+		return fmt.Errorf("log event: %w", err)
 	}
-
-	// Publish to Kafka if enabled
-	if eb.kafkaEnabled {
-		if err := eb.publishToKafka(ctx, event); err != nil {
-			// Log error but don't fail the operation
-			fmt.Printf("Failed to publish to Kafka: %v\n", err)
+	if eb.kafkaWriter != nil {
+		record := map[string]interface{}{
+			"topic":     eb.kafkaTopic,
+			"key":       event.Type,
+			"value":     event,
+			"timestamp": time.Now().UnixMilli(),
+		}
+		if err := eb.kafkaWriter.Append(record); err != nil {
+			fmt.Printf("failed to append kafka spool: %v\n", err)
 		}
 	}
-
-	// Publish to RedDB if enabled
-	if eb.reddbEnabled {
+	if eb.reddbClient != nil {
 		if err := eb.publishToRedDB(ctx, event); err != nil {
-			// Log error but don't fail the operation
-			fmt.Printf("Failed to publish to RedDB: %v\n", err)
+			fmt.Printf("failed to publish to RedDB: %v\n", err)
 		}
 	}
-
-	// Update metrics
 	eb.registry.Counter("events_published_total").Inc()
-
 	return nil
 }
 
-// logToFile logs the event to the agent action log file
 func (eb *EventBus) logToFile(event Event) error {
-	data, err := json.Marshal(event)
+	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
-
-	_, err = eb.logFile.Write(append(data, '\n'))
+	_, err = eb.logFile.Write(append(payload, '\n'))
 	return err
 }
 
-// publishToKafka publishes the event to Kafka
-func (eb *EventBus) publishToKafka(ctx context.Context, event Event) error {
-	// This would integrate with the existing Kafka infrastructure
-	// For now, just log that we would publish to Kafka
-	fmt.Printf("Would publish to Kafka: %s\n", event.Type)
-	return nil
-}
-
-// publishToRedDB publishes the event to RedDB
 func (eb *EventBus) publishToRedDB(ctx context.Context, event Event) error {
-	// This would integrate with the existing RedDB infrastructure
-	// For now, just log that we would publish to RedDB
-	fmt.Printf("Would publish to RedDB: %s\n", event.Type)
+	bytes, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, eb.reddbURL+"/api/v1/events", bytes.NewReader(bytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := eb.reddbClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("reddb status %d", resp.StatusCode)
+	}
 	return nil
 }
 
-// Close closes the event bus
+// Close releases event bus resources.
 func (eb *EventBus) Close() error {
 	if eb.logFile != nil {
 		return eb.logFile.Close()
 	}
 	return nil
+}
+
+// spoolWriter persists JSON records for downstream ingestion.
+type spoolWriter struct {
+	mu   sync.Mutex
+	path string
+}
+
+func newSpoolWriter(path string) *spoolWriter {
+	return &spoolWriter{path: path}
+}
+
+func (w *spoolWriter) Append(record map[string]interface{}) error {
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(w.path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(payload, '\n'))
+	return err
+}
+
+func envOrDefault(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
 }

@@ -1,45 +1,59 @@
-import React, { createContext, useCallback, useContext, useMemo, useState } from 'react'
+import { createContext, useContext, useState, useCallback, ReactNode } from 'react';
+import ToastItem, { Toast } from './Toast';
 
-type ToastKind = 'ok' | 'warn' | 'err'
-type Toast = { id: string; text: string; kind: ToastKind; ttl?: number }
-
-type ToastContextValue = {
-  notify: (text: string, kind?: ToastKind, ttlMs?: number) => void
+interface ToastContextType {
+  showToast: (toast: Omit<Toast, 'id'>) => void;
+  removeToast: (id: string) => void;
 }
 
-const ToastContext = createContext<ToastContextValue | null>(null)
+const ToastContext = createContext<ToastContextType | undefined>(undefined);
 
-export function ToastProvider({ children }: { children: React.ReactNode }) {
-  const [items, setItems] = useState<Toast[]>([])
+export const useToast = () => {
+  const context = useContext(ToastContext);
+  if (!context) {
+    throw new Error('useToast must be used within a ToastProvider');
+  }
+  return context;
+};
 
-  const notify = useCallback((text: string, kind: ToastKind = 'ok', ttlMs = 3200) => {
-    const id = `${Date.now()}_${Math.random().toString(36).slice(2,8)}`
-    const t: Toast = { id, text, kind, ttl: ttlMs }
-    setItems((prev) => [...prev, t].slice(-6))
-    window.setTimeout(() => {
-      setItems((prev) => prev.filter((x) => x.id !== id))
-    }, ttlMs)
-  }, [])
+interface ToastProviderProps {
+  children: ReactNode;
+}
 
-  const value = useMemo(() => ({ notify }), [notify])
+export const ToastProvider = ({ children }: ToastProviderProps) => {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+
+  const showToast = useCallback((toast: Omit<Toast, 'id'>) => {
+    const id = Math.random().toString(36).substr(2, 9);
+    const newToast: Toast = {
+      ...toast,
+      id,
+      duration: toast.duration ?? 5000, // Default 5 seconds
+    };
+    
+    setToasts(prev => [...prev, newToast]);
+  }, []);
+
+  const removeToast = useCallback((id: string) => {
+    setToasts(prev => prev.filter(toast => toast.id !== id));
+  }, []);
 
   return (
-    <ToastContext.Provider value={value}>
+    <ToastContext.Provider value={{ showToast, removeToast }}>
       {children}
-      <div style={{ position: 'fixed', right: 16, top: 16, zIndex: 60, display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {items.map((t) => (
-          <div key={t.id} className={`tag anim-fade-in`} style={{ borderColor: 'rgba(148,163,184,0.35)', background: t.kind==='ok' ? 'rgba(16,185,129,0.15)' : (t.kind==='warn' ? 'rgba(245,158,11,0.15)' : 'rgba(239,68,68,0.15)'), color: t.kind==='ok' ? '#86efac' : (t.kind==='warn' ? '#fbbf24' : '#fecaca') }}>
-            {t.text}
-          </div>
+      
+      {/* Toast container */}
+      <div className="fixed top-4 right-4 z-50 space-y-2">
+        {toasts.map(toast => (
+          <ToastItem
+            key={toast.id}
+            toast={toast}
+            onRemove={removeToast}
+          />
         ))}
       </div>
     </ToastContext.Provider>
-  )
-}
+  );
+};
 
-export function useToast(): ToastContextValue {
-  const ctx = useContext(ToastContext)
-  if (!ctx) throw new Error('useToast must be used within ToastProvider')
-  return ctx
-}
-
+export default ToastProvider;

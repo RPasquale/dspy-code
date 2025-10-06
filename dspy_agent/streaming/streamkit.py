@@ -796,18 +796,286 @@ class Discovered:
 
 
 def autodiscover_logs(root: Path) -> List[Discovered]:
+    """Enhanced container discovery with Docker Compose, framework detection, and intelligent classification."""
+    discovered: List[Discovered] = []
+    
+    # Strategy 1: Docker Compose discovery
+    compose_discoveries = _discover_docker_compose_services(root)
+    discovered.extend(compose_discoveries)
+    
+    # Strategy 2: Running container discovery
+    running_discoveries = _discover_running_containers(root)
+    discovered.extend(running_discoveries)
+    
+    # Strategy 3: Framework-based discovery
+    framework_discoveries = _discover_by_framework(root)
+    discovered.extend(framework_discoveries)
+    
+    # Strategy 4: Enhanced file-based discovery (fallback)
+    file_discoveries = _discover_log_files(root)
+    discovered.extend(file_discoveries)
+    
+    # Deduplicate by container name
+    chosen: Dict[str, Discovered] = {}
+    for discovery in discovered:
+        if discovery.container not in chosen:
+            chosen[discovery.container] = discovery
+    
+    return list(chosen.values())
+
+
+def _discover_docker_compose_services(root: Path) -> List[Discovered]:
+    """Discover services from Docker Compose files."""
+    discovered: List[Discovered] = []
+    
+    # Look for compose files
+    compose_files = [
+        root / "docker-compose.yml",
+        root / "docker-compose.yaml", 
+        root / "compose.yml",
+        root / "compose.yaml"
+    ]
+    
+    for compose_file in compose_files:
+        if not compose_file.exists():
+            continue
+            
+        try:
+            import yaml
+            with compose_file.open() as f:
+                compose_data = yaml.safe_load(f)
+                
+            services = compose_data.get('services', {})
+            for service_name, service_config in services.items():
+                container_type = _classify_compose_service(service_name, service_config)
+                
+                # Try to find log files for this service
+                log_paths = _find_service_logs(root, service_name)
+                for log_path in log_paths:
+                    discovered.append(Discovered(
+                        container=container_type,
+                        service=service_name,
+                        log_file=log_path
+                    ))
+                    
+        except Exception:
+            continue
+    
+    return discovered
+
+
+def _discover_running_containers(root: Path) -> List[Discovered]:
+    """Discover running Docker containers and classify them."""
+    discovered: List[Discovered] = []
+    
+    try:
+        import subprocess
+        import json
+        
+        # Get running containers with detailed info
+        result = subprocess.run([
+            'docker', 'ps', '--format', 'json'
+        ], capture_output=True, text=True, timeout=10)
+        
+        if result.returncode != 0:
+            return discovered
+            
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            try:
+                container_info = json.loads(line)
+                container_name = container_info.get('Names', '')
+                container_type = _classify_running_container(container_info)
+                
+                # Create a virtual log path for Docker logs
+                log_path = root / f"docker_logs_{container_name}.log"
+                discovered.append(Discovered(
+                    container=container_type,
+                    service=container_name,
+                    log_file=log_path
+                ))
+            except Exception:
+                continue
+                
+    except Exception:
+        pass
+    
+    return discovered
+
+
+def _discover_by_framework(root: Path) -> List[Discovered]:
+    """Discover containers based on project framework detection."""
+    discovered: List[Discovered] = []
+    
+    # Detect frontend frameworks
+    frontend_indicators = [
+        'package.json', 'yarn.lock', 'pnpm-lock.yaml',
+        'vite.config.js', 'next.config.js', 'nuxt.config.js',
+        'src/main.js', 'src/App.js', 'src/index.js'
+    ]
+    
+    # Detect backend frameworks
+    backend_indicators = [
+        'requirements.txt', 'Pipfile', 'pyproject.toml',
+        'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle',
+        'Gemfile', 'composer.json', 'package.json'  # Node.js backends
+    ]
+    
+    # Check for frontend indicators
+    if any((root / indicator).exists() for indicator in frontend_indicators):
+        # Look for frontend-specific log files
+        frontend_logs = _find_framework_logs(root, 'frontend')
+        for log_path in frontend_logs:
+            discovered.append(Discovered(
+                container='frontend',
+                service='web',
+                log_file=log_path
+            ))
+    
+    # Check for backend indicators
+    if any((root / indicator).exists() for indicator in backend_indicators):
+        backend_logs = _find_framework_logs(root, 'backend')
+        for log_path in backend_logs:
+            discovered.append(Discovered(
+                container='backend',
+                service='api',
+                log_file=log_path
+            ))
+    
+    return discovered
+
+
+def _discover_log_files(root: Path) -> List[Discovered]:
+    """Enhanced file-based discovery with better classification."""
     candidates: List[Tuple[str, str, Path]] = []
+    
     for p in root.rglob("*"):
-        if not p.is_file(): continue
+        if not p.is_file():
+            continue
         if p.suffix.lower() == ".log" or p.name.lower().endswith((".out", ".err")) or p.parts[-2:] == ("logs", p.name):
             parts = [x for x in p.parts if x not in (".",)]
-            container = "backend" if any("back" in seg.lower() for seg in parts) else ("frontend" if any("front" in seg.lower() for seg in parts) else "app")
+            
+            # Enhanced classification logic
+            container = _classify_by_path(parts)
             service = p.parent.name or "core"
             candidates.append((container, service, p))
+    
     chosen: Dict[str, Discovered] = {}
     for container, service, path in candidates:
-        if container not in chosen: chosen[container] = Discovered(container, service, path)
+        if container not in chosen:
+            chosen[container] = Discovered(container, service, path)
+    
     return list(chosen.values())
+
+
+def _classify_compose_service(service_name: str, service_config: dict) -> str:
+    """Classify Docker Compose service by name and configuration."""
+    name_lower = service_name.lower()
+    config_lower = str(service_config).lower()
+    
+    # Frontend indicators
+    frontend_keywords = ['frontend', 'front', 'web', 'ui', 'client', 'react', 'vue', 'angular']
+    if any(keyword in name_lower for keyword in frontend_keywords):
+        return 'frontend'
+    
+    # Backend indicators  
+    backend_keywords = ['backend', 'back', 'api', 'server', 'app', 'service', 'django', 'flask', 'express', 'fastapi']
+    if any(keyword in name_lower for keyword in backend_keywords):
+        return 'backend'
+    
+    # Port-based classification
+    ports = service_config.get('ports', [])
+    for port_mapping in ports:
+        if isinstance(port_mapping, str):
+            port = port_mapping.split(':')[0]
+            if port in ['3000', '5173', '8080', '4200']:
+                return 'frontend'
+            elif port in ['5000', '8000', '9000', '3001']:
+                return 'backend'
+    
+    # Default classification
+    return 'app'
+
+
+def _classify_running_container(container_info: dict) -> str:
+    """Classify running container by name, image, and ports."""
+    name = container_info.get('Names', '').lower()
+    image = container_info.get('Image', '').lower()
+    ports = container_info.get('Ports', '')
+    
+    # Frontend indicators
+    frontend_keywords = ['frontend', 'front', 'web', 'ui', 'client', 'react', 'vue', 'angular', 'nginx']
+    if any(keyword in name or keyword in image for keyword in frontend_keywords):
+        return 'frontend'
+    
+    # Backend indicators
+    backend_keywords = ['backend', 'back', 'api', 'server', 'app', 'django', 'flask', 'express', 'fastapi', 'node']
+    if any(keyword in name or keyword in image for keyword in backend_keywords):
+        return 'backend'
+    
+    # Port-based classification
+    if '3000' in ports or '5173' in ports or '8080' in ports:
+        return 'frontend'
+    elif '5000' in ports or '8000' in ports or '9000' in ports:
+        return 'backend'
+    
+    return 'app'
+
+
+def _classify_by_path(parts: List[str]) -> str:
+    """Enhanced path-based classification."""
+    path_str = ' '.join(parts).lower()
+    
+    # More sophisticated keyword matching
+    frontend_keywords = ['frontend', 'front', 'web', 'ui', 'client', 'react', 'vue', 'angular', 'public', 'static']
+    backend_keywords = ['backend', 'back', 'api', 'server', 'app', 'django', 'flask', 'express', 'fastapi', 'src']
+    
+    if any(keyword in path_str for keyword in frontend_keywords):
+        return 'frontend'
+    elif any(keyword in path_str for keyword in backend_keywords):
+        return 'backend'
+    else:
+        return 'app'
+
+
+def _find_service_logs(root: Path, service_name: str) -> List[Path]:
+    """Find log files for a specific service."""
+    log_paths = []
+    
+    # Common log locations
+    log_patterns = [
+        f"logs/{service_name}*.log",
+        f"logs/{service_name}*.out", 
+        f"logs/{service_name}*.err",
+        f"**/{service_name}*.log",
+        f"**/{service_name}*.out",
+        f"**/{service_name}*.err"
+    ]
+    
+    for pattern in log_patterns:
+        for log_path in root.glob(pattern):
+            if log_path.is_file():
+                log_paths.append(log_path)
+    
+    return log_paths
+
+
+def _find_framework_logs(root: Path, framework_type: str) -> List[Path]:
+    """Find log files for a specific framework type."""
+    log_paths = []
+    
+    if framework_type == 'frontend':
+        patterns = ['**/npm-debug.log', '**/yarn-error.log', '**/build.log', '**/dev.log']
+    else:  # backend
+        patterns = ['**/app.log', '**/server.log', '**/api.log', '**/error.log']
+    
+    for pattern in patterns:
+        for log_path in root.glob(pattern):
+            if log_path.is_file():
+                log_paths.append(log_path)
+    
+    return log_paths
 
 
 class FileTailer(threading.Thread):
@@ -835,7 +1103,12 @@ class Aggregator(threading.Thread):
             try: item = self.in_q.get(timeout=0.2)
             except Empty: item=None
             if item:
-                line = str(item.get("line", ""))
+                # Handle both string and dict message types
+                if isinstance(item, dict):
+                    line = str(item.get("line", ""))
+                else:
+                    # If item is a string, use it directly
+                    line = str(item)
                 if self._re.search(line): self._buf.append(line)
             if (now - self._last_flush) >= self.window_sec and self._buf:
                 ctx = {"ctx": list(self._buf), "ts": now}; self.bus.publish(self.out_topic, ctx); self._buf.clear(); self._last_flush = now
@@ -1219,7 +1492,8 @@ def start_local_stack(root: Path, cfg: Optional[StreamConfig] = None, storage: O
             hp.start(); threads.append(hp)
     except Exception:
         pass
-        return threads, bus
+    
+    return threads, bus
 
 
 # -----------------

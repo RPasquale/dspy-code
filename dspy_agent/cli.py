@@ -8,6 +8,7 @@ import time
 import hashlib
 import shutil
 import subprocess
+import asyncio
 from datetime import datetime
 from dataclasses import asdict
 from typing import Optional, List, Iterable, Tuple, Dict, Any, Literal, Mapping
@@ -3870,6 +3871,84 @@ def quickstart(
     except Exception as e:
         console.print(Panel(escape(str(e)), title='quickstart failed', border_style='red'))
 
+
+@app.command("select-containers")
+def select_containers(
+    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
+    list_only: bool = typer.Option(False, '--list/--select', help="List containers without selection"),
+):
+    """Interactive Docker container selector for log monitoring.
+    
+    Discover and select which Docker containers the DSPy agent should monitor
+    for logs and streaming. This helps you choose which frontend/backend
+    containers to include in your development workflow.
+    """
+    try:
+        # Import the container selector
+        import sys
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent
+        sys.path.insert(0, str(project_root))
+        
+        from select_containers import get_containers, display_containers, classify_container, select_containers as select_containers_func, save_config, generate_env_var
+        
+        console.print(Panel.fit(
+            "DSPy Container Selector\n"
+            "Discover and select Docker containers for log monitoring",
+            title="🐳 Container Selector",
+            border_style="blue"
+        ))
+        
+        # Discover containers
+        console.print("[yellow]Discovering Docker containers...[/yellow]")
+        containers = get_containers()
+        
+        if not containers:
+            console.print("[red]No Docker containers found![/red]")
+            return
+        
+        console.print(f"[green]Found {len(containers)} containers[/green]")
+        
+        if list_only:
+            # Just list containers
+            display_containers(containers)
+            
+            # Show classification summary
+            types = {}
+            for container in containers:
+                container_type = classify_container(container)
+                types[container_type] = types.get(container_type, 0) + 1
+            
+            console.print(f"\n[blue]Container Summary:[/blue]")
+            for container_type, count in types.items():
+                console.print(f"  {container_type}: {count} containers")
+            
+            console.print(f"\n[yellow]To select containers, run:[/yellow]")
+            console.print(f"[cyan]dspy-agent select-containers[/cyan]")
+        else:
+            # Interactive selection
+            selected = select_containers_func(containers)
+            
+            if not selected:
+                console.print("[yellow]No containers selected![/yellow]")
+                return
+            
+            console.print(f"\n[green]Selected {len(selected)} containers:[/green]")
+            for container in selected:
+                console.print(f"  • {container}")
+            
+            # Save configuration
+            save_config(selected, workspace)
+            
+            # Generate environment variable
+            env_var = generate_env_var(selected)
+            console.print(f"\n[blue]Environment variable:[/blue]")
+            console.print(f"[cyan]{env_var}[/cyan]")
+            console.print(f"\n[yellow]Start the agent with:[/yellow]")
+            console.print(f"[cyan]export {env_var} && dspy-agent up[/cyan]")
+            
+    except Exception as e:
+        console.print(Panel(f"Container selection failed: {e}", title="Error", border_style="red"))
 
 @app.command("quickstop")
 def quickstop(
@@ -10166,6 +10245,278 @@ def grpo_apply_policy(
         console.print(Panel.fit(body, title="grpo apply-policy updates", border_style="green"))
     except Exception as e:
         console.print(Panel(escape(str(e)), title="grpo apply-policy failed", border_style="red"))
+        raise typer.Exit(1)
+
+
+@app.command("train")
+def train_agent(
+    workspace: str = typer.Option(".", "--workspace", "-w", help="Workspace directory"),
+    episodes: int = typer.Option(1000, "--episodes", "-e", help="Number of training episodes"),
+    workers: int = typer.Option(4, "--workers", help="Number of training workers"),
+    gpus: int = typer.Option(1, "--gpus", help="Number of GPUs to use"),
+    framework: str = typer.Option("auto", "--framework", help="Training framework (auto, protein, carbs, ray, cleanrl)"),
+    sweep: bool = typer.Option(False, "--sweep", help="Run hyperparameter sweep"),
+    sweep_trials: int = typer.Option(50, "--sweep-trials", help="Number of sweep trials"),
+    global_objectives: bool = typer.Option(True, "--global-objectives", help="Use global objectives"),
+    auto_scaling: bool = typer.Option(True, "--auto-scaling", help="Enable auto-scaling"),
+    reddb_tracking: bool = typer.Option(True, "--reddb-tracking", help="Enable RedDB tracking"),
+    react_dashboard: bool = typer.Option(True, "--react-dashboard", help="Enable React dashboard monitoring"),
+    rust_optimized: bool = typer.Option(False, "--rust-optimized", help="Use Rust environment runner for optimization"),
+    go_orchestrated: bool = typer.Option(False, "--go-orchestrated", help="Use Go orchestrator for coordination")
+):
+    """Train the DSPy-Code agent with optimized Rust/Go integration."""
+    try:
+        from .streaming.streamkit import LocalBus
+        
+        # Choose training system based on optimization flags
+        if go_orchestrated and rust_optimized:
+            from .training.go_orchestrator import (
+                UniversalPufferConfig, RustRLConfig, GoOrchestratorConfig, 
+                create_coordinated_trainer, run_coordinated_training
+            )
+            
+            typer.echo("🚀 Starting DSPy-Code Agent Training (Rust + Go Optimized)")
+            typer.echo(f"Workspace: {workspace}")
+            typer.echo(f"Episodes: {episodes}")
+            typer.echo(f"Workers: {workers}")
+            typer.echo(f"GPUs: {gpus}")
+            typer.echo(f"Framework: {framework}")
+            typer.echo(f"Rust optimized: {rust_optimized}")
+            typer.echo(f"Go orchestrated: {go_orchestrated}")
+            typer.echo(f"RedDB tracking: {reddb_tracking}")
+            typer.echo(f"React dashboard: {react_dashboard}")
+            
+            # Create configurations
+            config = UniversalPufferConfig(
+                framework=framework,
+                num_envs=episodes,
+                num_workers=workers,
+                num_gpus=gpus,
+                total_timesteps=episodes * 1000,
+                sweep_enabled=sweep,
+                sweep_trials=sweep_trials,
+                reddb_tracking=reddb_tracking,
+                react_dashboard=react_dashboard
+            )
+            
+            rust_config = RustRLConfig(
+                num_envs=episodes,
+                max_parallel_envs=workers * 4,
+                prefetch_enabled=True,
+                batch_processing=True
+            )
+            
+            orchestrator_config = GoOrchestratorConfig(
+                base_limit=workers,
+                max_limit=workers * 4,
+                rl_task_priority=10,
+                batch_size=64
+            )
+            
+            # Run coordinated training
+            bus = LocalBus()
+            asyncio.run(run_coordinated_training(config, rust_config, orchestrator_config, bus))
+            
+        elif rust_optimized:
+            from .training.rust_rl_runner import (
+                UniversalPufferConfig, RustRLConfig, 
+                create_optimized_trainer, run_optimized_training
+            )
+            
+            typer.echo("🚀 Starting DSPy-Code Agent Training (Rust Optimized)")
+            typer.echo(f"Workspace: {workspace}")
+            typer.echo(f"Episodes: {episodes}")
+            typer.echo(f"Workers: {workers}")
+            typer.echo(f"GPUs: {gpus}")
+            typer.echo(f"Framework: {framework}")
+            typer.echo(f"Rust optimized: {rust_optimized}")
+            typer.echo(f"RedDB tracking: {reddb_tracking}")
+            typer.echo(f"React dashboard: {react_dashboard}")
+            
+            # Create configurations
+            config = UniversalPufferConfig(
+                framework=framework,
+                num_envs=episodes,
+                num_workers=workers,
+                num_gpus=gpus,
+                total_timesteps=episodes * 1000,
+                sweep_enabled=sweep,
+                sweep_trials=sweep_trials,
+                reddb_tracking=reddb_tracking,
+                react_dashboard=react_dashboard
+            )
+            
+            rust_config = RustRLConfig(
+                num_envs=episodes,
+                max_parallel_envs=workers * 4,
+                prefetch_enabled=True,
+                batch_processing=True
+            )
+            
+            # Run optimized training
+            bus = LocalBus()
+            asyncio.run(run_optimized_training(config, rust_config, bus))
+            
+        else:
+            # Standard universal PufferLib training
+            from .training.universal_pufferlib import UniversalPufferConfig, create_universal_trainer
+            
+            typer.echo("🚀 Starting DSPy-Code Agent Training (Universal PufferLib)")
+            typer.echo(f"Workspace: {workspace}")
+            typer.echo(f"Episodes: {episodes}")
+            typer.echo(f"Workers: {workers}")
+            typer.echo(f"GPUs: {gpus}")
+            typer.echo(f"Framework: {framework}")
+            typer.echo(f"Hyperparameter sweep: {sweep}")
+            typer.echo(f"Global objectives: {global_objectives}")
+            typer.echo(f"Auto-scaling: {auto_scaling}")
+            typer.echo(f"RedDB tracking: {reddb_tracking}")
+            typer.echo(f"React dashboard: {react_dashboard}")
+            
+            # Create universal configuration
+            config = UniversalPufferConfig(
+                framework=framework,
+                num_envs=episodes,
+                num_workers=workers,
+                num_gpus=gpus,
+                total_timesteps=episodes * 1000,  # Estimate timesteps per episode
+                sweep_enabled=sweep,
+                sweep_trials=sweep_trials,
+                reddb_tracking=reddb_tracking,
+                react_dashboard=react_dashboard
+            )
+            
+            # Create universal trainer
+            bus = LocalBus()
+            trainer = create_universal_trainer(config, bus)
+            
+            # Start training
+            typer.echo("Starting universal PufferLib training...")
+            trainer.train()
+            
+            # Run hyperparameter sweep if enabled
+            if sweep:
+                typer.echo("Running hyperparameter sweep...")
+                best_config = trainer.run_hyperparameter_sweep()
+                typer.echo(f"Best hyperparameters: {best_config}")
+            
+            # Final status
+            final_status = trainer.get_training_status()
+            typer.echo(f"Training completed!")
+            typer.echo(f"Total episodes: {final_status['episode_count']}")
+            typer.echo(f"Total timesteps: {final_status['total_timesteps']}")
+            typer.echo(f"Framework used: {final_status['framework']}")
+            typer.echo(f"Fallback mode: {final_status['fallback_mode']}")
+        
+    except Exception as e:
+        typer.echo(f"Training failed: {e}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command("sweep")
+def run_hyperparameter_sweep(
+    workspace: str = typer.Option(".", "--workspace", "-w", help="Workspace directory"),
+    trials: int = typer.Option(100, "--trials", "-t", help="Number of trials"),
+    framework: str = typer.Option("auto", "--framework", help="Training framework"),
+    max_concurrent: int = typer.Option(4, "--max-concurrent", help="Maximum concurrent trials"),
+    timeout_hours: int = typer.Option(24, "--timeout", help="Timeout in hours"),
+    reddb_tracking: bool = typer.Option(True, "--reddb-tracking", help="Enable RedDB tracking"),
+    react_dashboard: bool = typer.Option(True, "--react-dashboard", help="Enable React dashboard monitoring")
+):
+    """Run hyperparameter sweep for the DSPy-Code agent using universal PufferLib."""
+    try:
+        from .training.universal_pufferlib import UniversalPufferConfig, create_universal_trainer
+        from .streaming.streamkit import LocalBus
+        
+        typer.echo("🔍 Starting Universal Hyperparameter Sweep")
+        typer.echo(f"Workspace: {workspace}")
+        typer.echo(f"Trials: {trials}")
+        typer.echo(f"Framework: {framework}")
+        typer.echo(f"Max concurrent: {max_concurrent}")
+        typer.echo(f"Timeout: {timeout_hours} hours")
+        typer.echo(f"RedDB tracking: {reddb_tracking}")
+        typer.echo(f"React dashboard: {react_dashboard}")
+        
+        # Create universal configuration
+        config = UniversalPufferConfig(
+            framework=framework,
+            sweep_enabled=True,
+            sweep_trials=trials,
+            reddb_tracking=reddb_tracking,
+            react_dashboard=react_dashboard
+        )
+        
+        # Create universal trainer
+        bus = LocalBus()
+        trainer = create_universal_trainer(config, bus)
+        
+        # Run sweep
+        typer.echo("Starting universal hyperparameter sweep...")
+        best_config = trainer.run_hyperparameter_sweep()
+        
+        # Display results
+        if best_config:
+            typer.echo(f"Sweep completed with {trials} trials")
+            typer.echo(f"Best hyperparameters: {best_config}")
+        else:
+            typer.echo("No trials completed successfully")
+        
+    except Exception as e:
+        typer.echo(f"Hyperparameter sweep failed: {e}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command("judge")
+def setup_judge_models(
+    model_type: str = typer.Option("ensemble", "--model-type", help="Judge model type (transformer, dspy, openai, ensemble)"),
+    models: str = typer.Option("transformer,dspy,openai", "--models", help="Comma-separated list of models for ensemble"),
+    test_data: str = typer.Option(None, "--test-data", help="Path to test data for evaluation"),
+    benchmark: bool = typer.Option(False, "--benchmark", help="Benchmark different judge models")
+):
+    """Setup and test judge models for agent evaluation."""
+    try:
+        from .training.judge_models import create_judge_model, create_ensemble_judge, benchmark_judge_models
+        
+        typer.echo("⚖️ Setting up Judge Models")
+        typer.echo(f"Model type: {model_type}")
+        
+        if benchmark:
+            # Benchmark different models
+            typer.echo("Benchmarking judge models...")
+            model_types = ["transformer", "dspy", "openai"]
+            results = benchmark_judge_models([], model_types)
+            
+            typer.echo("Benchmark results:")
+            for model_type, metrics in results.items():
+                typer.echo(f"  {model_type}: {metrics}")
+        
+        elif model_type == "ensemble":
+            # Create ensemble model
+            model_list = models.split(",")
+            judge_model = create_ensemble_judge(model_list)
+            typer.echo(f"Created ensemble judge with models: {model_list}")
+        
+        else:
+            # Create single model
+            judge_model = create_judge_model(model_type)
+            typer.echo(f"Created {model_type} judge model")
+        
+        # Test the judge model
+        if test_data:
+            typer.echo(f"Testing with data from: {test_data}")
+            # This would load and test the judge model
+        else:
+            # Test with sample data
+            typer.echo("Testing with sample data...")
+            query = "Implement a REST API endpoint for user authentication"
+            response = "Here's a Flask endpoint for user authentication..."
+            
+            score = judge_model.score(query, response)
+            typer.echo(f"Sample score: {score.overall_score:.3f}")
+            typer.echo(f"Explanation: {score.explanation}")
+        
+    except Exception as e:
+        typer.echo(f"Judge model setup failed: {e}", err=True)
         raise typer.Exit(1)
 
 

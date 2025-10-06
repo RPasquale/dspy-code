@@ -74,7 +74,6 @@ rl = [
     "gymnasium>=0.27",
     "torch>=2.0.0",
     "pyro-ppl>=1.9.0",
-    "carbs>=0.2.0",
 ]
 
 [tool.uv]

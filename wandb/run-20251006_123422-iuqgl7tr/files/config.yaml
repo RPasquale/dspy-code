@@ -1,0 +1,90 @@
+_wandb:
+    value:
+        cli_version: 0.22.1
+        e:
+            x5cvz43z8dh6qy7pbjrtvp7t0aqh12ts:
+                email: robbie.pasquale@gmail.com
+                executable: /Users/robbiepasquale/dspy_stuff/.venv/bin/python3
+                git:
+                    commit: b39d762e979a1d02b6d447c10488d22e5e7f042c
+                    remote: https://github.com/RPasquale/dspy_stuff.git
+                host: Robbies-MacBook-Pro.local
+                os: macOS-15.5-arm64-arm-64bit
+                program: <python with no main file>
+                python: CPython 3.12.11
+                root: /Users/robbiepasquale/dspy_stuff
+                startedAt: "2025-10-06T16:34:22.617113Z"
+                writerId: x5cvz43z8dh6qy7pbjrtvp7t0aqh12ts
+        m: []
+        python_version: 3.12.11
+        t:
+            "1":
+                - 1
+                - 95
+                - 105
+                - 107
+            "2":
+                - 1
+                - 95
+                - 105
+                - 107
+            "3":
+                - 16
+            "4": 3.12.11
+            "5": 0.22.1
+            "12": 0.22.1
+            "13": darwin-arm64
+batch_size:
+    value: 64
+clip_coef:
+    value: 0.2
+compile_model:
+    value: true
+dataloader_workers:
+    value: 4
+ent_coef:
+    value: 0.01
+fallback_framework:
+    value: torch
+fallback_mode:
+    value: true
+framework:
+    value: fallback
+gradient_checkpointing:
+    value: true
+learning_rate:
+    value: 0.0003
+log_dir:
+    value: logs/universal_puffer
+max_grad_norm:
+    value: 0.5
+mixed_precision:
+    value: true
+n_epochs:
+    value: 4
+num_cpus:
+    value: 10
+num_envs:
+    value: 32
+num_gpus:
+    value: 0
+num_workers:
+    value: 4
+pin_memory:
+    value: true
+sweep_enabled:
+    value: true
+sweep_framework:
+    value: auto
+sweep_trials:
+    value: 10
+tensorboard:
+    value: true
+total_timesteps:
+    value: 10000000
+vf_coef:
+    value: 0.5
+wandb:
+    value: true
+wandb_project:
+    value: dspy-code-universal
