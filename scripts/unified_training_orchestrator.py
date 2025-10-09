@@ -190,13 +190,36 @@ python -m dspy_agent.training.entrypoint \\
             'BATCH_SIZE': str(request.batch_size),
             'LEARNING_RATE': str(request.learning_rate),
             'MAX_STEPS': str(request.max_steps),
-            'EPOCHS': str(request.epochs)
+            'EPOCHS': str(request.epochs),
+            'LOG_DIR': os.path.join(request.workspace_dir, 'logs')
         })
-        
+
+        if request.training_method == 'rl':
+            env.setdefault('RL_RESULTS_TOPIC', f"rl.results.{request.module_name}")
+            env.setdefault('RL_BUFFER_DIR', os.path.join(request.workspace_dir, 'logs', 'rl'))
+            env.setdefault('RL_WORKSPACE_DIR', request.workspace_dir)
+
+        if request.training_method == 'rl':
+            env.setdefault('RL_STEPS', str(request.max_steps or 1000))
+            env.setdefault('RL_N_ENVS', str(request.gpu_requirements.get('gpu_count', 1)))
+            env.setdefault('RL_LR', str(request.learning_rate))
+            env.setdefault('RL_ENTROPY', '0.01')
+            env.setdefault('RL_REPLAY_CAPACITY', '4096')
+            env.setdefault('RL_REPLAY_BATCH', '256')
+            env.setdefault('RL_GRAD_CLIP', '1.0')
+            env.setdefault('RL_LOG_INTERVAL', '10')
+            env.setdefault('RL_SKIP_GEPA', '0')
+            env.setdefault('RL_GEPA_MODULES', '')
+            env.setdefault('RL_LOG_JSONL', os.path.join(request.output_dir, f"rl_{int(time.time())}.jsonl"))
+
+        script_name = 'train_agent_basic.sbatch'
+        if request.training_method == 'rl':
+            script_name = 'train_puffer_rl.sbatch'
+
         # Submit job
         try:
             result = subprocess.run(
-                ['sbatch', str(self.slurm_scripts_dir / "train_agent_basic.sbatch")],
+                ['sbatch', str(self.slurm_scripts_dir / script_name)],
                 env=env,
                 capture_output=True,
                 text=True,

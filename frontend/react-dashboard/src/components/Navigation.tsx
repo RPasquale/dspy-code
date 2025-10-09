@@ -16,27 +16,45 @@ interface NavigationItem {
 
 const navigation: NavigationItem[] = [
   {
-    name: 'Agent Pulse',
-    description: 'Live actions, training, and inference telemetry',
+    name: 'Training Progress',
+    description: 'Current learning status and performance metrics',
     href: '/agent',
-    icon: '⚡'
+    icon: '🧠'
   },
   {
-    name: 'Performance',
-    description: 'Rewards, verifiers, and DSPy / RL analytics',
+    name: 'Results & Insights',
+    description: 'Training outcomes, accuracy, and model performance',
     href: '/performance',
     icon: '📈'
   },
   {
-    name: 'Data Streams',
-    description: 'Streams, backpressure, and RedDB records',
+    name: 'Data Sources',
+    description: 'What the agent is learning from and data quality',
     href: '/streams',
-    icon: '🌊'
+    icon: '📊'
   },
   {
-    name: 'System',
-    description: 'Infrastructure, guardrails, and operations',
+    name: 'Health Status',
+    description: 'System health and operational status',
     href: '/system',
+    icon: '💚'
+  },
+  {
+    name: 'Reports',
+    description: 'Detailed analytics and export capabilities',
+    href: '/analytics',
+    icon: '📋'
+  },
+  {
+    name: 'Graph Insights',
+    description: 'Snapshots, diffs, and high-impact nodes',
+    href: '/graph',
+    icon: '🗺️'
+  },
+  {
+    name: 'Workflow Composer',
+    description: 'Design signatures, verifiers, and deployment flows',
+    href: '/workflow',
     icon: '🧩'
   }
 ];

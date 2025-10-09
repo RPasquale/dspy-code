@@ -1,59 +1,45 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { BrowserRouter } from 'react-router-dom'
+import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import MonitoringPage from '@/pages/MonitoringPage'
+import { render } from '../utils/test-utils'
 
-global.fetch = vi.fn()
+const mockFetchImpl = vi.fn()
 
-const createWrapper = () => {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }}})
-  return ({ children }: { children: React.ReactNode }) => (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        {children}
-      </BrowserRouter>
-    </QueryClientProvider>
-  )
-}
+global.fetch = mockFetchImpl as unknown as typeof fetch
 
-describe('Monitoring Persist Example', () => {
+const createResponse = (data: unknown) => ({ ok: true, json: () => Promise.resolve(data) })
+
+describe('MonitoringPage persistence helpers', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    // Default mock for record-result
-    // @ts-ignore
-    global.fetch.mockImplementation((url: string, init?: RequestInit) => {
+    mockFetchImpl.mockImplementation((url: string) => {
       if (url.includes('/api/action/record-result')) {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ success: true }) })
+        return Promise.resolve(createResponse({ success: true }))
       }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+      return Promise.resolve(createResponse({}))
     })
-    // Mock prompts
     vi.spyOn(window, 'prompt').mockImplementation((msg: string) => {
       if (msg.toLowerCase().includes('signature')) return 'CodeContextSig'
-      if (msg.toLowerCase().includes('reward')) return '1.0'
+      if (msg.toLowerCase().includes('reward')) return '0.8'
       if (msg.toLowerCase().includes('environment')) return 'development'
       return ''
     })
     vi.spyOn(window, 'alert').mockImplementation(() => {})
   })
 
-  it('persists kNN example via record-result', async () => {
-    render(<MonitoringPage />, { wrapper: createWrapper() })
-    // Fill doc_id input inside kNN form
+  it('submits a persist example request', async () => {
+    render(<MonitoringPage />)
+
     const docIdInput = await waitFor(() => screen.getByPlaceholderText('doc_id'))
     fireEvent.change(docIdInput, { target: { value: 'abc123' } })
-    const persistBtn = screen.getByText('Persist as example')
-    fireEvent.click(persistBtn)
+    fireEvent.click(screen.getByText('Persist as example'))
+
     await waitFor(() => {
-      expect(fetch).toHaveBeenCalled()
-      const calls = (fetch as any).mock.calls
-      const last = calls[calls.length - 1]
-      expect(String(last[0])).toContain('/api/action/record-result')
-      const body = JSON.parse(String((last[1] && last[1].body) || '{}'))
+      expect(mockFetchImpl).toHaveBeenCalledWith('/api/action/record-result', expect.any(Object))
+      const last = mockFetchImpl.mock.calls.at(-1) as [string, RequestInit]
+      const body = JSON.parse(String(last[1]?.body))
       expect(body.doc_id).toBe('abc123')
       expect(body.signature_name).toBe('CodeContextSig')
     })
   })
 })
-

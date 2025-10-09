@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package mesh.v1;
+
+option go_package = "github.com/dspy/orchestrator/internal/pb;pb";
+
+import "google/protobuf/empty.proto";
+
+message SendRequest {
+  uint64 src_node = 1;
+  uint64 dst_node = 2;
+  bytes payload = 3;
+  bool require_ack = 4;
+  string domain = 5;
+  string trace_id = 6;
+}
+
+message SendResponse {
+  string delivery_id = 1;
+}
+
+message SubscribeRequest {
+  uint64 node_id = 1;
+  string domain = 2;
+}
+
+message Received {
+  string delivery_id = 1;
+  uint64 src_node = 2;
+  uint64 dst_node = 3;
+  bytes payload = 4;
+  string domain = 5;
+  string trace_id = 6;
+}
+
+message AckRequest {
+  string delivery_id = 1;
+  uint64 node_id = 2;
+}
+
+service MeshData {
+  rpc Send(SendRequest) returns (SendResponse);
+  rpc Subscribe(stream SubscribeRequest) returns (stream Received);
+  rpc Ack(AckRequest) returns (google.protobuf.Empty);
+}
+
+message PublishStateRequest {
+  uint64 node_id = 1;
+  string domain = 2;
+  bytes state_blob = 3;
+}
+
+message GetTopologyRequest {
+  string domain = 1;
+}
+
+message Topology {
+  repeated uint64 neighbors = 1;
+}
+
+message SetPolicyRequest {
+  string domain = 1;
+  string policy_blob = 2;
+}
+
+service MeshControl {
+  rpc PublishState(PublishStateRequest) returns (google.protobuf.Empty);
+  rpc GetTopology(GetTopologyRequest) returns (Topology);
+  rpc SetPolicy(SetPolicyRequest) returns (google.protobuf.Empty);
+}

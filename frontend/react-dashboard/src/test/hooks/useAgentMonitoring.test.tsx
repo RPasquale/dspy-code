@@ -1,163 +1,112 @@
-import { renderHook, waitFor } from '@testing-library/react'
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, renderHook } from '@testing-library/react'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { useAgentMonitoring } from '@/hooks/useAgentMonitoring'
-import { mockApiResponses, mockFetch } from '../__mocks__/api'
 
-// Mock fetch globally
-global.fetch = vi.fn()
+type Message = { type: string; data: any; timestamp?: number }
 
-// Create a wrapper for React Query
-const createWrapper = () => {
-  const queryClient = new QueryClient({
-    defaultOptions: {
-      queries: {
-        retry: false,
-      },
-    },
-  })
-  return ({ children }: { children: React.ReactNode }) => (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-  )
+const mockState = {
+  isConnected: true,
+  error: null as string | null,
+  lastMessage: null as Message | null,
+  sendMessage: vi.fn()
 }
+
+vi.mock('@/hooks/useWebSocket', () => ({
+  useWebSocket: () => ({
+    isConnected: mockState.isConnected,
+    error: mockState.error,
+    lastMessage: mockState.lastMessage,
+    sendMessage: mockState.sendMessage,
+    readyState: 1,
+    reconnectAttempts: 0,
+    isConnecting: false,
+    url: 'ws://localhost',
+    connect: vi.fn(),
+    disconnect: vi.fn(),
+    reconnect: vi.fn(),
+    send: mockState.sendMessage,
+    sendRaw: mockState.sendMessage
+  })
+}))
 
 describe('useAgentMonitoring', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
-    // @ts-ignore
-    global.fetch.mockImplementation(mockFetch)
+    mockState.lastMessage = null
+    mockState.error = null
+    mockState.sendMessage.mockReset()
   })
 
-  afterEach(() => {
-    vi.restoreAllMocks()
+  it('returns default monitoring data', () => {
+    const { result } = renderHook(() => useAgentMonitoring())
+
+    expect(result.current.data.learningMetrics.training_sessions).toBe(0)
+    expect(result.current.isConnected).toBe(true)
+    expect(result.current.error).toBeNull()
   })
 
-  it('fetches agent status successfully', async () => {
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
+  it('updates learning metrics when websocket message arrives', () => {
+    const { result, rerender } = renderHook(() => useAgentMonitoring())
 
-    await waitFor(() => {
-      expect(result.current.status.isSuccess).toBe(true)
+    const learningMessage: Message = {
+      type: 'learning_update',
+      data: {
+        training_sessions: 4,
+        learning_trends: {
+          training_accuracy: { current: 0.9, trend: 'improving' },
+          validation_accuracy: { current: 0.8, trend: 'stable' },
+          loss: { current: 0.12, trend: 'declining' }
+        },
+        signature_performance: {},
+        retrieval_statistics: {},
+        active_signatures: 2
+      },
+      timestamp: Date.now()
+    }
+
+    act(() => {
+      mockState.lastMessage = learningMessage
+      rerender()
     })
 
-    expect(result.current.status.data).toEqual(mockApiResponses.status)
+    expect(result.current.data.learningMetrics.training_sessions).toBe(4)
+    expect(result.current.data.learningMetrics.learning_trends.training_accuracy.current).toBe(0.9)
   })
 
-  it('fetches metrics successfully', async () => {
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
+  it('updates action statistics from actions_update message', () => {
+    const { result, rerender } = renderHook(() => useAgentMonitoring())
 
-    await waitFor(() => {
-      expect(result.current.metrics.isSuccess).toBe(true)
-    })
-
-    expect(result.current.metrics.data).toEqual(mockApiResponses.metrics)
-  })
-
-  it('fetches RL metrics successfully', async () => {
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
-
-    await waitFor(() => {
-      expect(result.current.rlMetrics.isSuccess).toBe(true)
-    })
-
-    expect(result.current.rlMetrics.data).toEqual(mockApiResponses.rlMetrics)
-  })
-
-  it('fetches bus metrics successfully', async () => {
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
-
-    await waitFor(() => {
-      expect(result.current.busMetrics.isSuccess).toBe(true)
-    })
-
-    expect(result.current.busMetrics.data).toEqual(mockApiResponses.busMetrics)
-  })
-
-  it('handles API errors gracefully', async () => {
-    // @ts-ignore
-    global.fetch.mockImplementation(() => 
-      Promise.resolve({
-        ok: false,
-        status: 500,
-        json: () => Promise.resolve({ error: 'Internal Server Error' })
-      })
-    )
-
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
-
-    await waitFor(() => {
-      expect(result.current.status.isError).toBe(true)
-    })
-
-    expect(result.current.status.error).toBeDefined()
-  })
-
-  it('provides loading states', () => {
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
-
-    expect(result.current.status.isLoading).toBe(true)
-    expect(result.current.metrics.isLoading).toBe(true)
-    expect(result.current.rlMetrics.isLoading).toBe(true)
-    expect(result.current.busMetrics.isLoading).toBe(true)
-  })
-
-  it('refetches data on interval', async () => {
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
-
-    await waitFor(() => {
-      expect(result.current.status.isSuccess).toBe(true)
-    })
-
-    // Verify fetch was called
-    expect(global.fetch).toHaveBeenCalledWith('/api/status')
-    expect(global.fetch).toHaveBeenCalledWith('/api/metrics')
-    expect(global.fetch).toHaveBeenCalledWith('/api/rl-metrics')
-    expect(global.fetch).toHaveBeenCalledWith('/api/bus-metrics')
-  })
-
-  it('handles network errors', async () => {
-    // @ts-ignore
-    global.fetch.mockImplementation(() => 
-      Promise.reject(new Error('Network error'))
-    )
-
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
-
-    await waitFor(() => {
-      expect(result.current.status.isError).toBe(true)
-    })
-
-    expect(result.current.status.error).toBeDefined()
-  })
-
-  it('provides error states for failed requests', async () => {
-    // @ts-ignore
-    global.fetch.mockImplementation((url) => {
-      if (url.includes('status')) {
-        return Promise.resolve({
-          ok: false,
-          status: 404,
-          json: () => Promise.resolve({ error: 'Not found' })
-        })
+    act(() => {
+      mockState.lastMessage = {
+        type: 'actions_update',
+        timestamp: 123,
+        data: {
+          actions: [{ action_id: '1', timestamp: 1, action_type: 'plan', reward: 0.5, confidence: 0.8, execution_time: 2, result_summary: 'ok', environment: 'dev' }],
+          statistics: {
+            total_actions: 1,
+            avg_reward: 0.5,
+            avg_confidence: 0.8,
+            avg_execution_time: 2,
+            high_reward_actions: 1,
+            action_types: { plan: 1 }
+          }
+        }
       }
-      return mockFetch(url)
+      rerender()
     })
 
-    const wrapper = createWrapper()
-    const { result } = renderHook(() => useAgentMonitoring(), { wrapper })
+    expect(result.current.data.actions.length).toBe(1)
+    expect(result.current.data.actionStatistics.total_actions).toBe(1)
+  })
 
-    await waitFor(() => {
-      expect(result.current.status.isError).toBe(true)
+  it('sends subscription requests via helper', () => {
+    const { result } = renderHook(() => useAgentMonitoring())
+
+    act(() => {
+      result.current.subscribe(['learning_update'])
+      result.current.requestData('status')
     })
 
-    expect(result.current.status.error).toBeDefined()
-    expect(result.current.metrics.isSuccess).toBe(true) // Other requests should still work
+    expect(mockState.sendMessage).toHaveBeenCalledWith({ type: 'subscribe', subscriptions: ['learning_update'] })
+    expect(mockState.sendMessage).toHaveBeenCalledWith({ type: 'get_data', data_type: 'status' })
   })
 })

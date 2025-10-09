@@ -5,20 +5,33 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-try:
+try:  # FastAPI is optional at runtime
     from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel, Field
 except Exception:  # pragma: no cover - optional install
     FastAPI = None  # type: ignore
-    BaseModel = object  # type: ignore
     HTTPException = Exception  # type: ignore
+
+try:
+    from pydantic import BaseModel, Field
+    from pydantic.config import ConfigDict
+except Exception:  # pragma: no cover - fallback when pydantic missing
+    BaseModel = object  # type: ignore
+
+    def Field(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[misc]
+        raise RuntimeError("pydantic is required to use fastapi_backend endpoints")
+
+    class ConfigDict(dict):  # type: ignore[override]
+        pass
 
 from ..db.redb_router import RedDBRouter, IngestRequest as _Ingest, QueryRequest as _Query
 from ..dbkit import RedDBStorage
+from ..skills.graph_memory import GraphMemoryExplorer
 from .live_data import WorkspaceAnalyzer
 
 
 class IngestRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     kind: str = Field(default="auto")
     id: Optional[str] = None
     namespace: str = Field(default="default")
@@ -30,7 +43,23 @@ class IngestRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     node: Optional[Dict[str, Any]] = None
     edge: Optional[Dict[str, Any]] = None
-    schema: Optional[Dict[str, Any]] = None
+    schema_payload: Optional[Dict[str, Any]] = Field(default=None, alias="schema", serialization_alias="schema")
+
+    @property
+    def schema(self) -> Optional[Dict[str, Any]]:  # type: ignore[override]
+        return self.schema_payload
+
+    @schema.setter
+    def schema(self, value: Optional[Dict[str, Any]]) -> None:  # type: ignore[override]
+        self.schema_payload = value
+
+    def dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
+        kwargs.setdefault("by_alias", True)
+        return super().dict(*args, **kwargs)
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
+        kwargs.setdefault("by_alias", True)
+        return super().model_dump(*args, **kwargs)
 
 
 class QueryRequest(BaseModel):
@@ -123,6 +152,7 @@ def build_app() -> Any:
         "stream_metrics": True,
         "sandbox_mode": False,
     }
+    graph_namespace = os.getenv("REDDB_NAMESPACE", router.st.ns)
 
     # ----------------------
     # RedDB proxy endpoints
@@ -194,6 +224,21 @@ def build_app() -> Any:
     @app.get("/api/system/resources")
     def get_system_resources() -> Dict[str, Any]:
         return analyzer.system_resources()
+
+    @app.get("/api/graph/memory-report")
+    def graph_memory_report(query: str = "graph memory review", limit: int = 8) -> Dict[str, Any]:
+        workspace = str(getattr(analyzer, 'workspace', os.getenv("WORKSPACE_DIR") or os.getcwd()))
+        top_k = max(1, min(int(limit), 32))
+        try:
+            explorer = GraphMemoryExplorer(namespace=graph_namespace, workspace=workspace, top_k=top_k)
+            report = explorer.build_report(query)
+            payload = report.to_dict()
+            payload['top_k'] = top_k
+            return payload
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"graph memory report failed: {exc}")
 
     @app.get("/api/containers")
     def get_containers() -> Dict[str, Any]:

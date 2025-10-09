@@ -42,6 +42,7 @@ type SlurmBridge struct {
 	queueDir    string
 	pendDir     string
 	doneDir     string
+	scancelPath string
 	ctx         context.Context
 }
 
@@ -82,6 +83,7 @@ func NewSlurmBridge(registry *telemetry.Registry, queueDir string, eventBus *eve
 		queueDir:    queueDir,
 		pendDir:     pendDir,
 		doneDir:     doneDir,
+		scancelPath: "scancel",
 	}
 }
 
@@ -174,10 +176,50 @@ func (sb *SlurmBridge) GetJobStatus(taskID string) (*SlurmJob, bool) {
 	return job, exists
 }
 
+func (sb *SlurmBridge) CancelJob(taskID string) error {
+	sb.mu.Lock()
+	job, exists := sb.jobStore[taskID]
+	sb.mu.Unlock()
+	if !exists {
+		return fmt.Errorf("slurm job for task %s not found", taskID)
+	}
+	if job == nil || job.ID == "" {
+		return fmt.Errorf("slurm job for task %s missing identifier", taskID)
+	}
+	cmd := exec.Command(sb.scancelPath, job.ID)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("scancel %s: %v (%s)", job.ID, err, string(output))
+	}
+	now := time.Now()
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if existing := sb.jobStore[taskID]; existing != nil {
+		existing.Status = "cancelled"
+		existing.EndTime = &now
+		zero := 0
+		existing.ExitCode = &zero
+	}
+	return nil
+}
+
 // generateSbatchScript creates an sbatch script from template
 func (sb *SlurmBridge) generateSbatchScript(taskID string, payload map[string]interface{}) (string, error) {
+	method := strings.ToLower(getString(payload, "method", ""))
+	templateName := getString(payload, "template", "")
+	if templateName == "" {
+		switch method {
+		case "puffer_rl", "rl":
+			templateName = "train_puffer_rl.sbatch"
+		case "ddp":
+			templateName = "train_ddp.sbatch"
+		default:
+			templateName = "train_agent_methodologies.sbatch"
+		}
+	}
+
 	// Read template
-	templatePath := filepath.Join(sb.submitter.templateDir, "train_agent_methodologies.sbatch")
+	templatePath := filepath.Join(sb.submitter.templateDir, templateName)
 	template, err := os.ReadFile(templatePath)
 	if err != nil {
 		return "", err
@@ -189,6 +231,38 @@ func (sb *SlurmBridge) generateSbatchScript(taskID string, payload map[string]in
 	script = strings.ReplaceAll(script, "${TRAINING_METHOD}", getString(payload, "method", "grpo"))
 	script = strings.ReplaceAll(script, "${MODULE_NAME}", getString(payload, "module", "orchestrator"))
 	script = strings.ReplaceAll(script, "${MODEL_NAME}", getString(payload, "model", "gpt2"))
+	script = strings.ReplaceAll(script, "${RL_SKILL_OVERRIDE}", getString(payload, "skill", ""))
+
+	// Common resource overrides
+	script = strings.ReplaceAll(script, "${NODES:-1}", strconv.Itoa(getInt(payload, "nodes", 1)))
+	script = strings.ReplaceAll(script, "${GPUS:-1}", strconv.Itoa(getInt(payload, "gpus", 1)))
+	script = strings.ReplaceAll(script, "${CPUS_PER_TASK:-8}", strconv.Itoa(getInt(payload, "cpus_per_task", 8)))
+	script = strings.ReplaceAll(script, "${MEMORY_GB:-48}", strconv.Itoa(getInt(payload, "memory_gb", 48)))
+	script = strings.ReplaceAll(script, "${TIME_LIMIT:-04:00:00}", getString(payload, "time_limit", "04:00:00"))
+	script = strings.ReplaceAll(script, "${LOG_DIR:-/workspace/logs}", getString(payload, "log_dir", "/workspace/logs"))
+
+	if templateName == "train_puffer_rl.sbatch" {
+		workspace := getString(payload, "workspace_dir", getString(payload, "workspace", "."))
+		script = strings.ReplaceAll(script, "${WORKSPACE_DIR:-$SLURM_SUBMIT_DIR}", workspace)
+		script = strings.ReplaceAll(script, "${RL_STEPS:-1000}", strconv.Itoa(getInt(payload, "steps", 1000)))
+		script = strings.ReplaceAll(script, "${RL_N_ENVS:-4}", strconv.Itoa(getInt(payload, "n_envs", 4)))
+		script = strings.ReplaceAll(script, "${RL_LR:-0.001}", getString(payload, "lr", "0.001"))
+		script = strings.ReplaceAll(script, "${RL_ENTROPY:-0.01}", getString(payload, "entropy", "0.01"))
+		script = strings.ReplaceAll(script, "${RL_REPLAY_CAPACITY:-4096}", strconv.Itoa(getInt(payload, "replay_capacity", 4096)))
+		script = strings.ReplaceAll(script, "${RL_REPLAY_BATCH:-256}", strconv.Itoa(getInt(payload, "replay_batch", 256)))
+		script = strings.ReplaceAll(script, "${RL_GRAD_CLIP:-1.0}", getString(payload, "grad_clip", "1.0"))
+		script = strings.ReplaceAll(script, "${RL_CHECKPOINT_DIR:-$WORKSPACE/logs/rl_checkpoints}", getString(payload, "checkpoint_dir", filepath.Join(workspace, "logs", "rl_checkpoints")))
+		script = strings.ReplaceAll(script, "${RL_CHECKPOINT_INTERVAL:-0}", strconv.Itoa(getInt(payload, "checkpoint_interval", 0)))
+		script = strings.ReplaceAll(script, "${RL_EARLY_STOP:-0}", strconv.Itoa(getInt(payload, "early_stop", 0)))
+		script = strings.ReplaceAll(script, "${RL_LOG_INTERVAL:-10}", strconv.Itoa(getInt(payload, "log_interval", 10)))
+		script = strings.ReplaceAll(script, "${RL_SKIP_GEPA:-0}", strconv.Itoa(getInt(payload, "skip_gepa", 0)))
+		script = strings.ReplaceAll(script, "${RL_GEPA_MODULES:-}", getString(payload, "gepa_modules", ""))
+		script = strings.ReplaceAll(script, "${RL_LOG_JSONL:-$WORKSPACE/logs/rl_task.jsonl}", getString(payload, "log_jsonl", filepath.Join(workspace, "logs", fmt.Sprintf("rl_%s.jsonl", taskID))))
+		script = strings.ReplaceAll(script, "${MESH_ENDPOINT:-}", getString(payload, "mesh_endpoint", ""))
+		script = strings.ReplaceAll(script, "${MESH_NODE_ID:-9002}", strconv.Itoa(getInt(payload, "mesh_node_id", 9002)))
+		script = strings.ReplaceAll(script, "${MESH_DOMAIN:-default}", getString(payload, "mesh_domain", "default"))
+		script = strings.ReplaceAll(script, "${SUPERVISOR_GRPC_ADDR:-http://127.0.0.1:7000}", getString(payload, "supervisor_addr", "http://127.0.0.1:7000"))
+	}
 
 	// Write to temp file
 	tmpDir := sb.submitter.workingDir
@@ -500,6 +574,32 @@ func getString(m map[string]interface{}, key, defaultValue string) string {
 	if val, exists := m[key]; exists {
 		if str, ok := val.(string); ok {
 			return str
+		}
+	}
+	return defaultValue
+}
+
+func getInt(m map[string]interface{}, key string, defaultValue int) int {
+	if val, exists := m[key]; exists {
+		switch v := val.(type) {
+		case int:
+			return v
+		case int32:
+			return int(v)
+		case int64:
+			return int(v)
+		case float64:
+			return int(v)
+		case float32:
+			return int(v)
+		case json.Number:
+			if iv, err := v.Int64(); err == nil {
+				return int(iv)
+			}
+		case string:
+			if iv, err := strconv.Atoi(v); err == nil {
+				return iv
+			}
 		}
 	}
 	return defaultValue

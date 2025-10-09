@@ -18,6 +18,9 @@ env.bak/
 venv.bak/
 tmp/gocache/*
 pytest-of-agent/pytest-*
+.cargo_cache/
+orchestrator/.gocache/
+orchestrator/.gomodcache/
 # Build / packaging
 build/
 dist/
@@ -159,6 +162,7 @@ validation_results.json
 real_training_results.json
 rl_test_results.json
 sample_data.json
+!tests/test_live_data_logs_dir.py
 
 # Cache and temporary directories
 diskcache/
@@ -167,6 +171,7 @@ tmp_*/
 pytest-of-*/
 test-results/
 test_lightweight/
+.uv_cache/
 
 # Logs and monitoring
 training.log

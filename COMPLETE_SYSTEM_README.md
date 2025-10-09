@@ -170,6 +170,11 @@ curl -X POST http://localhost:9097/queue/submit \
 # Check Slurm job status
 curl http://localhost:9097/slurm/status/slurm_001
 
+# Kick off an RL training cycle focused on Go builds
+curl -X POST http://localhost:9098/training/rl/start \
+  -H 'Content-Type: application/json' \
+  -d '{"skill":"go_build","steps":1200,"n_envs":4}'
+
 # Check queue status
 curl http://localhost:9097/queue/status
 ```
@@ -383,7 +388,7 @@ cargo build --release
 sbatch --version
 
 # Test job submission
-sbatch deploy/slurm/train_agent_methodologies.sbatch
+sbatch deploy/slurm/train_puffer_rl.sbatch
 ```
 
 ### **Debug Mode**

@@ -14,13 +14,13 @@ services:
         - REDDB_URL=http://reddb:8080
         - REDDB_NAMESPACE=dspy
         - REDDB_TOKEN=${REDDB_ADMIN_TOKEN}
-        - MODEL_NAME=${MODEL_NAME:-deepseek-coder:1.3b}
+        - MODEL_NAME=${MODEL_NAME:-qwen3:1.7b}
         - OPENAI_API_KEY=
         - OPENAI_BASE_URL=http://ollama:11434
-        - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-coder:1.3b}
+        - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:1.7b}
         - OLLAMA_API_KEY=
-        - OLLAMA_MODELS=${OLLAMA_MODELS:-deepseek-coder:1.3b,qwen3:1.7b}
-        - OLLAMA_MAX_TOKENS=${OLLAMA_MAX_TOKENS:-1024}
+        - OLLAMA_MODELS=${OLLAMA_MODELS:-qwen3:1.7b,deepseek-coder:1.3b}
+        - OLLAMA_MAX_TOKENS=${OLLAMA_MAX_TOKENS:-0}
         - OLLAMA_KEEP_ALIVE
         - OLLAMA_ALLOW_MISSING_MODEL
         - OLLAMA_TAG_TIMEOUT
@@ -44,6 +44,10 @@ services:
         - DSPY_INTELLIGENT_CACHING=true
         - DSPY_ADAPTIVE_LEARNING=true
         - PYTHONPATH=/workspace
+        - MESH_ENDPOINT=${MESH_WORKER_ENDPOINT:-http://mesh-worker:50052}
+        - MESH_NODE_ID=${MESH_NODE_ID:-9002}
+        - MESH_DOMAIN=${MESH_GATEWAY_DOMAIN:-edge}
+        - MESH_SERVICES_FILE=${MESH_SERVICES_FILE:-/etc/dspy/mesh-services.json}
         # Docker environment flag to override dspy.IS_STUB
         - DOCKER_ENV=true
         # Disable background auto-training loops for interactive sessions
@@ -54,6 +58,7 @@ services:
         - ${WORKSPACE_DIR}/logs:/workspace/logs:rw
         - ./entrypoints:/entrypoints:ro
         - dspy-cache:/home/agent/.dspy_cache:rw
+        - ./mesh-services.json:/etc/dspy/mesh-services.json:ro
       ports:
         - "127.0.0.1:8765:8765"
       restart: unless-stopped
@@ -82,6 +87,10 @@ services:
           condition: service_healthy
         reddb:
           condition: service_healthy
+        mesh-hub:
+          condition: service_healthy
+        mesh-worker:
+          condition: service_healthy
 
     ollama:
       image: ollama/ollama:latest
@@ -95,7 +104,7 @@ services:
         - OLLAMA_MAX_LOADED_MODELS=1
         - OLLAMA_NUM_PARALLEL=1
         - OLLAMA_MAX_QUEUE=512
-        - OLLAMA_MODELS=${OLLAMA_MODELS:-deepseek-coder:1.3b,qwen3:1.7b}
+        - OLLAMA_MODELS=${OLLAMA_MODELS:-qwen3:1.7b,deepseek-coder:1.3b}
         - OLLAMA_STARTUP_DELAY
       deploy:
         resources:
@@ -118,7 +127,7 @@ services:
         start_period: 10s
 
     zookeeper:
-      image: bitnami/zookeeper:3.9
+      image: zookeeper:3.9
       environment:
         - ALLOW_ANONYMOUS_LOGIN=yes
       ports:
@@ -139,16 +148,15 @@ services:
             cpus: '0.5'
 
     kafka:
-      image: bitnami/kafka:3.6
+      image: wurstmeister/kafka:2.13-2.8.1
       depends_on:
         zookeeper:
           condition: service_healthy
       environment:
-        - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
-        - ALLOW_PLAINTEXT_LISTENER=yes
-        - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-        - KAFKA_CFG_LISTENERS=PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
-        - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+        - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+        - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+        - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+        - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
         - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
         - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
         - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
@@ -160,7 +168,7 @@ services:
       ports:
         - "127.0.0.1:9092:29092"
       healthcheck:
-        test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+        test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
         interval: 15s
         timeout: 10s
         retries: 20
@@ -173,6 +181,155 @@ services:
           reservations:
             memory: 1G
             cpus: '1.0'
+
+    mesh-hub:
+      build:
+        context: ../..
+        dockerfile: docker/lightweight/mesh-core/Dockerfile
+      environment:
+        - MESH_NODE_ID=${MESH_HUB_NODE_ID:-9001}
+        - MESH_DOMAIN=${MESH_DOMAIN:-1}
+        - MESH_DOMAIN_ID=${MESH_DOMAIN_ID:-1}
+        - MESH_LISTEN_ADDR=0.0.0.0:7000
+        - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50051
+        - MESH_METRICS_ADDR=0.0.0.0:9100
+        - MESH_PEERS=
+        - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS:-}
+      ports:
+        - "127.0.0.1:50051:50051"
+        - "127.0.0.1:9100:9100"
+      healthcheck:
+        test: ["CMD-SHELL", "nc -z localhost 50051"]
+        interval: 10s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+      deploy:
+        resources:
+          limits:
+            memory: 1G
+            cpus: '1.0'
+          reservations:
+            memory: 256M
+            cpus: '0.25'
+
+    mesh-worker:
+      build:
+        context: ../..
+        dockerfile: docker/lightweight/mesh-core/Dockerfile
+      environment:
+        - MESH_NODE_ID=${MESH_NODE_ID:-9002}
+        - MESH_DOMAIN=${MESH_DOMAIN:-1}
+        - MESH_DOMAIN_ID=${MESH_DOMAIN_ID:-1}
+        - MESH_LISTEN_ADDR=0.0.0.0:7001
+        - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50052
+        - MESH_METRICS_ADDR=0.0.0.0:9101
+        - MESH_PEERS=mesh-hub:7000
+        - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS:-}
+      ports:
+        - "127.0.0.1:50052:50052"
+        - "127.0.0.1:9101:9101"
+      depends_on:
+        mesh-hub:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD-SHELL", "nc -z localhost 50052"]
+        interval: 10s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+      deploy:
+        resources:
+          limits:
+            memory: 1G
+            cpus: '1.0'
+          reservations:
+            memory: 256M
+            cpus: '0.25'
+
+    mesh-trainer:
+      build:
+        context: ../..
+        dockerfile: docker/lightweight/mesh-core/Dockerfile
+      environment:
+        - MESH_NODE_ID=${MESH_TRAINER_NODE_ID:-9003}
+        - MESH_DOMAIN=${MESH_DOMAIN:-1}
+        - MESH_DOMAIN_ID=${MESH_DOMAIN_ID:-1}
+        - MESH_LISTEN_ADDR=0.0.0.0:7002
+        - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50053
+        - MESH_METRICS_ADDR=0.0.0.0:9102
+        - MESH_PEERS=mesh-hub:7000
+        - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS:-}
+      ports:
+        - "127.0.0.1:50053:50053"
+        - "127.0.0.1:9102:9102"
+      depends_on:
+        mesh-hub:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD-SHELL", "nc -z localhost 50053"]
+        interval: 10s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+      deploy:
+        resources:
+          limits:
+            memory: 1G
+            cpus: '1.0'
+          reservations:
+            memory: 256M
+            cpus: '0.25'
+
+    mesh-gateway:
+      build:
+        context: ../..
+        dockerfile: docker/lightweight/mesh-core/Dockerfile
+      environment:
+        - MESH_NODE_ID=${MESH_GATEWAY_NODE_ID:-9010}
+        - MESH_DOMAIN=${MESH_DOMAIN:-1}
+        - MESH_DOMAIN_ID=${MESH_DOMAIN_ID:-1}
+        - MESH_LISTEN_ADDR=0.0.0.0:7003
+        - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50060
+        - MESH_METRICS_ADDR=0.0.0.0:9103
+        - MESH_PEERS=mesh-hub:7000
+        - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS:-}
+      depends_on:
+        mesh-hub:
+          condition: service_healthy
+      ports:
+        - "127.0.0.1:50060:50060"
+        - "127.0.0.1:9103:9103"
+      healthcheck:
+        test: ["CMD-SHELL", "nc -z localhost 50060"]
+        interval: 10s
+        timeout: 5s
+        retries: 10
+        start_period: 10s
+      deploy:
+        resources:
+          limits:
+            memory: 1G
+            cpus: '1.0'
+          reservations:
+            memory: 256M
+            cpus: '0.25'
+
+    prometheus:
+      image: prom/prometheus:latest
+      volumes:
+        - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      ports:
+        - "127.0.0.1:9090:9090"
+      depends_on:
+        mesh-hub:
+          condition: service_healthy
+        mesh-worker:
+          condition: service_healthy
+        mesh-trainer:
+          condition: service_healthy
+        mesh-gateway:
+          condition: service_healthy
 
     redis:
       image: redis:7-alpine
@@ -235,7 +392,7 @@ services:
 
     fastapi-backend:
       image: dspy-lightweight:latest
-      user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"
+      # user: "${DSPY_UID:-10001}:${DSPY_GID:-10001}"  # Temporarily disabled for permission fix
       working_dir: /app
       entrypoint: ["/bin/sh", "-lc", "python -m dspy_agent.server.fastapi_backend"]
       environment:
@@ -243,9 +400,12 @@ services:
         - REDDB_NAMESPACE=dspy
         - REDDB_TOKEN=${REDDB_ADMIN_TOKEN}
         - DSPY_WORKSPACE=/workspace
+        - DSPY_LOGS=/workspace/logs
+        - LOGS_DIR=/workspace/logs
       volumes:
         - ${WORKSPACE_DIR}:/workspace:rw
         - ./entrypoints:/entrypoints:ro
+        - ./logs:/app/logs:rw
       ports:
         - "127.0.0.1:8767:8767"
       depends_on:
@@ -409,7 +569,7 @@ services:
         - hf-cache:/root/.cache/huggingface
       entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_embed_worker.sh"]
       ports:
-        - "127.0.0.1:9101:9100"
+        - "127.0.0.1:19101:9100"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
@@ -426,7 +586,7 @@ services:
         start_period: 15s
 
     spark:
-      image: bitnami/spark:3.5
+      image: apache/spark:3.5.0
       depends_on:
         kafka:
           condition: service_healthy
@@ -855,6 +1015,43 @@ services:
             memory: 512M
             cpus: '0.5'
 
+    # Stream Supervisor Service
+    stream-supervisor:
+      image: dspy-lightweight:latest
+      build:
+        context: ../..
+        dockerfile: docker/lightweight/Dockerfile
+      environment:
+        - SUPERVISOR_LISTEN=:7000
+        - KAFKA_BROKERS=kafka:9092
+        - INPUT_TOPIC=raw.events.demo
+        - SUPERVISOR_GROUP=stream-supervisor
+        - SUPERVISOR_METRICS_LISTEN=:9098
+      entrypoint: ["/usr/local/bin/stream_supervisor"]
+      ports:
+        - "127.0.0.1:7000:7000"
+        - "127.0.0.1:9098:9098"
+      volumes:
+        - ./logs:/app/logs
+      depends_on:
+        - kafka
+        - redis
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "curl -f http://localhost:9098/metrics || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 10s
+      deploy:
+        resources:
+          limits:
+            memory: 2G
+            cpus: '2.0'
+          reservations:
+            memory: 512M
+            cpus: '0.5'
+
     # Rust Environment Runner Service
     rust-env-runner:
       image: dspy-lightweight:latest
@@ -871,15 +1068,24 @@ services:
         - REDIS_URL=redis://redis:6379
         - ENV_QUEUE_DIR=/app/logs/env_queue
         - METRICS_PORT=8083
+        # - MESH_ENDPOINT=${MESH_WORKER_ENDPOINT:-http://mesh-worker:50052}
+        # - MESH_NODE_ID=${MESH_NODE_ID:-9002}
+        # - MESH_DOMAIN=${MESH_DOMAIN:-1}
+        # - MESH_DOMAIN_ID=${MESH_DOMAIN_ID:-1}
+        # - MESH_SERVICES_FILE=${MESH_SERVICES_FILE:-/etc/dspy/mesh-services.json}
+        - KAFKA_BROKERS=kafka:9092
+        - SUPERVISOR_GRPC_ADDR=http://stream-supervisor:7000
       entrypoint: ["/usr/local/bin/env_runner"]
       ports:
         - "127.0.0.1:8081:8083"
       volumes:
         - ./logs:/app/logs
+        - ./mesh-services.json:/etc/dspy/mesh-services.json:ro
       depends_on:
         - redis
         - infermesh-router
         - go-orchestrator
+        - stream-supervisor
       restart: unless-stopped
       healthcheck:
         test: ["CMD-SHELL", "curl -f http://localhost:8083/health || exit 1"]

@@ -8,15 +8,32 @@ name = "env_runner"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+async-stream = "0.3"
+bytes = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+prost = "0.12"
+prost-types = "0.12"
+rdkafka = { version = "0.36", features = ["tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.11", features = ["json"] }
-anyhow = "1.0"
 notify = "6.0"
-warp = "0.3"
+reqwest = { version = "0.11", default-features = false, features = ["json"] }
+base64 = "0.22"
 tempfile = "3.0"
-chrono = { version = "0.4", features = ["serde"] }
+warp = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tonic = { version = "0.11", features = ["transport"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sysinfo = { version = "0.30", features = ["multithread"] }
+which = "4"
 
-[dev-dependencies]
-tokio-test = "0.4"
+[build-dependencies]
+prost-build = "0.12"
+tonic-build = "0.11"
+protoc-bin-vendored = "3"

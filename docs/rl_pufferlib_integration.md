@@ -19,13 +19,35 @@ This page captures the agreed design for wiring a bandit/RL loop around the codi
 - RL toolkit is consolidated under `dspy_agent/rl` (re-exported from `dspy_agent/rlkit.py`).
 
 CLI commands:
-- `dspy-agent rl train`: Train with real toolchain executor (tests/lint/build). Supports bandit or `--neural` trainer. Add `--puffer` to enable PufferLib vectorization.
+- `dspy-agent rl train`: Hybrid GEPA + PufferLib training with the live toolchain executor (tests/lint/build). Tunable via `--steps`, `--n-envs`, `--lr`, `--entropy`, etc.
 - `dspy-agent rl eval`: Evaluate with the same wiring (stub; extend for checkpoints).
 - `dspy-agent rl tune`: Simple epsilon sweep for epsilon-greedy.
 - `dspy-agent rl sweep`: Run a PufferLib-backed hyperparameter search and persist the best config per repo.
-- `dspy-agent rl ppo`: Run a PuffeRL PPO example shell on the same env.
 - `dspy-agent rl guide`: Print research-backed hyperparameter ranges (temperature, entropy, clip settings, curriculum stages).
-- `dspy-agent rl async-train`: Launch the asynchronous rollout→judge→learner pipeline that streams knowledge-graph features into the policy.
+
+Legacy flags such as `--puffer`, `--neural`, and separate `rl ppo`/`rl async-train`
+entry points have been deprecated; the unified `rl train` command now runs the
+PufferLib-based trainer by default.
+
+### Supervisor Integration
+
+- Set `RL_RESULTS_TOPIC` so the Rust env runner mirrors transitions onto a
+  dedicated Kafka topic that the supervisor buffer consumes (`RL_BUFFER_DIR` by
+  default).
+- Start a training epoch via `POST /training/rl/start` on the supervisor; check
+  progress at `/training/rl/status/<task>` or watch the new
+  `supervisor_training_*` Prometheus gauges.
+- Mesh workers mark training traffic with the `skill` header; the supervisor’s
+  skill planner will auto-trigger focused RL jobs when failure rates breach the
+  configured threshold.
+
+### Running on Slurm
+
+- Submit the GPU job with the new template: `sbatch deploy/slurm/train_puffer_rl.sbatch`
+- Override knobs via environment variables (e.g. `RL_STEPS`, `RL_N_ENVS`, `RL_LR`,
+  `RL_ENTROPY`, `RL_SKIP_GEPA`, `RL_GEPA_MODULES="context code"`).
+- When `MESH_ENDPOINT` is provided the Slurm script will launch the Rust
+  `env_runner` alongside the trainer so generations flow through the mesh stack.
 
 ## Toolchain Environment
 
@@ -67,6 +89,29 @@ Reward aggregation is a weighted sum with penalty support:
 
 See `dspy_agent/rl` for `RewardConfig` and `aggregate_reward`.
 
+### Graph memory verifier weights
+
+Graph/RAG signals ship as first-class verifiers (`graph_signal`, `graph_prefetch`,
+`graph_mcts_alignment`, `memory_precision`, `memory_coverage`). Their defaults are
+registered inside `dspy_agent.cli._rl_build_make_env`, so existing RL/stream runs
+automatically score the new feedback. Adjust them inline or via the workspace
+settings file, for example:
+
+```
+dspy-agent rl train --workspace . \
+  --weights graph_signal=1.2 graph_mcts_alignment=1.3 memory_precision=0.6
+```
+
+Or persist into `.dspy/stream_settings.json` with the helper:
+
+```
+dspy-agent settings set reward_weights.graph_mcts_alignment 1.1
+```
+
+Higher weights emphasise alignment with graph memory and retrieval precision,
+allowing dashboards and RL loops to prioritise memory health alongside code
+quality.
+
 Loading your verifiers:
 - Provide a Python module via `--verifiers-module` or env var and expose:
   - `get_verifiers() -> Iterable[VerifierProtocol]`, or
@@ -96,14 +141,11 @@ pip install .[rl]  # On ARM, install pufferlib separately once raylib is availab
 # Initialize a config file (no env vars needed)
 dspy-agent rl config init --out .dspy_rl.json --verifiers-module verifiers --puffer
 
-# Bandit with PufferLib vectorization
-RL_VERIFIERS_MODULE=verifiers dspy-agent rl train --steps 300 --policy ucb1 --n-envs 8 --puffer
+# Hybrid GEPA + PufferLib training across 8 envs
+RL_VERIFIERS_MODULE=verifiers dspy-agent rl train --steps 1000 --n-envs 8 --lr 5e-4 --entropy 0.02
 
-# Neural REINFORCE with PufferLib vectorization
-RL_VERIFIERS_MODULE=verifiers dspy-agent rl train --steps 1000 --neural --n-envs 8 --puffer
-
-# PuffeRL PPO example shell
-RL_VERIFIERS_MODULE=verifiers dspy-agent rl ppo --n-envs 8 --total-steps 200000
+# Lightweight single-env experiment (skips GEPA warmup)
+dspy-agent rl train --workspace . --steps 200 --n-envs 1 --skip-gepa
 ```
 
 ### Hyperparameter Sweep Quickstart
@@ -122,18 +164,6 @@ optimised settings. When `method` is set to `protein` or `carbs`, ensure the
 are available; the CLI will surface a clear runtime error if either dependency
 is missing.
 
-### Asynchronous Trainer
-
-The async trainer keeps samplers, judges, and the learner busy while
-emitting retrieval-quality rewards and structured memory features:
-
-```
-dspy-agent rl async-train --workspace . --rollout-workers 3 --judge-workers 3 --wall-clock 180
-```
-
-Combine this with `dspy-agent rl guide` to ensure temperature, entropy, and
-clip settings stay within the recommended bands.
-
 ## Kafka/Spark Context
 
 - Subscribe: `logs.ctx.<topic>` (e.g., `logs.ctx.backend`)
@@ -146,7 +176,7 @@ clip settings stay within the recommended bands.
 The scaffold keeps imports lazy. When ready to train neural policies:
 1. Install extras: `pip install .[rl]`
 2. `train_puffer_policy` implements a lightweight torch REINFORCE loop and uses PufferLib vectorization when available.
-3. Switch `dspy-agent rl train --neural` (and optionally `--puffer`) to use the neural trainer.
+3. The unified `dspy-agent rl train` command already drives the PufferLib trainer; adjust `--lr`, `--entropy`, and replay settings to explore different behaviours.
 
 PuffeRL PPO shell:
 See `dspy_agent/rl.run_puffer_ppo` for a sketch that builds a PufferLib vectorized env and instantiates PuffeRL with a simple actor-critic model. Replace the policy factory with a proper PufferLib policy and adjust config to your version.
@@ -160,11 +190,7 @@ See `dspy_agent/rl.run_puffer_ppo` for a sketch that builds a PufferLib vectoriz
 Prefer a JSON config file over env vars. Example `.dspy_rl.json`:
 ```
 {
-  "policy": "epsilon-greedy",
-  "epsilon": 0.1,
-  "ucb_c": 2.0,
   "n_envs": 4,
-  "puffer": true,
   "verifiers_module": "verifiers",
   "weights": {"pass_rate": 1.0, "blast_radius": 1.0},
   "penalty_kinds": ["blast_radius"],
@@ -177,10 +203,12 @@ Prefer a JSON config file over env vars. Example `.dspy_rl.json`:
 }
 ```
 
+Training-specific hyperparameters (learning rate, entropy coefficient,
+replay capacity, etc.) are now supplied via CLI flags on `dspy-agent rl train`.
+
 Use with CLI:
 ```
-dspy-agent rl train --workspace . --rl-config .dspy_rl.json
-dspy-agent rl ppo   --workspace . --rl-config .dspy_rl.json
+dspy-agent rl train --workspace . --rl-config .dspy_rl.json --steps 1000 --n-envs 4
 ```
 
 Default verifiers resolution order:

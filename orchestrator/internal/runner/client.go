@@ -35,6 +35,37 @@ type Metrics struct {
 	TotalErrors    uint64            `json:"total_errors"`
 	ErrorsByClass  map[string]uint64 `json:"errors_by_class"`
 	UptimeSeconds  uint64            `json:"uptime_seconds"`
+	Hardware       *HardwareSnapshot `json:"hardware"`
+}
+
+// HardwareSnapshot mirrors the environment runner hardware payload.
+type HardwareSnapshot struct {
+	Hostname     string        `json:"hostname"`
+	DetectedAt   string        `json:"detected_at"`
+	CPU          CPUSummary    `json:"cpu"`
+	Memory       MemorySummary `json:"memory"`
+	Accelerators []Accelerator `json:"accelerators"`
+}
+
+type CPUSummary struct {
+	Brand           string `json:"brand"`
+	LogicalCores    int    `json:"logical_cores"`
+	PhysicalCores   int    `json:"physical_cores"`
+	MinFrequencyMHz uint64 `json:"min_frequency_mhz"`
+	MaxFrequencyMHz uint64 `json:"max_frequency_mhz"`
+}
+
+type MemorySummary struct {
+	TotalBytes     uint64 `json:"total_bytes"`
+	AvailableBytes uint64 `json:"available_bytes"`
+}
+
+type Accelerator struct {
+	Vendor            string  `json:"vendor"`
+	Model             string  `json:"model"`
+	MemoryMB          uint64  `json:"memory_mb"`
+	Count             uint32  `json:"count"`
+	ComputeCapability *string `json:"compute_capability"`
 }
 
 // HTTPClient wraps communication with the Rust environment runner.

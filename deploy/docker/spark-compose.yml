@@ -1,7 +1,7 @@
 version: '3.9'
 services:
   spark-master:
-    image: bitnami/spark:3.5.1
+    image: apache/spark:3.5.0.1
     environment:
       - SPARK_MODE=master
     ports:
@@ -10,7 +10,7 @@ services:
     networks: [dspy]
 
   spark-worker:
-    image: bitnami/spark:3.5.1
+    image: apache/spark:3.5.0.1
     depends_on: [spark-master]
     environment:
       - SPARK_MODE=worker

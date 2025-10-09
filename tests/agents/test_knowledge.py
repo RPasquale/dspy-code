@@ -1,3 +1,4 @@
+import json
 import textwrap
 from pathlib import Path
 
@@ -30,6 +31,7 @@ def test_py_facts_extracts_imports_classes_and_functions(tmp_path: Path) -> None
 
     assert facts == FileFacts(
         path=str(path),
+        language="python",
         lines=len(src.splitlines()),
         imports=["math", "os"],
         classes=["Foo"],
@@ -44,6 +46,7 @@ def test_py_facts_handles_syntax_errors(tmp_path: Path) -> None:
 
     facts = _py_facts(path)
 
+    assert facts.language == "python"
     assert facts.imports == []
     assert facts.classes == []
     assert facts.functions == []
@@ -95,3 +98,69 @@ def test_summarize_code_graph_formats_human_readable_output() -> None:
     assert "mod/a.py" in output
     assert "classes=1" in output
     assert "funcs=2" in output
+
+
+@pytest.mark.unit
+def test_build_code_graph_handles_typescript_imports(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    entry = src_dir / "App.tsx"
+    util = src_dir / "lib" / "util.ts"
+    util.parent.mkdir()
+    util.write_text("export default function helper() { return 42; }\n")
+    entry.write_text("import helper from '@/lib/util';\nexport const App = () => helper();\n")
+    (tmp_path / "tsconfig.json").write_text(json.dumps({
+        "compilerOptions": {
+            "baseUrl": ".",
+            "paths": {
+                "@/*": ["src/*"],
+            },
+        }
+    }))
+
+    graph = build_code_graph(tmp_path)
+
+    edge_matches = [
+        e
+        for e in graph["edges"]
+        if e["source"].endswith("App.tsx")
+        and e["target"].endswith("lib/util.ts")
+        and e["kind"].endswith("import")
+    ]
+    assert edge_matches, f"expected import edge from App.tsx to util.ts, got {graph['edges']}"
+
+
+
+@pytest.mark.unit
+def test_build_code_graph_tracks_multiple_languages(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "scripts").mkdir()
+
+    (tmp_path / "src" / "lib.rs").write_text('mod helpers;\nuse crate::helpers::value;\n')
+    (tmp_path / "src" / "helpers.rs").write_text('pub fn value() -> i32 { 1 }\n')
+    (tmp_path / "main.go").write_text('package main\nimport "./util"\nfunc main() { util.Run() }\n')
+    (tmp_path / "util.go").write_text('package util\nfunc Run() {}\n')
+    (tmp_path / "scripts" / "build.sh").write_text('#!/usr/bin/env bash\nsource ./env.sh\n')
+    (tmp_path / "scripts" / "env.sh").write_text('export VAR=1\n')
+    (tmp_path / "index.html").write_text('<link rel="stylesheet" href="styles.css" />')
+    (tmp_path / "styles.css").write_text('@import "theme.css";')
+    (tmp_path / "theme.css").write_text('body { color: #000; }')
+    (tmp_path / "App.java").write_text('import java.util.List; class App {}')
+
+    graph = build_code_graph(tmp_path)
+
+    languages = {entry['language'] for entry in graph['files']}
+    expected = {"rust", "go", "bash", "html", "css", "java"}
+    assert expected.issubset(languages)
+
+    rust_edges = [e for e in graph['edges'] if e['kind'].endswith('import') and e['source'].endswith('lib.rs')]
+    assert any('helpers.rs' in e['target'] for e in rust_edges)
+
+    bash_edges = [e for e in graph['edges'] if e['kind'].startswith('bash_')]
+    assert bash_edges, "expected bash reference edges"
+
+    html_edges = [e for e in graph['edges'] if e['kind'].startswith('html_')]
+    assert any(e['target'].endswith('styles.css') for e in html_edges)
+
+    css_edges = [e for e in graph['edges'] if e['kind'].startswith('css_')]
+    assert any(e['target'].endswith('theme.css') for e in css_edges)

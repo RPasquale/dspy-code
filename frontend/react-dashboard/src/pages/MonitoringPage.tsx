@@ -698,8 +698,8 @@ const MonitoringPage = () => {
         <Card title="Presets" subtitle="One-click CLI flows" dense>
           <div className={styles.metricsGrid}>
             <PresetButton label="RL Train (200)" onClick={() => commandMutation.mutate('rl train --steps 200')} />
-            <PresetButton label="RL Neural (500)" onClick={() => commandMutation.mutate('rl neural --steps 500')} />
-            <PresetButton label="RL PPO (10k)" onClick={() => commandMutation.mutate('rl ppo --total-steps 10000')} />
+            <PresetButton label="RL Train (500)" onClick={() => commandMutation.mutate('rl train --steps 500 --n-envs 2')} />
+            <PresetButton label="RL Train (10k)" onClick={() => commandMutation.mutate('rl train --steps 10000 --n-envs 8 --lr 0.0005 --entropy 0.02')} />
             <PresetButton label="GEPA Orchestrator" onClick={() => commandMutation.mutate('gepa_orchestrator --dataset-dir /app/test_project/.dspy_data --auto light')} />
             <PresetButton label="GEPA Codegen" onClick={() => commandMutation.mutate('gepa_codegen --dataset-dir /app/test_project/.dspy_data --auto light')} />
             <PresetButton label="Live Training" onClick={() => commandMutation.mutate('live')} />

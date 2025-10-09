@@ -4,6 +4,7 @@ COPY orchestrator/go.mod orchestrator/go.sum ./orchestrator/
 RUN cd orchestrator && go mod download
 COPY orchestrator/ ./orchestrator
 RUN cd orchestrator && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/orchestrator ./cmd/orchestrator
+RUN cd orchestrator && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /out/stream_supervisor ./cmd/stream_supervisor
 
 FROM rust:1.82 AS rust-builder
 WORKDIR /src
@@ -11,6 +12,7 @@ COPY env_runner_rs/Cargo.toml env_runner_rs/Cargo.lock ./env_runner_rs/
 COPY reddb_rs/Cargo.toml ./reddb_rs/
 RUN cd env_runner_rs && cargo fetch
 RUN cd reddb_rs && cargo fetch
+COPY proto/ ./proto
 COPY env_runner_rs/ ./env_runner_rs
 COPY reddb_rs/ ./reddb_rs
 RUN cd env_runner_rs && cargo build --release
@@ -143,6 +145,7 @@ RUN set -eux; \
     fi
 
 COPY --from=go-builder /out/orchestrator /usr/local/bin/orchestrator
+COPY --from=go-builder /out/stream_supervisor /usr/local/bin/stream_supervisor
 COPY --from=rust-builder /src/env_runner_rs/target/release/env_runner /usr/local/bin/env_runner
 COPY --from=rust-builder /src/reddb_rs/target/release/reddb /usr/local/bin/reddb
 

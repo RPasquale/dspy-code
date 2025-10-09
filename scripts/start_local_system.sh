@@ -196,6 +196,19 @@ start_slurm() {
 echo "Starting agent training job"
 python scripts/train_agent.py ${TRAINING_METHOD:-grpo} --backend local
 EOF
+      cat > "$ROOT_DIR/deploy/slurm/train_puffer_rl.sbatch" << 'EOF'
+#!/bin/bash
+#SBATCH --job-name=puffer_rl_train
+#SBATCH --nodes=${NODES:-1}
+#SBATCH --gpus-per-node=${GPUS:-1}
+#SBATCH --cpus-per-task=${CPUS_PER_TASK:-8}
+#SBATCH --mem=${MEMORY_GB:-48}G
+#SBATCH --time=${TIME_LIMIT:-02:00:00}
+#SBATCH --output=/workspace/logs/puffer_rl_%j.out
+#SBATCH --error=/workspace/logs/puffer_rl_%j.err
+
+echo "mock puffer rl job"
+EOF
     fi
   else
     echo "[warn] sbatch not found; Slurm will be skipped"

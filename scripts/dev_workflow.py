@@ -4,26 +4,45 @@ Streamlined Development Workflow for DSPy Agent
 Makes it super easy for human users to publish packages, push to GitHub, and update versions.
 """
 
-import os
-import sys
-import json
-import subprocess
 import argparse
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-from datetime import datetime
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 class DevWorkflow:
     def __init__(self, workspace: Path = None):
         self.workspace = workspace or Path.cwd()
         self.pyproject_path = self.workspace / "pyproject.toml"
         self.package_name = "blampert"
+        self.python_cmd = os.getenv("PYTHON_BIN") or shutil.which("python3") or sys.executable
+        if not self.python_cmd:
+            self.python_cmd = "python3"
+        self.env = os.environ.copy()
+        cache_dir = self.workspace / ".uv_cache"
+        cache_dir.mkdir(exist_ok=True)
+        self.env.setdefault("UV_CACHE_DIR", str(cache_dir))
+        self.env.setdefault("UV_LINK_MODE", "copy")
+        self.env.setdefault("UV_PYTHON_BIN", self.python_cmd)
         
     def run_command(self, cmd: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run a shell command and return the result"""
+        if "uv run python" in cmd:
+            cmd = cmd.replace("uv run python", f"uv run {self.python_cmd}")
         print(f"🔄 Running: {cmd}")
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=self.workspace)
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            cwd=self.workspace,
+            env=self.env,
+        )
         if check and result.returncode != 0:
             print(f"❌ Command failed: {cmd}")
             print(f"Error: {result.stderr}")

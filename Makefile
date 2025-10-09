@@ -12,6 +12,19 @@ stack-env:
 		echo "REDDB_NAMESPACE=dspy" >> $(STACK_ENV); \
 		echo "REDDB_TOKEN=$$REDDB_ADMIN_TOKEN" >> $(STACK_ENV); \
 		echo "DB_BACKEND=reddb" >> $(STACK_ENV); \
+		echo "MESH_GRPC_ENDPOINT=http://mesh-hub:50051" >> $(STACK_ENV); \
+		echo "MESH_WORKER_ENDPOINT=http://mesh-worker:50052" >> $(STACK_ENV); \
+		echo "MESH_NODE_ID=9002" >> $(STACK_ENV); \
+		echo "MESH_DOMAIN=default" >> $(STACK_ENV); \
+		echo "MESH_DOMAIN_ID=1" >> $(STACK_ENV); \
+		echo "MESH_HUB_NODE_ID=9001" >> $(STACK_ENV); \
+		echo "MESH_TRAINER_NODE_ID=9003" >> $(STACK_ENV); \
+		echo "MESH_GATEWAY_NODE_ID=9010" >> $(STACK_ENV); \
+		echo 'MESH_SERVICES_JSON=[{"id":9001,"endpoint":"http://mesh-hub:50051","domain":"default","tags":["hub"]},{"id":9002,"endpoint":"http://mesh-worker:50052","domain":"default","tags":["worker","inference"]},{"id":9003,"endpoint":"http://mesh-trainer:50053","domain":"default","tags":["trainer"]},{"id":9010,"endpoint":"http://mesh-gateway:50060","domain":"default","tags":["gateway","edge"]}]' >> $(STACK_ENV); \
+		echo "MESH_LISTEN_ADDR=0.0.0.0:7000" >> $(STACK_ENV); \
+		echo "MESH_GRPC_LISTEN_ADDR=0.0.0.0:50051" >> $(STACK_ENV); \
+		echo "MESH_METRICS_ADDR=0.0.0.0:9100" >> $(STACK_ENV); \
+		echo "MESH_EXTRA_ARGS=" >> $(STACK_ENV); \
 		echo "[make] wrote $(STACK_ENV) with WORKSPACE_DIR=$$(pwd) and RedDB config"; \
 	fi
 
@@ -466,3 +479,69 @@ stack-demo: stack-up
 	echo "- FastAPI Backend http://127.0.0.1:8767/api/db/health"; \
 	echo "- RedDB:         http://127.0.0.1:8082/health"; \
 	echo "(Use 'make health' for a quick status report)"
+
+STREAMING_COMPOSE := docker/streaming/docker-compose.yml
+STREAMING_ENV := docker/streaming/.env
+
+.PHONY: streaming-env streaming-proto streaming-build streaming-up streaming-down streaming-logs streaming-ps
+
+streaming-env:
+	@if [ ! -f $(STREAMING_ENV) ]; then \
+		echo "# streaming stack" > $(STREAMING_ENV); \
+		echo "KAFKA_BROKERS=broker:9092" >> $(STREAMING_ENV); \
+		echo "INPUT_TOPIC=raw.events.demo" >> $(STREAMING_ENV); \
+		echo "OUTPUT_TOPIC=features.events.demo" >> $(STREAMING_ENV); \
+		echo "SUPERVISOR_LISTEN=:7000" >> $(STREAMING_ENV); \
+		echo "SUPERVISOR_GRPC_ADDR=supervisor:7000" >> $(STREAMING_ENV); \
+		echo "WORKER_ID=worker-1" >> $(STREAMING_ENV); \
+		echo "MAX_INFLIGHT=4" >> $(STREAMING_ENV); \
+		echo "MESH_GRPC_ENDPOINT=http://mesh-hub:50051" >> $(STREAMING_ENV); \
+		echo "MESH_SOURCE_NODE=9001" >> $(STREAMING_ENV); \
+		echo "MESH_WORKER_NODE_ID=9002" >> $(STREAMING_ENV); \
+		echo "MESH_TRAINER_NODE_ID=9003" >> $(STREAMING_ENV); \
+		echo "MESH_GATEWAY_NODE_ID=9010" >> $(STREAMING_ENV); \
+		echo "MESH_WORKER_ENDPOINT=http://mesh-worker:50052" >> $(STREAMING_ENV); \
+		echo "MESH_DOMAIN=default" >> $(STREAMING_ENV); \
+		echo "MESH_DOMAIN_ID=1" >> $(STREAMING_ENV); \
+		echo 'MESH_SERVICES_JSON=[{"id":9001,"endpoint":"http://mesh-hub:50051","domain":"default"},{"id":9002,"endpoint":"http://mesh-worker:50052","domain":"default"},{"id":9003,"endpoint":"http://mesh-trainer:50053","domain":"default"}]' >> $(STREAMING_ENV); \
+		echo "MESH_LISTEN_ADDR=0.0.0.0:7000" >> $(STREAMING_ENV); \
+		echo "MESH_GRPC_LISTEN_ADDR=0.0.0.0:50051" >> $(STREAMING_ENV); \
+		echo "MESH_METRICS_ADDR=0.0.0.0:9100" >> $(STREAMING_ENV); \
+		echo "MESH_EXTRA_ARGS=" >> $(STREAMING_ENV); \
+		echo "[make] wrote $(STREAMING_ENV)"; \
+	fi
+
+streaming-proto:
+	docker run --rm \
+		-v $$(pwd):/workspace \
+		-w /workspace \
+		bufbuild/buf:1.29.0 generate
+
+streaming-build: streaming-env streaming-proto
+	DOCKER_BUILDKIT=1 docker compose -f $(STREAMING_COMPOSE) --env-file $(STREAMING_ENV) build
+
+streaming-up: streaming-env
+	docker compose -f $(STREAMING_COMPOSE) --env-file $(STREAMING_ENV) up -d
+
+streaming-down:
+	docker compose -f $(STREAMING_COMPOSE) --env-file $(STREAMING_ENV) down
+
+streaming-logs:
+	docker compose -f $(STREAMING_COMPOSE) --env-file $(STREAMING_ENV) logs -f
+
+streaming-ps:
+	docker compose -f $(STREAMING_COMPOSE) --env-file $(STREAMING_ENV) ps
+.PHONY: test-dashboard
+test-dashboard:
+	uv run pytest tests/test_dashboard_api.py -q
+
+.PHONY: test-stream-supervisor
+test-stream-supervisor:
+	cd orchestrator && go test ./cmd/stream_supervisor -run .
+
+.PHONY: test-env-runner
+test-env-runner:
+	cd env_runner_rs && cargo test --tests integration_tests
+.PHONY: proto.generate
+proto.generate:
+	./scripts/generate_protos.sh

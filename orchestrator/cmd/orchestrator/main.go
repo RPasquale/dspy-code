@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/dspy/orchestrator/internal/runner"
 	"github.com/dspy/orchestrator/internal/slurm"
 	"github.com/dspy/orchestrator/internal/workflow"
+	"github.com/dspy/orchestrator/internal/workflowspec"
 	"github.com/dspy/orchestrator/pkg/telemetry"
 )
 
@@ -35,6 +38,26 @@ func main() {
 		log.Fatalf("failed to create event bus: %v", err)
 	}
 	defer eventBus.Close()
+
+	workflowDir := os.Getenv("WORKFLOW_STORE_DIR")
+	if workflowDir == "" {
+		workflowDir = "data/workflows"
+	}
+	workflowStore, err := workflowspec.NewFileStore(workflowDir)
+	if err != nil {
+		log.Fatalf("failed to create workflow store: %v", err)
+	}
+	workflowGauge := telemetry.NewGauge(registry, "workflows_total", "Number of registered workflows.")
+	refreshWorkflowGauge(workflowStore, workflowGauge)
+
+	runDir := os.Getenv("WORKFLOW_RUN_DIR")
+	if runDir == "" {
+		runDir = "data/workflow_runs"
+	}
+	runStore, err := workflow.NewRunStore(runDir)
+	if err != nil {
+		log.Fatalf("failed to create workflow run store: %v", err)
+	}
 
 	queueDir := os.Getenv("ENV_QUEUE_DIR")
 	if queueDir == "" {
@@ -62,6 +85,7 @@ func main() {
 	queueGauge := telemetry.NewGauge(registry, "env_queue_depth", "Number of queued environment evaluations awaiting execution.")
 	gpuWaitGauge := telemetry.NewGauge(registry, "gpu_wait_seconds", "Average seconds tasks waited for GPU resources.")
 	errorGauge := telemetry.NewGauge(registry, "env_error_rate", "Rolling error rate observed across tasks.")
+	runnerGpuGauge := telemetry.NewGauge(registry, "runner_gpu_total", "Detected GPU devices on the environment runner.")
 
 	source := &metrics.RegistrySource{
 		Registry:    registry,
@@ -88,10 +112,162 @@ func main() {
 	}
 
 	runnerClient := runner.NewHTTPClient(os.Getenv("ENV_RUNNER_URL"))
-	go pollRunnerMetrics(ctx, runnerClient, queueWatcher, queueGauge, gpuWaitGauge, errorGauge)
+	runnerHardware := newRunnerHardwareCache()
+	go pollRunnerMetrics(ctx, runnerClient, queueWatcher, runnerHardware, queueGauge, gpuWaitGauge, errorGauge, runnerGpuGauge)
+
+	executor := workflow.NewExecutor(orchestrator, runStore, workflowStore, runnerClient, slurmBridge, eventBus, workflow.WithHardwareProvider(runnerHardware.SnapshotAsMap))
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", registry.Handler())
+	mux.HandleFunc("/workflows", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			workflows, err := workflowStore.List()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			respondJSON(w, map[string]interface{}{"items": workflows})
+		case http.MethodPost:
+			defer r.Body.Close()
+			var wf workflowspec.Workflow
+			if err := json.NewDecoder(r.Body).Decode(&wf); err != nil {
+				http.Error(w, fmt.Sprintf("invalid workflow payload: %v", err), http.StatusBadRequest)
+				return
+			}
+			saved, err := workflowStore.Save(&wf)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			respondJSON(w, saved)
+			refreshWorkflowGauge(workflowStore, workflowGauge)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/workflows/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/workflows/")
+		if path == "" {
+			http.Error(w, "workflow id is required", http.StatusBadRequest)
+			return
+		}
+		parts := strings.Split(path, "/")
+		id := parts[0]
+		subresource := ""
+		if len(parts) > 1 {
+			subresource = strings.Join(parts[1:], "/")
+		}
+		switch {
+		case subresource == "runs":
+			switch r.Method {
+			case http.MethodPost:
+				defer r.Body.Close()
+				var req struct {
+					IdempotencyKey string                 `json:"idempotency_key"`
+					Input          map[string]interface{} `json:"input"`
+				}
+				if r.Body != nil && r.Body != http.NoBody {
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+						http.Error(w, fmt.Sprintf("invalid workflow run payload: %v", err), http.StatusBadRequest)
+						return
+					}
+				}
+				runRecord, err := executor.StartRun(r.Context(), id, req.IdempotencyKey, req.Input)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("start run failed: %v", err), http.StatusInternalServerError)
+					return
+				}
+				respondJSON(w, runRecord)
+			case http.MethodGet:
+				limit := 0
+				if raw := r.URL.Query().Get("limit"); raw != "" {
+					if n, err := strconv.Atoi(raw); err == nil {
+						limit = n
+					}
+				}
+				runs, err := runStore.ListRuns(id, limit)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("list runs failed: %v", err), http.StatusInternalServerError)
+					return
+				}
+				respondJSON(w, map[string]interface{}{"items": runs})
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
+			return
+		case subresource == "history" && r.Method == http.MethodGet:
+			revisions, err := workflowStore.History(id, 0)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			respondJSON(w, map[string]interface{}{"items": revisions})
+			return
+		case subresource != "" && subresource != "history":
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			wf, err := workflowStore.Get(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			respondJSON(w, wf)
+		case http.MethodPut:
+			existing, err := workflowStore.Get(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			defer r.Body.Close()
+			var wf workflowspec.Workflow
+			if err := json.NewDecoder(r.Body).Decode(&wf); err != nil {
+				http.Error(w, fmt.Sprintf("invalid workflow payload: %v", err), http.StatusBadRequest)
+				return
+			}
+			wf.ID = id
+			if wf.CreatedAt.IsZero() {
+				wf.CreatedAt = existing.CreatedAt
+			}
+			saved, err := workflowStore.Save(&wf)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			respondJSON(w, saved)
+			refreshWorkflowGauge(workflowStore, workflowGauge)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/workflow-runs/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/workflow-runs/")
+		if id == "" {
+			http.Error(w, "run id is required", http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			runRecord, err := runStore.GetRun(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			respondJSON(w, runRecord)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	mux.HandleFunc("/queue/submit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -155,7 +331,7 @@ func main() {
 		}
 
 		refreshQueueGauge(queueWatcher, queueGauge)
-		scheduleEnvTask(ctx, orchestrator, runnerClient, eventBus, queueWatcher, queueGauge, pendDir, doneDir, envelope)
+		scheduleEnvTask(ctx, orchestrator, runnerClient, eventBus, queueWatcher, queueGauge, runnerHardware, workflowStore, pendDir, doneDir, envelope)
 
 		respondJSON(w, map[string]interface{}{"ok": true, "id": id})
 	})
@@ -190,7 +366,7 @@ func main() {
 	}
 }
 
-func scheduleEnvTask(parent context.Context, orchestrator *workflow.Orchestrator, runnerClient *runner.HTTPClient, eventBus *events.EventBus, queueWatcher *queue.QueueWatcher, queueGauge *telemetry.Gauge, pendDir, doneDir string, envelope map[string]interface{}) {
+func scheduleEnvTask(parent context.Context, orchestrator *workflow.Orchestrator, runnerClient *runner.HTTPClient, eventBus *events.EventBus, queueWatcher *queue.QueueWatcher, queueGauge *telemetry.Gauge, hardwareCache *runnerHardwareCache, workflowStore workflowspec.Store, pendDir, doneDir string, envelope map[string]interface{}) {
 	id, _ := envelope["id"].(string)
 	class, _ := envelope["class"].(string)
 	rawPayload, _ := envelope["payload"].(map[string]interface{})
@@ -199,6 +375,8 @@ func scheduleEnvTask(parent context.Context, orchestrator *workflow.Orchestrator
 	for k, v := range rawPayload {
 		payloadCopy[k] = v
 	}
+	attachWorkflowContext(payloadCopy, workflowStore)
+	attachRunnerHardwarePayload(payloadCopy, hardwareCache)
 
 	orchestrator.Go("env_task_"+id, func(ctx context.Context) error {
 		sourcePath := filepath.Join(pendDir, id+".json")
@@ -250,7 +428,14 @@ func scheduleEnvTask(parent context.Context, orchestrator *workflow.Orchestrator
 		_ = os.Remove(lockPath)
 		refreshQueueGauge(queueWatcher, queueGauge)
 
-		if publishErr := eventBus.PublishTaskCompleted(ctx, id, map[string]interface{}{"latency_ms": resp.LatencyMs}); publishErr != nil {
+		completionPayload := map[string]interface{}{"latency_ms": resp.LatencyMs, "class": class}
+		if wfCtx, ok := payloadCopy["workflow_context"]; ok {
+			completionPayload["workflow_context"] = wfCtx
+		}
+		if wfID, ok := payloadCopy["workflow_id"]; ok {
+			completionPayload["workflow_id"] = wfID
+		}
+		if publishErr := eventBus.PublishTaskCompleted(ctx, id, completionPayload); publishErr != nil {
 			log.Printf("publish completion event: %v", publishErr)
 		}
 
@@ -267,6 +452,12 @@ func scheduleEnvTask(parent context.Context, orchestrator *workflow.Orchestrator
 					"timestamp": time.Now().Unix(),
 				}
 				if err := eventBus.PublishVectorizedMessage(ctx, id, vectorPayload); err != nil {
+					if wfCtx, ok := payloadCopy["workflow_context"]; ok {
+						vectorPayload["workflow_context"] = wfCtx
+					}
+					if wfID, ok := payloadCopy["workflow_id"].(string); ok && wfID != "" {
+						vectorPayload["workflow_id"] = wfID
+					}
 					log.Printf("publish vectorized message: %v", err)
 				}
 			}
@@ -276,7 +467,7 @@ func scheduleEnvTask(parent context.Context, orchestrator *workflow.Orchestrator
 	})
 }
 
-func pollRunnerMetrics(ctx context.Context, client *runner.HTTPClient, queueWatcher *queue.QueueWatcher, queueGauge, gpuWaitGauge, errorGauge *telemetry.Gauge) {
+func pollRunnerMetrics(ctx context.Context, client *runner.HTTPClient, queueWatcher *queue.QueueWatcher, hardware *runnerHardwareCache, queueGauge, gpuWaitGauge, errorGauge, gpuTotalGauge *telemetry.Gauge) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -296,6 +487,14 @@ func pollRunnerMetrics(ctx context.Context, client *runner.HTTPClient, queueWatc
 				errorRate = float64(metrics.TotalErrors) / float64(metrics.TasksProcessed)
 			}
 			errorGauge.Set(math.Min(errorRate, 1.0))
+			if metrics.Hardware != nil {
+				hardware.Set(metrics.Hardware)
+				gpuTotal := 0.0
+				for _, accel := range metrics.Hardware.Accelerators {
+					gpuTotal += float64(accel.Count)
+				}
+				gpuTotalGauge.Set(gpuTotal)
+			}
 
 			// Fallback to watcher for instantaneous updates
 			refreshQueueGauge(queueWatcher, queueGauge)
@@ -310,6 +509,56 @@ func refreshQueueGauge(queueWatcher *queue.QueueWatcher, gauge *telemetry.Gauge)
 	gauge.Set(float64(queueWatcher.GetQueueDepth()))
 }
 
+type runnerHardwareCache struct {
+	mu          sync.RWMutex
+	snapshot    *runner.HardwareSnapshot
+	snapshotMap map[string]any
+}
+
+func newRunnerHardwareCache() *runnerHardwareCache {
+	return &runnerHardwareCache{}
+}
+
+func (c *runnerHardwareCache) Set(hw *runner.HardwareSnapshot) {
+	if hw == nil {
+		return
+	}
+	clone := *hw
+	clone.Accelerators = append([]runner.Accelerator(nil), hw.Accelerators...)
+	var snapshotMap map[string]any
+	if payload, err := json.Marshal(hw); err == nil {
+		_ = json.Unmarshal(payload, &snapshotMap)
+	}
+	c.mu.Lock()
+	c.snapshot = &clone
+	c.snapshotMap = snapshotMap
+	c.mu.Unlock()
+}
+
+func (c *runnerHardwareCache) Snapshot() *runner.HardwareSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.snapshot == nil {
+		return nil
+	}
+	clone := *c.snapshot
+	clone.Accelerators = append([]runner.Accelerator(nil), c.snapshot.Accelerators...)
+	return &clone
+}
+
+func (c *runnerHardwareCache) SnapshotAsMap() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.snapshotMap == nil {
+		return nil
+	}
+	clone := make(map[string]any, len(c.snapshotMap))
+	for k, v := range c.snapshotMap {
+		clone[k] = v
+	}
+	return clone
+}
+
 func tokenize(input string) []string {
 	lower := strings.ToLower(input)
 	fields := strings.Fields(lower)
@@ -321,6 +570,47 @@ func tokenize(input string) []string {
 		}
 	}
 	return tokens
+}
+
+func attachWorkflowContext(payload map[string]interface{}, store workflowspec.Store) {
+	if store == nil || payload == nil {
+		return
+	}
+	idRaw, ok := payload["workflow_id"]
+	if !ok {
+		return
+	}
+	wfID, ok := idRaw.(string)
+	if !ok || strings.TrimSpace(wfID) == "" {
+		return
+	}
+	wf, err := store.Get(wfID)
+	if err != nil {
+		log.Printf("workflow lookup failed for %s: %v", wfID, err)
+		return
+	}
+	ctxPayload := workflow.BuildWorkflowContext(wf)
+	if ctxPayload == nil {
+		return
+	}
+	payload["workflow_context"] = ctxPayload
+	if _, exists := payload["tenant"]; !exists {
+		if tenant, ok := ctxPayload["tenant"].(string); ok && tenant != "" {
+			payload["tenant"] = tenant
+		}
+	}
+}
+
+func attachRunnerHardwarePayload(payload map[string]interface{}, cache *runnerHardwareCache) {
+	if cache == nil || payload == nil {
+		return
+	}
+	if _, exists := payload["runner_hardware"]; exists {
+		return
+	}
+	if snapshot := cache.SnapshotAsMap(); snapshot != nil {
+		payload["runner_hardware"] = snapshot
+	}
 }
 
 func extractInputs(payload map[string]interface{}) []string {
@@ -339,6 +629,18 @@ func extractInputs(payload map[string]interface{}) []string {
 		}
 	}
 	return out
+}
+
+func refreshWorkflowGauge(store workflowspec.Store, gauge *telemetry.Gauge) {
+	if store == nil || gauge == nil {
+		return
+	}
+	workflows, err := store.List()
+	if err != nil {
+		log.Printf("workflow gauge refresh failed: %v", err)
+		return
+	}
+	gauge.Set(float64(len(workflows)))
 }
 
 func respondJSON(w http.ResponseWriter, payload interface{}) {

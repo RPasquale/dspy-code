@@ -6,13 +6,15 @@ This script runs a complete validation suite to ensure the package is ready
 for publishing. It includes all tests, quality checks, and build validation.
 """
 
-import sys
-import subprocess
 import argparse
-from pathlib import Path
-from typing import List, Tuple, Dict, Any
 import json
+import os
+import shutil
+import subprocess
+import sys
 import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Union
 
 
 class PackageValidator:
@@ -22,18 +24,32 @@ class PackageValidator:
         self.workspace = workspace or Path.cwd()
         self.results: Dict[str, Any] = {}
         self.start_time = time.time()
-        
-    def run_command(self, cmd: str, check: bool = True) -> subprocess.CompletedProcess:
+        self.python_cmd = os.getenv("PYTHON_BIN") or shutil.which("python3") or sys.executable
+        if not self.python_cmd:
+            self.python_cmd = "python3"
+        self.env = os.environ.copy()
+        cache_dir = self.workspace / ".uv_cache"
+        cache_dir.mkdir(exist_ok=True)
+        self.env.setdefault("UV_CACHE_DIR", str(cache_dir))
+        self.env.setdefault("UV_LINK_MODE", "copy")
+        self.env.setdefault("UV_PYTHON_BIN", self.python_cmd)
+
+    def run_command(self, cmd: Union[str, List[str]], check: bool = True) -> subprocess.CompletedProcess:
         """Run a command and return the result"""
-        print(f"  🔧 Running: {cmd}")
+        if isinstance(cmd, list):
+            printable = " ".join(cmd)
+        else:
+            printable = cmd
+        print(f"  🔧 Running: {printable}")
         try:
             result = subprocess.run(
-                cmd, 
-                shell=True, 
+                cmd,
+                shell=isinstance(cmd, str),
                 capture_output=True, 
                 text=True, 
                 cwd=self.workspace,
-                check=check
+                check=check,
+                env=self.env,
             )
             return result
         except subprocess.CalledProcessError as e:
@@ -70,7 +86,13 @@ class PackageValidator:
         print("🔍 Validating dependencies...")
         
         # Check pyproject.toml syntax
-        result = self.run_command("uv run python -c 'import tomllib; tomllib.load(open(\"pyproject.toml\", \"rb\"))'", check=False)
+        result = self.run_command([
+            "uv",
+            "run",
+            self.python_cmd,
+            "-c",
+            "import tomllib; tomllib.load(open('pyproject.toml','rb'))",
+        ], check=False)
         if result.returncode != 0:
             print("  ❌ Invalid pyproject.toml syntax")
             self.results["dependencies"] = {"status": "failed", "error": "Invalid pyproject.toml"}
@@ -105,7 +127,7 @@ class PackageValidator:
         """Run integration tests"""
         print("🔗 Running integration tests...")
         
-        result = self.run_command("uv run python scripts/test_full_integration.py", check=False)
+        result = self.run_command(["uv", "run", self.python_cmd, "scripts/test_full_integration.py"], check=False)
         if result.returncode != 0:
             print("  ❌ Integration tests failed")
             self.results["integration_tests"] = {"status": "failed", "output": result.stdout}
@@ -119,7 +141,7 @@ class PackageValidator:
         """Run RL tests"""
         print("🧠 Running RL tests...")
         
-        result = self.run_command("uv run python scripts/test_rl.py", check=False)
+        result = self.run_command(["uv", "run", self.python_cmd, "scripts/test_rl.py"], check=False)
         if result.returncode != 0:
             print("  ❌ RL tests failed")
             self.results["rl_tests"] = {"status": "failed", "output": result.stdout}
@@ -133,7 +155,7 @@ class PackageValidator:
         """Run agent functionality tests"""
         print("🤖 Running agent tests...")
         
-        result = self.run_command("uv run python scripts/test_agent_simple.py", check=False)
+        result = self.run_command(["uv", "run", self.python_cmd, "scripts/test_agent_simple.py"], check=False)
         if result.returncode != 0:
             print("  ❌ Agent tests failed")
             self.results["agent_tests"] = {"status": "failed", "output": result.stdout}
@@ -161,7 +183,13 @@ class PackageValidator:
         """Run import tests"""
         print("📦 Running import tests...")
         
-        result = self.run_command("uv run python -c 'import dspy_agent; print(\"✅ Package imports work\")'", check=False)
+        result = self.run_command([
+            "uv",
+            "run",
+            self.python_cmd,
+            "-c",
+            "import dspy_agent; print('✅ Package imports work')",
+        ], check=False)
         if result.returncode != 0:
             print("  ❌ Import tests failed")
             self.results["import_tests"] = {"status": "failed", "output": result.stdout}

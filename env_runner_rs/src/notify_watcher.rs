@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use crate::{PrefetchQueue, WorkItem, WorkloadClass};
 
 /// File system watcher for queue directory changes
 pub struct NotifyWatcher {
-    watcher: RecommendedWatcher,
+    _watcher: RecommendedWatcher,
     queue: Arc<PrefetchQueue>,
     metrics: Arc<EnvRunnerMetrics>,
     pend_dir: PathBuf,
@@ -49,7 +50,7 @@ impl NotifyWatcher {
         watcher.watch(&done_dir, RecursiveMode::NonRecursive)?;
 
         Ok(Self {
-            watcher,
+            _watcher: watcher,
             queue,
             metrics,
             pend_dir,
@@ -108,12 +109,13 @@ impl NotifyWatcher {
     }
 
     fn should_rescan(&self, kind: &EventKind) -> bool {
-        match kind {
-            EventKind::Remove(RemoveKind::Any) | EventKind::Remove(RemoveKind::File) => true,
-            EventKind::Modify(ModifyKind::Metadata(_)) => true,
-            EventKind::Modify(ModifyKind::Name(_)) => true,
-            _ => false,
-        }
+        matches!(
+            kind,
+            EventKind::Remove(RemoveKind::Any)
+                | EventKind::Remove(RemoveKind::File)
+                | EventKind::Modify(ModifyKind::Metadata(_))
+                | EventKind::Modify(ModifyKind::Name(_))
+        )
     }
 
     async fn ingest_path(&self, path: PathBuf) {
@@ -203,9 +205,12 @@ fn read_task_file(path: &Path) -> Option<WorkItem> {
     let content = fs::read_to_string(path).ok()?;
     let task: TaskEnvelope = serde_json::from_str(&content).ok()?;
 
+    let class_label = task.class.unwrap_or_else(|| "cpu_short".to_owned());
+    let class = WorkloadClass::from_str(&class_label).unwrap_or(WorkloadClass::CpuShort);
+
     Some(WorkItem {
         id: task.id,
-        class: WorkloadClass::from_str(&task.class.unwrap_or_else(|| "cpu_short".to_owned())),
+        class,
         payload: task.payload.to_string(),
     })
 }
@@ -215,17 +220,6 @@ struct TaskEnvelope {
     id: String,
     class: Option<String>,
     payload: serde_json::Value,
-}
-
-impl WorkloadClass {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "gpu" => WorkloadClass::Gpu,
-            "gpu_slurm" => WorkloadClass::Gpu,
-            "cpu_long" => WorkloadClass::CpuLong,
-            _ => WorkloadClass::CpuShort,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -244,7 +238,7 @@ mod tests {
 
         let queue = Arc::new(PrefetchQueue::new(128));
         let metrics = Arc::new(EnvRunnerMetrics::new());
-        let mut watcher = NotifyWatcher::new(
+        let watcher = NotifyWatcher::new(
             pend_dir.clone(),
             done_dir.clone(),
             queue.clone(),
@@ -252,10 +246,11 @@ mod tests {
         )
         .unwrap();
 
-        let shutdown = AtomicBool::new(false);
+        let shutdown = Arc::new(AtomicBool::new(false));
         let mut watcher_ref = watcher;
+        let shutdown_handle = shutdown.clone();
         let task = tokio::spawn(async move {
-            watcher_ref.run(&shutdown).await.unwrap();
+            watcher_ref.run(shutdown_handle.as_ref()).await.unwrap();
         });
 
         // Create a test task file

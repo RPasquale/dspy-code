@@ -1,0 +1,188 @@
+version: "3.9"
+
+services:
+  broker:
+    image: bitnami/kafka:3.7
+    container_name: streaming-broker
+    environment:
+      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@broker:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://broker:9092
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_NUM_PARTITIONS=3
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  supervisor:
+    build:
+      context: ../../orchestrator
+      dockerfile: Dockerfile.stream
+    depends_on:
+      broker:
+        condition: service_healthy
+      mesh-hub:
+        condition: service_healthy
+      mesh-worker:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - KAFKA_BROKERS=${KAFKA_BROKERS}
+      - INPUT_TOPIC=${INPUT_TOPIC}
+      - OUTPUT_TOPIC=${OUTPUT_TOPIC}
+      - SUPERVISOR_LISTEN=${SUPERVISOR_LISTEN}
+      - MESH_PUBLISH_ENDPOINT=${MESH_GRPC_ENDPOINT}
+      - MESH_SOURCE_NODE=${MESH_SOURCE_NODE}
+      - MESH_PUBLISH_DOMAIN=${MESH_DOMAIN}
+      - MESH_SERVICES_FILE=${MESH_SERVICES_FILE:-/etc/dspy/mesh-services.json}
+    volumes:
+      - ../lightweight/mesh-services.json:/etc/dspy/mesh-services.json:ro
+    ports:
+      - "7000:7000"
+
+  worker:
+    build:
+      context: ../../env_runner_rs
+      dockerfile: Dockerfile.stream
+    depends_on:
+      supervisor:
+        condition: service_started
+      mesh-hub:
+        condition: service_healthy
+      mesh-worker:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - KAFKA_BROKERS=${KAFKA_BROKERS}
+      - INPUT_TOPIC=${INPUT_TOPIC}
+      - OUTPUT_TOPIC=${OUTPUT_TOPIC}
+      - SUPERVISOR_GRPC_ADDR=${SUPERVISOR_GRPC_ADDR}
+      - WORKER_ID=${WORKER_ID}
+      - MAX_INFLIGHT=${MAX_INFLIGHT}
+      - MESH_ENDPOINT=${MESH_WORKER_ENDPOINT:-http://mesh-worker:50052}
+      - MESH_NODE_ID=${MESH_WORKER_NODE_ID}
+      - MESH_DOMAIN=${MESH_GATEWAY_DOMAIN:-edge}
+      - MESH_SERVICES_FILE=${MESH_SERVICES_FILE:-/etc/dspy/mesh-services.json}
+    volumes:
+      - ../lightweight/mesh-services.json:/etc/dspy/mesh-services.json:ro
+
+  mesh-hub:
+    build:
+      context: ../../
+      dockerfile: docker/lightweight/mesh-core/Dockerfile
+    environment:
+      - MESH_NODE_ID=${MESH_SOURCE_NODE}
+      - MESH_DOMAIN=${MESH_DOMAIN}
+      - MESH_LISTEN_ADDR=0.0.0.0:7000
+      - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50051
+      - MESH_METRICS_ADDR=0.0.0.0:9100
+      - MESH_PEERS=
+      - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS}
+    ports:
+      - "127.0.0.1:50051:50051"
+      - "127.0.0.1:9100:9100"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  mesh-worker:
+    build:
+      context: ../../
+      dockerfile: docker/lightweight/mesh-core/Dockerfile
+    environment:
+      - MESH_NODE_ID=${MESH_WORKER_NODE_ID}
+      - MESH_DOMAIN=${MESH_DOMAIN}
+      - MESH_LISTEN_ADDR=0.0.0.0:7001
+      - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50052
+      - MESH_METRICS_ADDR=0.0.0.0:9101
+      - MESH_PEERS=mesh-hub:7000
+      - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS}
+    depends_on:
+      mesh-hub:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:50052:50052"
+      - "127.0.0.1:9101:9101"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50052"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  mesh-trainer:
+    build:
+      context: ../../
+      dockerfile: docker/lightweight/mesh-core/Dockerfile
+    environment:
+      - MESH_NODE_ID=${MESH_TRAINER_NODE_ID}
+      - MESH_DOMAIN=${MESH_DOMAIN}
+      - MESH_LISTEN_ADDR=0.0.0.0:7002
+      - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50053
+      - MESH_METRICS_ADDR=0.0.0.0:9102
+      - MESH_PEERS=mesh-hub:7000
+      - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS}
+    depends_on:
+      mesh-hub:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:50053:50053"
+      - "127.0.0.1:9102:9102"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50053"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+  mesh-gateway:
+    build:
+      context: ../../
+      dockerfile: docker/lightweight/mesh-core/Dockerfile
+    environment:
+      - MESH_NODE_ID=${MESH_GATEWAY_NODE_ID}
+      - MESH_DOMAIN=${MESH_DOMAIN}
+      - MESH_LISTEN_ADDR=0.0.0.0:7003
+      - MESH_GRPC_LISTEN_ADDR=0.0.0.0:50060
+      - MESH_METRICS_ADDR=0.0.0.0:9103
+      - MESH_PEERS=mesh-hub:7000
+      - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS}
+    depends_on:
+      mesh-hub:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:50060:50060"
+      - "127.0.0.1:9103:9103"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50060"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9095:9090"
+    depends_on:
+      mesh-hub:
+        condition: service_healthy
+      mesh-worker:
+        condition: service_healthy
+      mesh-trainer:
+        condition: service_healthy
+      mesh-gateway:
+        condition: service_healthy

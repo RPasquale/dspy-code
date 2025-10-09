@@ -1,5 +1,6 @@
 import '@testing-library/jest-dom'
 import { vi } from 'vitest'
+import React from 'react'
 
 // Mock window.matchMedia for responsive design
 Object.defineProperty(window, 'matchMedia', {
@@ -29,3 +30,19 @@ global.IntersectionObserver = vi.fn().mockImplementation(() => ({
   unobserve: vi.fn(),
   disconnect: vi.fn(),
 }))
+
+vi.mock('react-chartjs-2', () => {
+  const makeMock = (chartName: string) => (props: Record<string, unknown>) => {
+    const testId = typeof props['data-testid'] === 'string' ? props['data-testid'] : `chart-${chartName}`
+    return React.createElement('div', { 'data-testid': testId })
+  }
+
+  return {
+    Line: makeMock('line'),
+    Bar: makeMock('bar'),
+    Doughnut: makeMock('doughnut'),
+    Scatter: makeMock('scatter'),
+    Radar: makeMock('radar'),
+    PolarArea: makeMock('polarArea')
+  }
+})

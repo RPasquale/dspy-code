@@ -2,7 +2,7 @@
 # Usage:
 #   docker build -f docker/spark/Dockerfile -t ghcr.io/OWNER/dspy-spark:latest .
 
-FROM bitnami/spark:3.5.1
+FROM apache/spark:3.5.0.1
 
 USER root
 

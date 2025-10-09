@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: mesh-hub
+    static_configs:
+      - targets: ['mesh-hub:9100']
+  - job_name: mesh-worker
+    static_configs:
+      - targets: ['mesh-worker:9101']
+  - job_name: mesh-trainer
+    static_configs:
+      - targets: ['mesh-trainer:9102']
+  - job_name: mesh-gateway
+    static_configs:
+      - targets: ['mesh-gateway:9103']
+  - job_name: supervisor
+    static_configs:
+      - targets: ['supervisor:9091']
+    metrics_path: /metrics

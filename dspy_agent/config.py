@@ -69,7 +69,7 @@ def _parse_scales(env_key: str) -> Dict[str, Tuple[float, float]]:
 
 def get_settings() -> Settings:
     return Settings(
-        model_name=os.getenv("MODEL_NAME", "gpt-4o-mini"),
+        model_name=os.getenv("MODEL_NAME") or os.getenv("OLLAMA_MODEL") or "deepseek-coder:1.3b",
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         openai_base_url=os.getenv("OPENAI_BASE_URL"),
         use_ollama=os.getenv("USE_OLLAMA", "true").lower() in {"1", "true", "yes", "on"},

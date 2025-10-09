@@ -1432,7 +1432,13 @@ def sample_get_verifiers():
             if not keys: return 1.0
             vals = [float(result.metrics.get(k, 0.0) or 0.0) for k in keys]
             return sum(vals) / max(1, len(vals))
-    return [PassRateVerifier(), BlastRadiusVerifier(), BuildOkVerifier(), LintOkVerifier(), QualityAvgVerifier()]
+    extra = []
+    try:
+        from ..verifiers.graph_memory import get_graph_memory_verifiers as _gmv
+        extra = list(_gmv())
+    except Exception:
+        extra = []
+    return [PassRateVerifier(), BlastRadiusVerifier(), BuildOkVerifier(), LintOkVerifier(), QualityAvgVerifier(), *extra]
 
 
 def get_verifiers():

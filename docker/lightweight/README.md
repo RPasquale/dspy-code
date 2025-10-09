@@ -161,14 +161,11 @@ pip install '.[rl]'
 # Config stub
 uv run dspy-agent rl config init --out .dspy_rl.json
 
-# Bandit (epsilon-greedy)
-uv run dspy-agent rl train --workspace . --steps 300
+# Quick baseline
+uv run dspy-agent rl train --workspace . --steps 300 --n-envs 1 --skip-gepa
 
-# Neural REINFORCE (uses PufferLib vectorization if available)
-uv run dspy-agent rl train --workspace . --steps 1000 --neural --n-envs 4
-
-# PuffeRL PPO shell (example)
-uv run dspy-agent rl ppo --workspace . --n-envs 8 --total-steps 200000
+# Hybrid GEPA + PufferLib training (multi-env)
+uv run dspy-agent rl train --workspace . --steps 1000 --n-envs 4 --lr 5e-4 --entropy 0.02
 ```
 
 ## Deployment

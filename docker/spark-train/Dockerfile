@@ -1,7 +1,7 @@
 # Spark training image with PyTorch and Transformers
 # Build: docker build -f docker/spark-train/Dockerfile -t ghcr.io/OWNER/dspy-spark-train:latest .
 
-FROM bitnami/spark:3.5.1
+FROM apache/spark:3.5.0.1
 
 USER root
 

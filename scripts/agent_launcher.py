@@ -24,7 +24,7 @@ from typing import Iterable, List, Sequence
 import scripts.manage_stack as manage_stack
 
 
-DEFAULT_MODELS = ["deepseek-r1:1.5b", "qwen3:1.7b"]
+DEFAULT_MODELS = ["deepseek-coder:1.3b", "qwen3:1.7b"]
 
 
 def _compose_env(use_gpu: bool = False) -> dict[str, str]:

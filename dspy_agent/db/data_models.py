@@ -319,7 +319,10 @@ class RedDBDataManager:
         """Store signature performance metrics"""
         key = self._key("signatures", metrics.signature_name)
         self.storage.put(key, metrics.to_dict())
-        
+        # Keep registry in sync so UI queries can discover this signature without
+        # requiring an extra manual registration call.
+        self.register_signature(metrics.signature_name)
+
         # Also append to time series stream
         self.storage.append("signature_metrics", {
             "signature_name": metrics.signature_name,
@@ -362,7 +365,9 @@ class RedDBDataManager:
         """Store verifier performance metrics"""
         key = self._key("verifiers", metrics.verifier_name)
         self.storage.put(key, metrics.to_dict())
-        
+        # Automatically track verifiers in the registry for discovery in the UI.
+        self.register_verifier(metrics.verifier_name)
+
         # Append to time series
         self.storage.append("verifier_metrics", {
             "verifier_name": metrics.verifier_name,

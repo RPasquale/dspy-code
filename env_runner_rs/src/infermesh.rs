@@ -4,7 +4,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
@@ -17,21 +16,16 @@ pub struct InferMeshClient {
     api_key: Option<String>,
     model: String,
     connection_pool: Arc<Semaphore>,
-    batch_processor: Arc<Mutex<BatchProcessor>>,
+    max_concurrency: usize,
+    batch_config: Arc<Mutex<BatchConfig>>,
     metrics: Arc<Mutex<ClientMetrics>>,
 }
 
-/// Batch processor for intelligent request batching
-struct BatchProcessor {
+/// Batch tuning shared across async tasks.
+#[derive(Clone, Debug)]
+struct BatchConfig {
     batch_size: usize,
     max_wait_time: Duration,
-    pending_batches: HashMap<String, PendingBatch>,
-}
-
-/// Pending batch waiting to be processed
-struct PendingBatch {
-    texts: Vec<String>,
-    created_at: Instant,
 }
 
 /// Client performance metrics
@@ -95,15 +89,16 @@ impl InferMeshClient {
             .timeout(Duration::from_secs(config.timeout_secs))
             .pool_max_idle_per_host(config.connection_pool_size)
             .pool_idle_timeout(Duration::from_secs(90))
+            .no_proxy()
             .build()
             .context("Failed to create HTTP client")?;
 
-        let connection_pool = Arc::new(Semaphore::new(config.max_concurrent_requests));
+        let max_concurrency = config.max_concurrent_requests;
+        let connection_pool = Arc::new(Semaphore::new(max_concurrency));
 
-        let batch_processor = Arc::new(Mutex::new(BatchProcessor {
-            batch_size: config.batch_size,
-            max_wait_time: Duration::from_millis(config.max_wait_time_ms),
-            pending_batches: HashMap::new(),
+        let batch_config = Arc::new(Mutex::new(BatchConfig {
+            batch_size: config.batch_size.max(1),
+            max_wait_time: Duration::from_millis(config.max_wait_time_ms.max(1)),
         }));
 
         let metrics = Arc::new(Mutex::new(ClientMetrics {
@@ -121,7 +116,8 @@ impl InferMeshClient {
             api_key: config.api_key,
             model: config.model,
             connection_pool,
-            batch_processor,
+            max_concurrency,
+            batch_config,
             metrics,
         })
     }
@@ -147,7 +143,10 @@ impl InferMeshClient {
         }
 
         let start_time = Instant::now();
-        let result = self.process_embedding_request(texts).await;
+        let batch_config = self.batch_config_snapshot().await;
+        let result = self
+            .process_embedding_request(texts, batch_config.max_wait_time)
+            .await;
         let latency = start_time.elapsed();
 
         // Update metrics
@@ -170,7 +169,11 @@ impl InferMeshClient {
     }
 
     /// Process embedding request with optimized HTTP handling
-    async fn process_embedding_request(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    async fn process_embedding_request(
+        &self,
+        texts: Vec<String>,
+        request_deadline: Duration,
+    ) -> Result<Vec<Vec<f32>>> {
         let request = EmbedRequest {
             model: self.model.clone(),
             inputs: texts.clone(),
@@ -179,7 +182,7 @@ impl InferMeshClient {
         // Prepare HTTP request
         let mut request_builder = self
             .client
-            .post(&format!("{}/embed", self.base_url))
+            .post(format!("{}/embed", self.base_url))
             .json(&request);
 
         // Add authentication header if API key is provided
@@ -189,7 +192,7 @@ impl InferMeshClient {
         }
 
         // Execute request with timeout
-        let response = timeout(Duration::from_secs(30), request_builder.send())
+        let response = timeout(request_deadline, request_builder.send())
             .await
             .context("Request timeout")?
             .context("Failed to send request")?;
@@ -231,7 +234,8 @@ impl InferMeshClient {
         }
 
         // For very large batches, split into smaller chunks
-        let chunk_size = 512;
+        let batch_config = self.batch_config_snapshot().await;
+        let chunk_size = batch_config.batch_size;
         if texts.len() <= chunk_size {
             return self.embed(texts).await;
         }
@@ -259,21 +263,21 @@ impl InferMeshClient {
 
     /// Set batch size for optimal performance
     pub async fn set_batch_size(&self, size: usize) {
-        let mut processor = self.batch_processor.lock().await;
-        processor.batch_size = size;
+        let mut config = self.batch_config.lock().await;
+        config.batch_size = size.max(1);
     }
 
     /// Set maximum wait time for batching
     pub async fn set_max_wait_time(&self, duration: Duration) {
-        let mut processor = self.batch_processor.lock().await;
-        processor.max_wait_time = duration;
+        let mut config = self.batch_config.lock().await;
+        config.max_wait_time = duration.max(Duration::from_millis(1));
     }
 
     /// Health check for InferMesh service
     pub async fn health_check(&self) -> Result<bool> {
         let response = self
             .client
-            .get(&format!("{}/health", self.base_url))
+            .get(format!("{}/health", self.base_url))
             .send()
             .await
             .context("Failed to send health check request")?;
@@ -284,9 +288,11 @@ impl InferMeshClient {
     /// Get connection pool status
     pub fn get_connection_pool_status(&self) -> (usize, usize) {
         let available = self.connection_pool.available_permits();
-        let total =
-            self.connection_pool.available_permits() + self.connection_pool.available_permits();
-        (available, total)
+        (available, self.max_concurrency)
+    }
+
+    async fn batch_config_snapshot(&self) -> BatchConfig {
+        self.batch_config.lock().await.clone()
     }
 }
 

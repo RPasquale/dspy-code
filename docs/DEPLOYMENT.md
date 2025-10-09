@@ -89,6 +89,10 @@ uv run dspy-agent
    export OLLAMA_MODEL=qwen3:1.7b
    export OLLAMA_BASE_URL=http://localhost:11434
    ```
+
+   *Only a single Ollama model is loaded per agent process. The first model that initializes becomes the resident model. To allow a hot swap at runtime, start the process with `OLLAMA_ALLOW_SWITCH=1`; otherwise later configuration attempts reuse the existing model.*
+
+   *Max-token caps are disabled for Ollama calls; responses stream until the model chooses to stop. If you need a ceiling for a specific workflow, apply it at the caller layer (e.g., post-process the stream or use a wrapper that truncates output).*
    
    **Option B: OpenAI API**
    ```bash

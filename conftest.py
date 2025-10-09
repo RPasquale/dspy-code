@@ -556,6 +556,7 @@ _reconciler_thread: Optional[threading.Thread] = None
 def _ensure_slurm_templates() -> None:
     ddp = Path("deploy/slurm/train_ddp.sbatch")
     meth = Path("deploy/slurm/train_agent_methodologies.sbatch")
+    puffer = Path("deploy/slurm/train_puffer_rl.sbatch")
     try:
         ddp.parent.mkdir(parents=True, exist_ok=True)
         if not ddp.exists():
@@ -582,6 +583,18 @@ torchrun --nproc_per_node "${GPUS:-4}" --nnodes "${NODES:-2}" rl/training/traine
 
 # Task: ${TASK_ID} Method: ${TRAINING_METHOD}
 torchrun --nproc_per_node "${GPUS:-1}" --nnodes "${NODES:-1}" rl/training/trainer_fsdp.py
+""", encoding="utf-8")
+        if not puffer.exists():
+            puffer.write_text("""#!/bin/bash
+#SBATCH -J puffer_rl_train
+#SBATCH -N ${NODES:-1}
+#SBATCH --ntasks-per-node=${GPUS:-1}
+#SBATCH --gpus-per-node=${GPUS:-1}
+#SBATCH --cpus-per-task=${CPUS_PER_TASK:-8}
+#SBATCH --mem=${MEMORY_GB:-48}G
+#SBATCH -t ${TIME_LIMIT:-04:00:00}
+
+echo "mock slurm puffer rl job"
 """, encoding="utf-8")
     except Exception:
         pass

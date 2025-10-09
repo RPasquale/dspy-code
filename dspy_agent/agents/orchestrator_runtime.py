@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Mapping
 
@@ -9,6 +11,10 @@ from ..streaming.log_reader import load_logs, extract_key_events
 from ..code_tools.code_search import search_text, search_file as file_search, extract_context, python_extract_symbol
 from ..embedding.indexer import build_index, save_index, load_index, semantic_search
 from ..code_tools.code_snapshot import build_code_snapshot
+try:
+    from ..db.redb_router import RedDBRouter
+except Exception:  # pragma: no cover - optional fallback
+    RedDBRouter = None  # type: ignore
 
 
 class OrchestratorRuntime:
@@ -62,6 +68,36 @@ SAFE_TOOLS = {
 }
 
 
+@lru_cache(maxsize=4)
+def _load_mcts_priorities(namespace: str) -> Dict[str, float]:
+    if RedDBRouter is None:
+        return {}
+    router = RedDBRouter()
+    labels = router.st.get(f"{namespace}:graph:_node_labels") or []
+    priorities: Dict[str, float] = {}
+    for label in labels:
+        idx_key = router._k(namespace, 'collection', f'graph::node::{label}', '_ids')
+        ids = router.st.get(idx_key) or []
+        for node_id in ids:
+            rec = router.st.get(router._k(namespace, 'graph', 'node', label, node_id)) or {}
+            priority = rec.get('mcts_priority')
+            if priority is None:
+                continue
+            for key in filter(None, {rec.get('relative_path'), rec.get('path'), node_id}):
+                normalized = str(key).replace('\\', '/').lstrip('./')
+                priorities[normalized] = float(priority)
+    return priorities
+
+
+def _lookup_mcts_priority(namespace: str, path: str) -> float:
+    priorities = _load_mcts_priorities(namespace)
+    candidates = [path, path.replace('\\', '/'), path.lstrip('./'), Path(path).as_posix().lstrip('./')]
+    for candidate in candidates:
+        if candidate in priorities:
+            return priorities[candidate]
+    return 0.0
+
+
 @dataclass
 class EvalOutcome:
     score: float
@@ -109,6 +145,12 @@ def evaluate_tool_choice(
     score = 0.0
     fb = []
     targets = targets or []
+    namespace = os.getenv('DSPY_NAMESPACE', 'dspy_agent')
+
+    def mcts_bonus_for_path(path: Optional[str]) -> float:
+        if not path:
+            return 0.0
+        return _lookup_mcts_priority(namespace, path)
 
     def cov(text: str, kws: List[str]) -> Tuple[float, List[str]]:
         missing = []
@@ -167,6 +209,10 @@ def evaluate_tool_choice(
             score += 0.5 * c
             if miss:
                 fb.append("extract: Segment misses: " + ", ".join(miss))
+            priority = mcts_bonus_for_path(file)
+            if priority:
+                score += min(priority, 5.0) * 0.1
+                evidence.append(f"mcts_priority={priority:.3f}")
         else:
             fb.append("extract produced no segment. Provide --symbol (py) or --regex.")
 
@@ -181,6 +227,11 @@ def evaluate_tool_choice(
             score += 0.5 * c
             if miss:
                 fb.append("context: key events miss: " + ", ".join(miss))
+            log_target = argd.get("file") or argd.get("log")
+            priority = mcts_bonus_for_path(log_target)
+            if priority:
+                score += min(priority, 5.0) * 0.05
+                evidence.append(f"mcts_priority={priority:.3f}")
         else:
             fb.append("context produced no events. Consider codectx if logs are missing.")
 
@@ -193,6 +244,10 @@ def evaluate_tool_choice(
             score += 0.5 * c
             if miss:
                 fb.append("codectx: summary miss: " + ", ".join(miss))
+            priority = mcts_bonus_for_path(argd.get('file') or argd.get('path'))
+            if priority:
+                score += min(priority, 5.0) * 0.1
+                evidence.append(f"mcts_priority={priority:.3f}")
         else:
             fb.append("codectx empty snapshot.")
 

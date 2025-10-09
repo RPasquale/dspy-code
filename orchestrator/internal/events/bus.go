@@ -1,6 +1,7 @@
 package events
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -194,11 +195,11 @@ func (eb *EventBus) logToFile(event Event) error {
 }
 
 func (eb *EventBus) publishToRedDB(ctx context.Context, event Event) error {
-	bytes, err := json.Marshal(event)
+	data, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, eb.reddbURL+"/api/v1/events", bytes.NewReader(bytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, eb.reddbURL+"/api/v1/events", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}

@@ -49,6 +49,13 @@ class BlastRadiusVerifier:
         return 1.0 - min(result.metrics.get("blast_radius", 0.0) / 100.0, 1.0)
 ```
 
+### **Graph Memory Verifiers**
+- `graph_signal`: rewards dense neighbor coverage returned by the graph head
+- `graph_prefetch`: scores how well seed expansion added additional edges
+- `graph_mcts_alignment`: checks overlap between graph seeds and top MCTS priorities
+- `memory_precision`: measures recent retrieval precision from memory logs
+- `memory_coverage`: blends coverage depth with query cadence to avoid stale caches
+
 ### **Custom Verifiers** (from verifiers package):
 - **Code Quality Verifier**: Checks code style, complexity, documentation
 - **Test Coverage Verifier**: Measures test coverage percentage

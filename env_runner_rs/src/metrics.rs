@@ -1,9 +1,10 @@
+use crate::hardware::HardwareSnapshot;
 use crate::infermesh::InferMeshClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use warp::http::StatusCode;
@@ -114,11 +115,12 @@ impl EnvRunnerMetrics {
             total_errors,
             errors_by_class,
             uptime_seconds: self.start_time.elapsed().as_secs(),
+            hardware: None,
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MetricsStats {
     pub tasks_processed: u64,
     pub queue_depth: u64,
@@ -128,6 +130,8 @@ pub struct MetricsStats {
     pub total_errors: u64,
     pub errors_by_class: HashMap<String, u64>,
     pub uptime_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareSnapshot>,
 }
 
 impl Default for EnvRunnerMetrics {
@@ -162,15 +166,22 @@ struct ErrorResponse {
 pub struct MetricsServer {
     metrics: Arc<EnvRunnerMetrics>,
     client: Arc<InferMeshClient>,
+    hardware: Arc<RwLock<HardwareSnapshot>>,
     port: u16,
     shutdown: Arc<Notify>,
 }
 
 impl MetricsServer {
-    pub fn new(metrics: Arc<EnvRunnerMetrics>, client: Arc<InferMeshClient>, port: u16) -> Self {
+    pub fn new(
+        metrics: Arc<EnvRunnerMetrics>,
+        client: Arc<InferMeshClient>,
+        hardware: Arc<RwLock<HardwareSnapshot>>,
+        port: u16,
+    ) -> Self {
         Self {
             metrics,
             client,
+            hardware,
             port,
             shutdown: Arc::new(Notify::new()),
         }
@@ -179,6 +190,9 @@ impl MetricsServer {
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let metrics = self.metrics.clone();
         let metrics_for_prometheus = self.metrics.clone();
+        let hardware_for_metrics = self.hardware.clone();
+        let hardware_for_prometheus = self.hardware.clone();
+        let hardware_for_endpoint = self.hardware.clone();
         let client = self.client.clone();
         let shutdown = self.shutdown.clone();
 
@@ -187,12 +201,28 @@ impl MetricsServer {
             .boxed();
 
         let metrics_endpoint = warp::path("metrics")
-            .map(move || warp::reply::json(&metrics.get_stats()))
+            .map(move || {
+                let mut stats = metrics.get_stats();
+                if let Ok(snapshot) = hardware_for_metrics.read() {
+                    stats.hardware = Some(snapshot.clone());
+                }
+                warp::reply::json(&stats)
+            })
             .boxed();
 
         let prometheus = warp::path("prometheus")
             .map(move || {
                 let stats = metrics_for_prometheus.get_stats();
+                let gpu_total: u64 = hardware_for_prometheus
+                    .read()
+                    .map(|snapshot| {
+                        snapshot
+                            .accelerators
+                            .iter()
+                            .map(|acc| acc.count as u64)
+                            .sum()
+                    })
+                    .unwrap_or_default();
                 format!(
                     "# HELP env_runner_tasks_processed_total Total number of tasks processed\n\
                  # TYPE env_runner_tasks_processed_total counter\n\
@@ -220,15 +250,30 @@ impl MetricsServer {
                  \n\
                  # HELP env_runner_uptime_seconds Uptime in seconds\n\
                  # TYPE env_runner_uptime_seconds gauge\n\
-                 env_runner_uptime_seconds {}\n",
+                 env_runner_uptime_seconds {}\n\
+                 \n\
+                 # HELP env_runner_gpu_total_total Reported GPU devices\n\
+                 # TYPE env_runner_gpu_total_total gauge\n\
+                 env_runner_gpu_total_total {}\n",
                     stats.tasks_processed,
                     stats.queue_depth,
                     stats.gpu_utilization,
                     stats.latency_p95_ms as f64 / 1000.0,
                     stats.avg_duration_ms as f64 / 1000.0,
                     stats.total_errors,
-                    stats.uptime_seconds
+                    stats.uptime_seconds,
+                    gpu_total
                 )
+            })
+            .boxed();
+
+        let hardware = warp::path("hardware")
+            .map(move || {
+                let snapshot = hardware_for_endpoint
+                    .read()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or_default();
+                warp::reply::json(&snapshot)
             })
             .boxed();
 
@@ -237,6 +282,7 @@ impl MetricsServer {
             .and(warp::post())
             .and(with_client(client))
             .and(with_metrics(self.metrics.clone()))
+            .and(with_hardware(self.hardware.clone()))
             .and(warp::body::json())
             .and_then(handle_task_request)
             .boxed();
@@ -244,14 +290,18 @@ impl MetricsServer {
         let routes = health
             .or(metrics_endpoint)
             .or(prometheus)
+            .or(hardware)
             .or(tasks)
             .with(warp::log("env_runner"));
 
-        warp::serve(routes)
-            .bind_with_graceful_shutdown(([0, 0, 0, 0], self.port), async move {
+        let (_, server) = warp::serve(routes).bind_with_graceful_shutdown(
+            ([0, 0, 0, 0], self.port),
+            async move {
                 shutdown.notified().await;
-            })
-            .await;
+            },
+        );
+
+        server.await;
 
         Ok(())
     }
@@ -273,9 +323,16 @@ fn with_metrics(
     warp::any().map(move || metrics.clone())
 }
 
+fn with_hardware(
+    hardware: Arc<RwLock<HardwareSnapshot>>,
+) -> impl Filter<Extract = (Arc<RwLock<HardwareSnapshot>>,), Error = Infallible> + Clone {
+    warp::any().map(move || hardware.clone())
+}
+
 async fn handle_task_request(
     client: Arc<InferMeshClient>,
     metrics: Arc<EnvRunnerMetrics>,
+    hardware: Arc<RwLock<HardwareSnapshot>>,
     request: TaskRequest,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let inputs = match extract_inputs(&request.payload) {
@@ -304,19 +361,31 @@ async fn handle_task_request(
                 .map(|vec| vec.into_iter().map(|f| f as f64).collect())
                 .collect();
 
+            let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let hardware_snapshot = hardware.read().ok().map(|snapshot| snapshot.clone());
+            let metadata = build_workflow_metadata(
+                &request.payload,
+                latency_ms,
+                embeddings.len(),
+                hardware_snapshot,
+            );
             let response = TaskExecutionResponse {
                 id: request.id,
                 embeddings,
-                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
-                metadata: None,
+                latency_ms,
+                metadata,
             };
 
             let body = warp::reply::json(&response);
             Ok(warp::reply::with_status(body, StatusCode::OK))
         }
         Err(err) => {
-            let class = request.class.unwrap_or_else(|| "default".to_string());
-            metrics.increment_error(&class);
+            let class = request
+                .class
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let label = enrich_error_label(&request.payload, &class);
+            metrics.increment_error(&label);
             let body = warp::reply::json(&ErrorResponse {
                 error: err.to_string(),
             });
@@ -348,4 +417,65 @@ fn extract_inputs(payload: &Value) -> Result<Vec<String>, String> {
     }
 
     Ok(out)
+}
+
+fn build_workflow_metadata(
+    payload: &Value,
+    latency_ms: f64,
+    embedding_count: usize,
+    hardware: Option<HardwareSnapshot>,
+) -> Option<Value> {
+    let ctx = payload.get("workflow_context")?.clone();
+    let mut meta = serde_json::Map::new();
+    meta.insert("workflow_context".to_string(), ctx);
+    if let Some(inputs) = payload.get("inputs").and_then(|v| v.as_array()) {
+        meta.insert("input_count".to_string(), Value::from(inputs.len()));
+    }
+    meta.insert("embedding_count".to_string(), Value::from(embedding_count));
+    meta.insert("latency_ms".to_string(), Value::from(latency_ms));
+    if let Some(hw) = hardware {
+        if let Ok(value) = serde_json::to_value(hw) {
+            meta.insert("hardware".to_string(), value);
+        }
+    }
+    Some(Value::Object(meta))
+}
+
+fn enrich_error_label(payload: &Value, base: &str) -> String {
+    if let Some(ctx) = payload.get("workflow_context") {
+        if let Some(id) = ctx.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                return format!("{}::{}", base, id);
+            }
+        }
+    }
+    base.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_includes_workflow_context() {
+        let payload = json!({
+            "inputs": ["a"],
+            "workflow_context": {"id": "wf-123", "name": "demo"}
+        });
+        let hw = HardwareSnapshot::default();
+        let meta = build_workflow_metadata(&payload, 42.0, 1, Some(hw)).expect("metadata");
+        assert_eq!(meta["workflow_context"]["id"], "wf-123");
+        assert_eq!(meta["embedding_count"], 1);
+        assert!(meta.get("hardware").is_some());
+    }
+
+    #[test]
+    fn error_label_appends_workflow_id() {
+        let payload = json!({
+            "workflow_context": {"id": "wf-xyz"}
+        });
+        let label = enrich_error_label(&payload, "training");
+        assert_eq!(label, "training::wf-xyz");
+    }
 }

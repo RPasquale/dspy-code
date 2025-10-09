@@ -4,13 +4,14 @@ Comprehensive test runner for DSPy Agent
 Runs all tests including unit tests, integration tests, and end-to-end validation
 """
 
+import json
 import os
-import sys
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
-import json
 
 # Add the project root to Python path
 project_root = Path(__file__).parent.parent
@@ -21,7 +22,16 @@ class TestRunner:
         self.project_root = project_root
         self.results = {}
         self.start_time = time.time()
-        
+        self.python_bin = os.getenv("PYTHON_BIN") or shutil.which("python3") or sys.executable
+        if not self.python_bin:
+            self.python_bin = "python3"
+        self.uv_cache_dir = self.project_root / ".uv_cache"
+        self.uv_cache_dir.mkdir(exist_ok=True)
+        self.base_env = os.environ.copy()
+        self.base_env.setdefault("UV_CACHE_DIR", str(self.uv_cache_dir))
+        self.base_env.setdefault("UV_LINK_MODE", "copy")
+        self.base_env.setdefault("UV_PYTHON_BIN", self.python_bin)
+
     def run_command(self, cmd: List[str], cwd: Path = None, timeout: int = 300) -> Tuple[bool, str, str]:
         """Run a command and return success, stdout, stderr"""
         try:
@@ -30,7 +40,8 @@ class TestRunner:
                 cwd=cwd or self.project_root,
                 capture_output=True, 
                 text=True, 
-                timeout=timeout
+                timeout=timeout,
+                env=self.base_env,
             )
             return result.returncode == 0, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
@@ -79,7 +90,7 @@ class TestRunner:
         
         if not success:
             print("  Pytest failed, trying unittest...")
-            success, stdout, stderr = self.run_command(["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests", "-v"])
+            success, stdout, stderr = self.run_command(["uv", "run", self.python_bin, "-m", "unittest", "discover", "-s", "tests", "-v"])
         
         self.results["unit_tests"] = {
             "success": success,
@@ -181,7 +192,7 @@ class TestRunner:
             script_path = self.project_root / script
             if script_path.exists():
                 print(f"  Running {script}...")
-                success, stdout, stderr = self.run_command(["uv", "run", "python", str(script_path)], timeout=600)
+                success, stdout, stderr = self.run_command(["uv", "run", self.python_bin, str(script_path)], timeout=600)
                 results.append({
                     "script": script,
                     "success": success,
@@ -256,7 +267,7 @@ class TestRunner:
         
         # Run the comprehensive RL test script
         success, stdout, stderr = self.run_command(
-            ["uv", "run", "python", str(rl_test_script)],
+            ["uv", "run", self.python_bin, str(rl_test_script)],
             timeout=300
         )
         

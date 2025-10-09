@@ -113,13 +113,13 @@ def render_compose(image: str, host_ws: Path, host_logs: Optional[Path], db_back
               - REDDB_URL
               - REDDB_NAMESPACE=dspy
               - REDDB_TOKEN
-              - MODEL_NAME=${MODEL_NAME:-deepseek-coder:1.3b}
+              - MODEL_NAME=${MODEL_NAME:-qwen3:1.7b}
               - OPENAI_API_KEY=
               - OPENAI_BASE_URL=http://ollama:11434
-              - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-coder:1.3b}
+              - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:1.7b}
               - OLLAMA_API_KEY=
-              - OLLAMA_MODELS=${OLLAMA_MODELS:-deepseek-coder:1.3b,qwen3:1.7b}
-              - OLLAMA_MAX_TOKENS=${OLLAMA_MAX_TOKENS:-1024}
+              - OLLAMA_MODELS=${OLLAMA_MODELS:-qwen3:1.7b,deepseek-coder:1.3b}
+              - OLLAMA_MAX_TOKENS=${OLLAMA_MAX_TOKENS:-0}
               - OLLAMA_KEEP_ALIVE
               - OLLAMA_ALLOW_MISSING_MODEL
               - OLLAMA_TAG_TIMEOUT
@@ -150,7 +150,7 @@ def render_compose(image: str, host_ws: Path, host_logs: Optional[Path], db_back
             image: ollama/ollama:latest
             entrypoint: ["/bin/sh", "/entrypoints/run_ollama.sh"]
             environment:
-              - OLLAMA_MODELS=${OLLAMA_MODELS:-deepseek-coder:1.3b,qwen3:1.7b}
+              - OLLAMA_MODELS=${OLLAMA_MODELS:-qwen3:1.7b,deepseek-coder:1.3b}
               - OLLAMA_STARTUP_DELAY
             ports:
               - "127.0.0.1:11435:11434"

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import heapq
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Set
 
 from ..dbkit import RedDBStorage
 
@@ -171,19 +172,34 @@ class RedDBRouter:
     # Graph (nodes/edges)
     # ------------------------
     def upsert_node(self, ns: str, label: str, node: Dict[str, Any]) -> None:
+        """Insert or update a graph node while keeping registries in sync."""
+        self._register_node_label(ns, label)
         if self._native.available and self._native.upsert_node(ns, label, node):
-            self._register_node_label(ns, label)
             return
         nid = str(node.get("id") or node.get("_id") or node.get("name") or self._next_row_id(ns, f"graph::{label}"))
         rec = {**node, "id": nid, "label": label}
         self.st.put(self._k(ns, "graph", "node", label, nid), rec)
         self._index_document_id(ns, f"graph::node::{label}", nid)
 
-    def upsert_edge(self, ns: str, src: str, dst: str, label: str, props: Optional[Dict[str, Any]] = None) -> None:
-        if self._native.available and self._native.upsert_edge(ns, src, dst, label, props=props):
-            self._register_edge_label(ns, label)
+    def upsert_edge(
+        self,
+        ns: str,
+        src: str,
+        dst: str,
+        label: str,
+        props: Optional[Dict[str, Any]] = None,
+        *,
+        edge_id: Optional[str] = None,
+    ) -> None:
+        """Insert or update a graph edge.
+
+        When ``edge_id`` is provided we use it as the storage key which enables
+        deterministic upserts (critical for graph refresh jobs).
+        """
+        self._register_edge_label(ns, label)
+        if self._native.available and self._native.upsert_edge(ns, src, dst, label, props=props, edge_id=edge_id):
             return
-        eid = str(self._next_row_id(ns, f"graph::edge::{label}"))
+        eid = str(edge_id or self._next_row_id(ns, f"graph::edge::{label}"))
         rec = {"id": eid, "src": src, "dst": dst, "label": label, "props": props or {}}
         self.st.put(self._k(ns, "graph", "edge", label, eid), rec)
         self._index_document_id(ns, f"graph::edge::{label}", eid)
@@ -218,6 +234,168 @@ class RedDBRouter:
                 if node:
                     result_nodes.append(node)
         return {"node": node_id, "neighbors": result_nodes, "edges": result_edges}
+
+    def shortest_path(
+        self,
+        ns: str,
+        src: str,
+        dst: str,
+        *,
+        weight_attr: str = 'weight',
+        max_hops: int = 200,
+        max_expanded: int = 2000,
+        penalties: Optional[Dict[Tuple[str, str, str, str], float]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not src or not dst:
+            return None
+
+        edge_map: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        adjacency: Dict[str, List[Tuple[str, float, Tuple[str, str]]]] = {}
+        penalties = penalties or {}
+
+        for label in self._edge_labels(ns):
+            idx_key = self._k(ns, "collection", f"graph::edge::{label}", "_ids")
+            ids = self.st.get(idx_key) or []
+            for eid in ids:
+                rec = self.st.get(self._k(ns, "graph", "edge", label, eid)) or {}
+                src_node = rec.get('src')
+                dst_node = rec.get('dst')
+                if not src_node or not dst_node:
+                    continue
+                props = rec.get('props') or {}
+                weight = float(props.get(weight_attr) or props.get('weight') or 1.0)
+                weight = max(float(weight), 1e-6)
+                edge_map[(src_node, dst_node, label, eid)] = {
+                    'id': eid,
+                    'label': label,
+                    'src': src_node,
+                    'dst': dst_node,
+                    'props': props,
+                }
+                penalty = penalties.get((src_node, dst_node, label, eid), 0.0)
+                adjacency.setdefault(src_node, []).append((dst_node, weight + penalty, (label, eid)))
+
+        if src not in adjacency and src != dst:
+            return None
+
+        heap: List[Tuple[float, str]] = [(0.0, src)]
+        distances: Dict[str, float] = {src: 0.0}
+        previous: Dict[str, str] = {}
+        edge_taken: Dict[str, Tuple[str, str]] = {}
+        expanded = 0
+
+        while heap:
+            dist, node = heapq.heappop(heap)
+            if node == dst:
+                break
+            if dist > distances.get(node, float('inf')):
+                continue
+            if expanded >= max_expanded:
+                break
+            expanded += 1
+            for neighbor, weight, edge_info in adjacency.get(node, []):
+                new_dist = dist + weight
+                if new_dist < distances.get(neighbor, float('inf')):
+                    distances[neighbor] = new_dist
+                    previous[neighbor] = node
+                    edge_taken[neighbor] = edge_info
+                    if len(previous) > max_hops:
+                        continue
+                    heapq.heappush(heap, (new_dist, neighbor))
+
+        if dst not in distances:
+            return None
+
+        path_nodes: List[str] = []
+        path_edges: List[Dict[str, Any]] = []
+        cursor = dst
+        while True:
+            path_nodes.append(cursor)
+            if cursor == src:
+                break
+            prev_node = previous.get(cursor)
+            if prev_node is None:
+                break
+            label, eid = edge_taken.get(cursor, (None, None))
+            if label is not None and eid is not None:
+                edge_rec = edge_map.get((prev_node, cursor, label, eid))
+                if edge_rec:
+                    path_edges.append(edge_rec)
+            cursor = prev_node
+
+        path_nodes.reverse()
+        path_edges.reverse()
+
+        return {
+            'distance': distances.get(dst, 0.0),
+            'nodes': path_nodes,
+            'edges': path_edges,
+        }
+
+    def k_shortest_paths(
+        self,
+        ns: str,
+        src: str,
+        dst: str,
+        *,
+        k: int = 3,
+        weight_attr: str = 'weight',
+        penalty_increment: float = 5.0,
+        max_hops: int = 200,
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        penalties: Dict[Tuple[str, str, str, str], float] = {}
+        for _ in range(max(1, k)):
+            path = self.shortest_path(
+                ns,
+                src,
+                dst,
+                weight_attr=weight_attr,
+                max_hops=max_hops,
+                penalties=penalties,
+            )
+            if not path:
+                break
+            results.append(path)
+            for edge in path.get('edges', []) or []:
+                key = (edge.get('src'), edge.get('dst'), edge.get('label'), edge.get('id'))
+                if all(key):
+                    penalties[key] = penalties.get(key, 0.0) + penalty_increment
+        return results
+
+    def find_cycles(
+        self,
+        ns: str,
+        *,
+        start: Optional[str] = None,
+        max_length: int = 6,
+    ) -> List[List[str]]:
+        adjacency: Dict[str, List[str]] = {}
+        for label in self._edge_labels(ns):
+            idx_key = self._k(ns, "collection", f"graph::edge::{label}", "_ids")
+            ids = self.st.get(idx_key) or []
+            for edge_id in ids:
+                rec = self.st.get(self._k(ns, "graph", "edge", label, edge_id)) or {}
+                src = rec.get('src')
+                dst = rec.get('dst')
+                if src and dst:
+                    adjacency.setdefault(src, []).append(dst)
+
+        nodes = [start] if start else list(adjacency.keys())
+        cycles: List[List[str]] = []
+
+        def dfs(node: str, target: str, path: List[str], visited: Set[str]):
+            if len(path) > max_length:
+                return
+            for neighbor in adjacency.get(node, []):
+                if neighbor == target and len(path) > 1:
+                    cycles.append(path + [neighbor])
+                elif neighbor not in visited:
+                    dfs(neighbor, target, path + [neighbor], visited | {neighbor})
+
+        for node in nodes:
+            dfs(node, node, [node], {node})
+        return cycles
 
     def _edge_labels(self, ns: str) -> List[str]:
         # Track known edge labels in a registry key
@@ -293,12 +471,17 @@ class RedDBRouter:
         if kind == "graph":
             if req.node:
                 label = str(req.node.get("label") or "node")
-                self._register_node_label(ns, label)
                 self.upsert_node(ns, label, req.node)
             if req.edge:
                 lbl = str(req.edge.get("label") or "edge")
-                self._register_edge_label(ns, lbl)
-                self.upsert_edge(ns, str(req.edge.get("src")), str(req.edge.get("dst")), lbl, req.edge.get("props") or {})
+                self.upsert_edge(
+                    ns,
+                    str(req.edge.get("src")),
+                    str(req.edge.get("dst")),
+                    lbl,
+                    req.edge.get("props") or {},
+                    edge_id=req.edge.get("id"),
+                )
             return {"ok": True, "kind": "graph"}
 
         return {"ok": False, "error": f"unsupported kind: {kind}"}
@@ -339,6 +522,18 @@ class RedDBRouter:
                 k = int(nb.get("k") or 10)
                 out = self.neighbors(ns, node_id, limit=k)
                 return {"mode": "graph", "neighbors": out}
+            if "path" in g:
+                path_req = g["path"] or {}
+                src = str(path_req.get("src") or path_req.get("from") or "")
+                dst = str(path_req.get("dst") or path_req.get("to") or "")
+                if not src or not dst:
+                    return {"mode": "graph", "error": "src and dst required"}
+                weight_attr = str(path_req.get("weight_attr") or 'weight')
+                max_hops = int(path_req.get("max_hops") or 200)
+                result = self.shortest_path(ns, src, dst, weight_attr=weight_attr, max_hops=max_hops)
+                if result is None:
+                    return {"mode": "graph", "error": "no path"}
+                return {"mode": "graph", "path": result}
             return {"mode": "graph", "error": "unsupported graph query"}
 
         return {"error": f"unsupported mode: {mode}"}
@@ -465,9 +660,20 @@ class _RedBOpenAdapter:
         except Exception:
             return False
 
-    def upsert_edge(self, ns: str, src: str, dst: str, label: str, props: Optional[Dict[str, Any]] = None) -> bool:
+    def upsert_edge(
+        self,
+        ns: str,
+        src: str,
+        dst: str,
+        label: str,
+        props: Optional[Dict[str, Any]] = None,
+        *,
+        edge_id: Optional[str] = None,
+    ) -> bool:
         try:
             body = {"src": src, "dst": dst, "label": label, "props": props or {}}
+            if edge_id is not None:
+                body["id"] = edge_id
             self.storage._http_post(f"/api/graph/{ns}/edges", body)
             return True
         except Exception:

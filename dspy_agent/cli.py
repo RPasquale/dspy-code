@@ -210,18 +210,12 @@ from .rl.rlkit import (
     EnvConfig,
     RewardConfig,
     aggregate_reward,
-    ToolchainConfig,
     ToolchainExecutor,
     ToolAction,
     detect_toolchain,
     load_from_module,
     get_verifiers as _rl_default_verifiers,
     make_bandit as _rl_make_bandit,
-    TrainerConfig as _RLTrainerConfig,
-    bandit_trainer as _rl_bandit_trainer,
-    bandit_trainer_puffer as _rl_bandit_trainer_puffer,
-    train_puffer_policy as _rl_train_puffer_policy,
-    run_puffer_ppo as _rl_run_puffer_ppo,
     RLConfig as _RLConfig,
     load_rl_config as _load_rl_config,
 )
@@ -242,74 +236,6 @@ rl_app.add_typer(prefs_app, name="prefs")
 config_app = typer.Typer(no_args_is_help=True, help="Agent config helpers (routing, embeddings)")
 stack_app = typer.Typer(no_args_is_help=True, help="Docker stack helper commands")
 feedback_app = typer.Typer(no_args_is_help=True, help="Capture feedback and scaffold tests")
-
-
-@rl_app.command("quick-train")
-def rl_quick_train(
-    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, dir_okay=True, help="Workspace directory"),
-    signature: str = typer.Option("CodeContextSig", "--signature", help="Signature name for labeling analytics"),
-    verifiers: str = typer.Option("dspy_agent.verifiers.custom", "--verifiers", help="Module path exporting get_verifiers()"),
-    steps: int = typer.Option(200, "--steps", help="Number of steps"),
-    n_envs: int = typer.Option(1, "--n-envs", help="Parallel envs"),
-    policy: str = typer.Option("epsilon-greedy", "--policy", help="Bandit policy"),
-    environment: str = typer.Option("development", "--env", help="Environment label for analytics"),
-):
-    """Run a quick RL bandit training loop and persist analytics."""
-    try:
-        import importlib
-        mod = importlib.import_module(verifiers)
-        if not hasattr(mod, 'get_verifiers'):
-            console.print(Panel(f"Module {verifiers} missing get_verifiers()", title="rl quick-train", border_style="red"))
-            raise typer.Exit(1)
-        vlist = list(mod.get_verifiers())
-    except Exception as e:
-        console.print(Panel(escape(str(e)), title="verifiers load failed", border_style="red"))
-        raise typer.Exit(1)
-
-    weights = {getattr(v, 'kind', f'v{i}'): 1.0 for i, v in enumerate(vlist)}
-    rc = RewardConfig(weights=weights)
-
-    def reward_fn(result, vlist, wmap):
-        return aggregate_reward(result, vlist, rc)
-
-    tcfg = detect_toolchain(workspace)
-    execu = ToolchainExecutor(tcfg)
-
-    def executor(tool, args) -> Any:
-        return execu(tool, args)
-
-    env_cfg = EnvConfig(
-        verifiers=vlist,
-        reward_fn=reward_fn,
-        weights=weights,
-        context_provider=None,
-        action_args=None,
-        allowed_actions=None,
-    )
-
-    def make_env() -> RLToolEnv:
-        env = RLToolEnv(executor, env_cfg, episode_len=1)
-        try:
-            env.set_signature_name(signature)
-        except Exception:
-            pass
-        return env
-
-    # Import here to avoid issues if top-level import is optimized out in some environments
-    try:
-        from .rl.rlkit import make_default_analytics_cb as _mk_cb  # type: ignore
-        cb = _mk_cb(signature, env=environment)
-    except Exception:
-        # Fallback to previously imported symbol if present
-        cb = make_default_analytics_cb(signature, env=environment)  # type: ignore[name-defined]
-    cfg = _RLTrainerConfig(steps=int(steps), policy=policy, policy_kwargs={}, n_envs=max(1, int(n_envs)))
-    res = bandit_trainer(make_env, cfg, analytics_cb=cb)
-    # Summarize
-    try:
-        avg = sum(res.rewards) / len(res.rewards) if getattr(res, 'rewards', None) else 0.0
-        console.print(Panel.fit(f"steps={steps} avg_reward={avg:.3f}", title="rl quick-train", border_style="green"))
-    except Exception:
-        pass
 
 
 @rl_app.command("report")
@@ -431,6 +357,11 @@ def _rl_build_make_env(
     base_weights.setdefault('retrieval_avg_score', 0.1)
     base_weights.setdefault('retrieval_query_count', 0.05)
     base_weights.setdefault('quality_policy', 0.3)
+    base_weights.setdefault('graph_signal', 0.8)
+    base_weights.setdefault('graph_prefetch', 0.4)
+    base_weights.setdefault('graph_mcts_alignment', 1.0)
+    base_weights.setdefault('memory_precision', 0.5)
+    base_weights.setdefault('memory_coverage', 0.35)
     if isinstance(settings, dict):
         extra_weights = settings.get('reward_weights')
         if isinstance(extra_weights, dict):
@@ -1413,39 +1344,42 @@ def feedback_scaffold_quality(
 @rl_app.command("train")
 def rl_train(
     workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
-    steps: int = typer.Option(200, '--steps', help="Number of training steps"),
+    steps: int = typer.Option(500, '--steps', help="Number of training steps"),
     n_envs: int = typer.Option(2, '--n-envs', help="Parallel environments"),
-    policy: str = typer.Option("epsilon-greedy", '--policy', help="Bandit policy: epsilon-greedy|ucb1|thompson"),
-    epsilon: float = typer.Option(0.1, '--epsilon', help="Epsilon for epsilon-greedy"),
-    ucb_c: float = typer.Option(2.0, '--ucb-c', help="UCB1 exploration constant"),
-    neural: bool = typer.Option(False, '--neural/--no-neural', help="Use neural REINFORCE trainer"),
-    vector_path: Optional[Path] = typer.Option(None, '--vector-path', help="Attach vector feeder context from this embeddings dir (e.g., /workspace/vectorized/embeddings_imesh)"),
-    puffer: bool = typer.Option(False, '--puffer/--no-puffer', help="Use PufferLib vectorization (bandits only)"),
-    rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Path to RL config JSON"),
-    verifiers_module: Optional[str] = typer.Option(None, '--verifiers-module', help="Override verifiers module"),
-    test_cmd: Optional[str] = typer.Option(None, '--test-cmd', help="Override test command"),
-    lint_cmd: Optional[str] = typer.Option(None, '--lint-cmd', help="Override lint command"),
-    build_cmd: Optional[str] = typer.Option(None, '--build-cmd', help="Override build command"),
-    timeout_sec: Optional[int] = typer.Option(None, '--timeout-sec', help="Per-tool timeout in seconds"),
+    lr: float = typer.Option(1e-3, '--lr', help="Learning rate"),
+    entropy_coef: float = typer.Option(0.01, '--entropy', help="Entropy regularization coefficient"),
+    replay_capacity: int = typer.Option(2048, '--replay-capacity', help="On-policy replay capacity"),
+    replay_batch: int = typer.Option(128, '--replay-batch', help="Replay batch size"),
+    grad_clip: float = typer.Option(1.0, '--grad-clip', help="Gradient clipping norm"),
+    checkpoint_dir: Optional[Path] = typer.Option(None, '--checkpoint-dir', help="Checkpoint directory"),
+    checkpoint_interval: int = typer.Option(0, '--checkpoint-interval', help="Checkpoint interval (steps, 0=off)"),
+    early_stop_patience: int = typer.Option(0, '--early-stop', help="Early stop patience (0=off)"),
+    log_interval: int = typer.Option(10, '--log-interval', min=1, help="Steps between console log lines"),
+    echo_actions: bool = typer.Option(False, '--echo-actions/--no-echo-actions', help="Print each environment action detail"),
+    log_jsonl: Optional[Path] = typer.Option(None, '--log-jsonl', help="Write per-step JSON logs to this file"),
+    skip_gepa: bool = typer.Option(False, '--skip-gepa', help="Skip GEPA signature training before RL"),
+    gepa_module: List[str] = typer.Option([], '--gepa-module', help="GEPA module to train before RL (repeatable, default: context, task, code)"),
 ):
-    """Delegate to trainers module to avoid duplication."""
+    """Run hybrid GEPA + PufferLib RL training."""
     from .cli_rl_trainers import train as _train  # local import to avoid circular init
+
     _train(
         workspace=workspace,
         steps=steps,
         n_envs=n_envs,
-        policy=policy,
-        epsilon=epsilon,
-        ucb_c=ucb_c,
-        neural=neural,
-        vector_path=vector_path,
-        puffer=puffer,
-        rl_config=rl_config,
-        verifiers_module=verifiers_module,
-        test_cmd=test_cmd,
-        lint_cmd=lint_cmd,
-        build_cmd=build_cmd,
-        timeout_sec=timeout_sec,
+        lr=lr,
+        entropy_coef=entropy_coef,
+        replay_capacity=replay_capacity,
+        replay_batch=replay_batch,
+        grad_clip=grad_clip,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_interval=checkpoint_interval,
+        early_stop_patience=early_stop_patience,
+        log_interval=log_interval,
+        echo_actions=echo_actions,
+        log_jsonl=log_jsonl,
+        skip_gepa=skip_gepa,
+        gepa_module=gepa_module,
     )
 
 
@@ -1563,86 +1497,6 @@ def rl_sweep_command(
             console.print(Panel(escape(str(e)), title="config update failed", border_style="yellow"))
 
     console.print(Panel.fit("Tip: run 'dspy-agent rl guide' for recommended temperature/entropy targets and curriculum stages.", title="next", border_style="dim"))
-
-
-@rl_app.command("async-train")
-def rl_async_train(
-    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
-    steps: int = typer.Option(200, '--steps', help="Rough number of learner updates to run"),
-    rollout_workers: int = typer.Option(2, '--rollout-workers', help="Concurrent action selectors"),
-    judge_workers: int = typer.Option(2, '--judge-workers', help="Concurrent tool executors"),
-    policy: str = typer.Option("epsilon-greedy", '--policy', help="Bandit policy"),
-    epsilon: float = typer.Option(0.1, '--epsilon', help="Epsilon for epsilon-greedy"),
-    ucb_c: float = typer.Option(2.0, '--ucb-c', help="Exploration constant for UCB"),
-    rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Optional RL config JSON"),
-    wall_clock: float = typer.Option(120.0, '--wall-clock', help="Seconds to run before stopping"),
-):
-    """Delegate to trainers module to avoid duplication."""
-    from .cli_rl_trainers import async_train as _async_train  # local import
-    _async_train(
-        workspace=workspace,
-        steps=steps,
-        rollout_workers=rollout_workers,
-        judge_workers=judge_workers,
-        policy=policy,
-        epsilon=epsilon,
-        ucb_c=ucb_c,
-        rl_config=rl_config,
-        wall_clock=wall_clock,
-    )
-
-
-@rl_app.command("ppo")
-def rl_ppo(
-    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
-    rl_config: Optional[Path] = typer.Option(None, '--rl-config', exists=True, help="Path to RL config JSON"),
-    n_envs: int = typer.Option(4, '--n-envs', help="Vectorized environments"),
-    total_steps: int = typer.Option(100_000, '--total-steps', help="Total PPO steps"),
-):
-    """Delegate to trainers module to avoid duplication."""
-    from .cli_rl_trainers import ppo as _ppo  # local import
-    _ppo(workspace=workspace, rl_config=rl_config, n_envs=n_envs, total_steps=total_steps)
-
-
-@rl_app.command("neural")
-def rl_neural(
-    workspace: Path = typer.Option(Path.cwd(), '--workspace', dir_okay=True, exists=True, help="Workspace root"),
-    steps: int = typer.Option(500, '--steps', help="Number of training steps"),
-    n_envs: int = typer.Option(2, '--n-envs', help="Parallel environments"),
-    lr: float = typer.Option(1e-3, '--lr', help="Learning rate"),
-    entropy_coef: float = typer.Option(0.01, '--entropy', help="Entropy regularization coefficient"),
-    replay_capacity: int = typer.Option(2048, '--replay-capacity', help="On-policy replay capacity"),
-    replay_batch: int = typer.Option(128, '--replay-batch', help="Replay batch size"),
-    grad_clip: float = typer.Option(1.0, '--grad-clip', help="Gradient clipping norm"),
-    checkpoint_dir: Optional[Path] = typer.Option(None, '--checkpoint-dir', help="Checkpoint directory"),
-    checkpoint_interval: int = typer.Option(0, '--checkpoint-interval', help="Checkpoint interval (steps, 0=off)"),
-    early_stop_patience: int = typer.Option(0, '--early-stop', help="Early stop patience (0=off)"),
-    log_interval: int = typer.Option(10, '--log-interval', min=1, help="Steps between console log lines"),
-    echo_actions: bool = typer.Option(False, '--echo-actions/--no-echo-actions', help="Print each environment action detail"),
-    log_jsonl: Optional[Path] = typer.Option(None, '--log-jsonl', help="Write per-step JSON logs to this file"),
-    skip_gepa: bool = typer.Option(False, '--skip-gepa', help="Skip GEPA signature training before RL"),
-    gepa_module: List[str] = typer.Option([], '--gepa-module', help="GEPA module to train before RL (repeatable, default: context, task, code)"),
-):
-    """Delegate to trainers module to avoid duplication."""
-    from .cli_rl_trainers import neural as _neural  # local import
-    _neural(
-        workspace=workspace,
-        steps=steps,
-        n_envs=n_envs,
-        lr=lr,
-        entropy_coef=entropy_coef,
-        replay_capacity=replay_capacity,
-        replay_batch=replay_batch,
-        grad_clip=grad_clip,
-        checkpoint_dir=checkpoint_dir,
-        checkpoint_interval=checkpoint_interval,
-        early_stop_patience=early_stop_patience,
-        log_interval=log_interval,
-        echo_actions=echo_actions,
-        log_jsonl=log_jsonl,
-        skip_gepa=skip_gepa,
-        gepa_module=gepa_module,
-    )
 
 
 # -----------------------------

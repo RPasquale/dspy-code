@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.22 AS build
+
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . ./
+
+WORKDIR /workspace/cmd/stream_supervisor
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/stream_supervisor
+
+FROM gcr.io/distroless/base-debian12:nonroot
+COPY --from=build /out/stream_supervisor /usr/local/bin/stream_supervisor
+ENTRYPOINT ["/usr/local/bin/stream_supervisor"]

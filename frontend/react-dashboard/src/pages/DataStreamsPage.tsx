@@ -109,9 +109,9 @@ const DataStreamsPage = () => {
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3">
-        <h1 className="text-3xl font-semibold text-white">Data Streams Observatory</h1>
+        <h1 className="text-3xl font-semibold text-white">Data Sources</h1>
         <p className="text-sm text-slate-300 max-w-3xl">
-          Inspect live pipelines, follower queues, and message bus health. Stream, search, and export RedDB-backed records in real time.
+          Monitor what your agent is learning from, data quality, and training progress. See the information sources that are improving your AI's performance.
         </p>
       </div>
 
@@ -199,24 +199,24 @@ function buildSummaryCards(stream?: StreamMetricsResponse, bus?: BusMetricsRespo
   const network = stream?.current_metrics.network_io;
   return [
     {
-      label: 'Kafka throughput',
-      value: kafka ? `${formatNumber(kafka.messages_per_second)} msg/s` : '—',
-      detail: kafka ? `${formatBytes(kafka.bytes_per_second)}/s · prod ${formatNumber(kafka.producer_rate)} / cons ${formatNumber(kafka.consumer_rate)}` : undefined
+      label: 'Learning Data Rate',
+      value: kafka ? `${formatNumber(kafka.messages_per_second)} events/s` : '—',
+      detail: kafka ? `Processing ${formatBytes(kafka.bytes_per_second)}/s of training data` : undefined
     },
     {
-      label: 'Pipeline rates',
-      value: pipe ? `${formatNumber(pipe.output_rate)} out/s` : '—',
-      detail: pipe ? `${formatNumber(pipe.input_rate)} in/s · errors ${formatNumber(pipe.error_rate)}` : undefined
+      label: 'Training Progress',
+      value: pipe ? `${formatNumber(pipe.output_rate)} processed/s` : '—',
+      detail: pipe ? `${formatNumber(pipe.input_rate)} new examples/s · ${formatNumber(pipe.error_rate)} issues` : undefined
     },
     {
-      label: 'Spark latency',
+      label: 'Processing Speed',
       value: spark ? `${spark.processing_time.toFixed(2)}s` : '—',
-      detail: spark ? `Delay ${spark.total_delay.toFixed(2)}s · Batch ${spark.records_per_batch}` : undefined
+      detail: spark ? `Processing ${spark.records_per_batch} examples per batch` : undefined
     },
     {
-      label: 'Active connections',
-      value: network ? `${formatNumber(network.connections_active)}` : '—',
-      detail: network ? `${formatBytes(network.bytes_in_per_sec)}/s in · ${formatBytes(network.bytes_out_per_sec)}/s out` : undefined
+      label: 'Data Sources',
+      value: network ? `${formatNumber(network.connections_active)} active` : '—',
+      detail: network ? `Receiving ${formatBytes(network.bytes_in_per_sec)}/s of new data` : undefined
     }
   ];
 }

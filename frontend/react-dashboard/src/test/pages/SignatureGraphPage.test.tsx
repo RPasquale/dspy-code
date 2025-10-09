@@ -13,6 +13,31 @@ const graphPayload = {
   edges_sig_sig: [ { a: 'SigA', b: 'SigB', count: 2 } ]
 }
 
+const snapshotPayload = {
+  namespace: 'default',
+  snapshots: [
+    { timestamp: 1000, nodes: {}, edges: [] },
+    { timestamp: 2000, nodes: {}, edges: [] }
+  ]
+}
+
+const diffPayload = {
+  namespace: 'default',
+  a: '1000',
+  b: '2000',
+  nodes_added: ['src/new.py'],
+  nodes_removed: [],
+  edges_added: ['src/main.py->src/new.py'],
+  edges_removed: []
+}
+
+const mctsPayload = {
+  namespace: 'default',
+  nodes: [
+    { id: 'src/main.py', label: 'code_file', priority: 1.23, language: 'python', owner: 'alice' }
+  ]
+}
+
 const createWrapper = () => {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }}})
   return ({ children }: { children: React.ReactNode }) => (
@@ -32,6 +57,18 @@ describe('SignatureGraphPage', () => {
       if (url.includes('/api/signature/graph')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve(graphPayload) })
       }
+      if (url.includes('/api/graph/snapshots')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(snapshotPayload) })
+      }
+      if (url.includes('/api/graph/diff')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(diffPayload) })
+      }
+      if (url.includes('/api/graph/mcts-top')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(mctsPayload) })
+      }
+      if (url.includes('/api/graph/patterns')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ namespace: 'default', mode: 'mixed-language', nodes: ['src/main.py'] }) })
+      }
       return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) })
     })
   })
@@ -39,6 +76,8 @@ describe('SignatureGraphPage', () => {
   it('renders controls and loads graph', async () => {
     render(<SignatureGraphPage />, { wrapper: createWrapper() })
     expect(screen.getByText('Signature Graph')).toBeInTheDocument()
+    expect(screen.getByText('Graph Snapshot Diff')).toBeInTheDocument()
+    expect(screen.getByText('Top MCTS Priorities')).toBeInTheDocument()
     expect(screen.getByText('Timeframe')).toBeInTheDocument()
     expect(screen.getByText('Env')).toBeInTheDocument()
     expect(screen.getByText('Export JSON')).toBeInTheDocument()
@@ -51,4 +90,3 @@ describe('SignatureGraphPage', () => {
     })
   })
 })
-

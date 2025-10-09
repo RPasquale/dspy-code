@@ -1,17 +1,20 @@
-use chrono;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod hardware;
 pub mod infermesh;
 pub mod metrics;
 pub mod notify_watcher;
+pub mod pb;
+pub mod streaming;
 
 use crate::metrics::EnvRunnerMetrics;
 
@@ -20,6 +23,24 @@ pub enum WorkloadClass {
     CpuShort,
     CpuLong,
     Gpu,
+}
+
+impl WorkloadClass {
+    pub fn from_label(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "gpu" | "gpu_slurm" => WorkloadClass::Gpu,
+            "cpu_long" => WorkloadClass::CpuLong,
+            _ => WorkloadClass::CpuShort,
+        }
+    }
+}
+
+impl FromStr for WorkloadClass {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(WorkloadClass::from_label(s))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +123,11 @@ impl PrefetchQueue {
     pub fn len(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.q_cpu_short.len() + inner.q_cpu_long.len() + inner.q_gpu.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.q_cpu_short.is_empty() && inner.q_cpu_long.is_empty() && inner.q_gpu.is_empty()
     }
 }
 

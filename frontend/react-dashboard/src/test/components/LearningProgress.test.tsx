@@ -1,110 +1,79 @@
 import { render, screen } from '@testing-library/react'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import LearningProgress from '@/components/LearningProgress'
+import { LearningMetrics } from '@/hooks/useAgentMonitoring'
 
-// Mock the CSS module
-vi.mock('@/components/LearningProgress.module.css', () => ({
-  container: 'container',
-  progressBar: 'progressBar',
-  progressFill: 'progressFill',
-  metrics: 'metrics',
-  metric: 'metric',
-  label: 'label',
-  value: 'value'
-}))
-
-// Mock Chart.js components
 vi.mock('react-chartjs-2', () => ({
-  Line: vi.fn(() => <div data-testid="learning-chart">Learning Chart</div>)
+  Line: () => <div data-testid="learning-chart" />
 }))
 
 describe('LearningProgress', () => {
-  const mockProps = {
-    episodes: 1000,
-    avgReward: 0.75,
-    successRate: 0.68,
-    recentRewards: [0.8, 0.7, 0.9, 0.6, 0.85],
-    explorationRate: 0.1,
-    learningRate: 0.001
+  const metrics: LearningMetrics = {
+    training_sessions: 8,
+    learning_progress: {},
+    learning_trends: {
+      training_accuracy: { current: 0.82, trend: 'improving' },
+      validation_accuracy: { current: 0.74, trend: 'stable' },
+      loss: { current: 0.1234, trend: 'declining' }
+    },
+    active_signatures: 3,
+    signature_performance: {
+      CodeExplain: {
+        active: true,
+        performance_score: 92.3,
+        success_rate: 88.5,
+        avg_response_time: 1.21
+      },
+      TestBench: {
+        active: false,
+        performance_score: 70.1,
+        success_rate: 64.2,
+        avg_response_time: 2.54
+      }
+    },
+    retrieval_statistics: {
+      total_events: 120,
+      avg_score: 0.731,
+      avg_hits_per_query: 4.5,
+      unique_queries: 28
+    }
   }
 
-  beforeEach(() => {
-    vi.clearAllMocks()
-  })
+  it('renders advanced learning metrics', () => {
+    render(<LearningProgress metrics={metrics} />)
 
-  it('renders learning metrics correctly', () => {
-    render(<LearningProgress {...mockProps} />)
-    
     expect(screen.getByText('Learning Progress')).toBeInTheDocument()
-    expect(screen.getByText('1000')).toBeInTheDocument() // episodes
-    expect(screen.getByText('75%')).toBeInTheDocument() // avg reward as percentage
-    expect(screen.getByText('68%')).toBeInTheDocument() // success rate
+    expect(screen.getByText('8 sessions')).toBeInTheDocument()
+    expect(screen.getByText('82.0%')).toBeInTheDocument()
+    expect(screen.getByText('74.0%')).toBeInTheDocument()
+    expect(screen.getByText('0.1234')).toBeInTheDocument()
+    expect(screen.getByText('Active Signatures')).toBeInTheDocument()
+    expect(screen.getByText('3')).toBeInTheDocument()
   })
 
-  it('displays progress bar with correct percentage', () => {
-    render(<LearningProgress {...mockProps} />)
-    
-    const progressBar = screen.getByRole('progressbar')
-    expect(progressBar).toHaveAttribute('aria-valuenow', '75')
-    expect(progressBar).toHaveAttribute('aria-valuemax', '100')
+  it('renders signature performance cards', () => {
+    render(<LearningProgress metrics={metrics} />)
+
+    expect(screen.getByText('CodeExplain')).toBeInTheDocument()
+    expect(screen.getByText('92.3%')).toBeInTheDocument()
+    expect(screen.getByText('Active')).toBeInTheDocument()
+    expect(screen.getByText('88.5%')).toBeInTheDocument()
+    expect(screen.getByText('1.21s')).toBeInTheDocument()
   })
 
-  it('renders learning chart', () => {
-    render(<LearningProgress {...mockProps} />)
-    
-    expect(screen.getByTestId('learning-chart')).toBeInTheDocument()
+  it('renders retrieval statistics', () => {
+    render(<LearningProgress metrics={metrics} />)
+
+    expect(screen.getByText('Retrieval Statistics')).toBeInTheDocument()
+    expect(screen.getByText('120')).toBeInTheDocument()
+    expect(screen.getByText('0.731')).toBeInTheDocument()
+    expect(screen.getByText('4.5')).toBeInTheDocument()
+    expect(screen.getByText('28')).toBeInTheDocument()
   })
 
-  it('formats percentages correctly', () => {
-    const { rerender } = render(<LearningProgress {...mockProps} />)
-    
-    // Test with different values
-    rerender(<LearningProgress {...mockProps} avgReward={0.5} successRate={0.3} />)
-    expect(screen.getByText('50%')).toBeInTheDocument()
-    expect(screen.getByText('30%')).toBeInTheDocument()
-  })
+  it('renders fallback when metrics missing', () => {
+    render(<LearningProgress metrics={{ ...metrics, training_sessions: 0 }} />)
 
-  it('handles edge cases for metrics', () => {
-    const edgeCaseProps = {
-      ...mockProps,
-      episodes: 0,
-      avgReward: 0,
-      successRate: 0,
-      recentRewards: []
-    }
-    
-    render(<LearningProgress {...edgeCaseProps} />)
-    
-    expect(screen.getByText('0')).toBeInTheDocument() // episodes
-    expect(screen.getByText('0%')).toBeInTheDocument() // avg reward
-    expect(screen.getByText('0%')).toBeInTheDocument() // success rate
-  })
-
-  it('displays exploration and learning rates', () => {
-    render(<LearningProgress {...mockProps} />)
-    
-    expect(screen.getByText('Exploration Rate')).toBeInTheDocument()
-    expect(screen.getByText('Learning Rate')).toBeInTheDocument()
-    expect(screen.getByText('10%')).toBeInTheDocument() // exploration rate
-    expect(screen.getByText('0.1%')).toBeInTheDocument() // learning rate
-  })
-
-  it('handles missing recent rewards gracefully', () => {
-    const propsWithoutRewards = {
-      ...mockProps,
-      recentRewards: undefined as any
-    }
-    
-    render(<LearningProgress {...propsWithoutRewards} />)
-    
-    expect(screen.getByText('Learning Progress')).toBeInTheDocument()
-    expect(screen.getByTestId('learning-chart')).toBeInTheDocument()
-  })
-
-  it('applies correct CSS classes', () => {
-    render(<LearningProgress {...mockProps} />)
-    
-    const container = screen.getByText('Learning Progress').closest('div')
-    expect(container).toHaveClass('container')
+    expect(screen.getByText('No learning metrics available')).toBeInTheDocument()
   })
 })

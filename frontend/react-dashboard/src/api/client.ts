@@ -19,7 +19,18 @@ import type {
   UpdateConfigResponse,
   OptimizeSignatureRequest,
   OptimizeSignatureResponse,
-  OverviewResponse
+  OverviewResponse,
+  GraphSnapshotsResponse,
+  GraphDiffResponse,
+  GraphMctsTopResponse,
+  GraphPatternsResponse,
+  GraphMemoryReportResponse,
+  WorkflowDefinition,
+  WorkflowListResponse,
+  WorkflowSummary,
+  WorkflowRunListResponse,
+  WorkflowRunRecord,
+  RunnerHardwareSnapshot
 } from './types';
 
 const computeDefaultBaseUrl = () => {
@@ -392,6 +403,21 @@ export const api = {
     }),
   getActionsAnalytics: async (limit = 500, timeframe: string = '24h') =>
     normalizeActionsAnalytics(await apiRequest<any>(`/api/actions-analytics?limit=${limit}&timeframe=${encodeURIComponent(timeframe)}`).catch(() => ({}))),
+  getGraphSnapshots: async (limit = 10) =>
+    apiRequest<GraphSnapshotsResponse>(`/api/graph/snapshots?limit=${limit}`),
+  getGraphDiff: async (a: string | number, b: string | number) =>
+    apiRequest<GraphDiffResponse>(`/api/graph/diff?a=${encodeURIComponent(String(a))}&b=${encodeURIComponent(String(b))}`),
+  getGraphPatterns: async (mode: 'cycles' | 'mixed-language', opts?: { start?: string; maxLength?: number }) => {
+    const params = new URLSearchParams();
+    params.set('mode', mode);
+    if (opts?.start) params.set('start', opts.start);
+    if (opts?.maxLength) params.set('max_length', String(opts.maxLength));
+    return apiRequest<GraphPatternsResponse>(`/api/graph/patterns?${params.toString()}`);
+  },
+  getGraphMctsTop: async (limit = 10) =>
+    apiRequest<GraphMctsTopResponse>(`/api/graph/mcts-top?limit=${limit}`),
+  getGraphMemoryReport: async (query = 'graph memory review', limit = 8) =>
+    apiRequest<GraphMemoryReportResponse>(`/api/graph/memory-report?query=${encodeURIComponent(query)}&limit=${limit}`),
   updateConfig: (payload: UpdateConfigRequest) =>
     apiRequest<UpdateConfigResponse>('/api/config', {
       method: 'POST',
@@ -491,6 +517,33 @@ export const api = {
   startGrpo: (payload: { dataset_path: string; model_name?: string; reference_model_name?: string; device?: string; batch_groups?: number; lr?: number; max_steps?: number; log_interval?: number; ckpt_interval?: number; adv_clip?: number; kl_coeff?: number }) =>
     apiRequest<{ ok: boolean; error?: string }>('/api/grpo/start', { method: 'POST', body: JSON.stringify(payload) }),
   stopGrpo: () => apiRequest<{ ok: boolean; error?: string }>('/api/grpo/stop', { method: 'POST' }),
+  listWorkflows: async () => {
+    try {
+      const res = await apiRequest<WorkflowListResponse>('/workflows');
+      return Array.isArray(res?.items) ? res.items : [];
+    } catch {
+      return [] as WorkflowSummary[];
+    }
+  },
+  getWorkflow: (id: string) => apiRequest<WorkflowDefinition>(`/workflows/${encodeURIComponent(id)}`),
+  getWorkflowRuns: async (workflowId: string, limit = 25) => {
+    if (!workflowId) return [] as WorkflowRunRecord[];
+    const res = await apiRequest<WorkflowRunListResponse>(
+      `/workflows/${encodeURIComponent(workflowId)}/runs${limit ? `?limit=${limit}` : ''}`
+    );
+    return Array.isArray(res?.items) ? res.items : [];
+  },
+  getWorkflowRun: (runId: string) => apiRequest<WorkflowRunRecord>(`/workflow-runs/${encodeURIComponent(runId)}`),
+  getRunnerHardware: () => apiRequest<RunnerHardwareSnapshot>('/hardware'),
+  saveWorkflow: (workflow: WorkflowDefinition) => {
+    const hasId = Boolean(workflow.id);
+    const path = hasId ? `/workflows/${encodeURIComponent(String(workflow.id))}` : '/workflows';
+    const method = hasId ? 'PUT' : 'POST';
+    return apiRequest<WorkflowDefinition>(path, {
+      method,
+      body: JSON.stringify(workflow)
+    });
+  },
   // Auto mode
   getGrpoAutoStatus: async () => {
     try {

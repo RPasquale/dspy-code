@@ -79,33 +79,79 @@ def ensure_stack_env(verbose: bool = True) -> None:
     """Ensure docker/lightweight/.env exists (mirrors `make stack-env`)."""
     uid, gid = _host_ids()
 
+    def _ensure(content: str, key: str, value: str) -> tuple[str, bool]:
+        if f"{key}=" in content:
+            return content, False
+        return content + f"{key}={value}\n", True
+
     if STACK_ENV.exists():
         content = STACK_ENV.read_text(encoding="utf-8")
         changed = False
-        if "DSPY_UID=" not in content:
-            content += f"DSPY_UID={uid}\n"
-            changed = True
-        if "DSPY_GID=" not in content:
-            content += f"DSPY_GID={gid}\n"
-            changed = True
+        for key, value in (
+            ("DSPY_UID", uid),
+            ("DSPY_GID", gid),
+            ("MODEL_NAME", os.getenv("MODEL_NAME", "deepseek-coder:1.3b")),
+            ("OLLAMA_MODEL", os.getenv("OLLAMA_MODEL", "deepseek-coder:1.3b")),
+            ("OLLAMA_MODELS", os.getenv("OLLAMA_MODELS", "deepseek-coder:1.3b,qwen3:1.7b")),
+            ("GEPA_MODEL", os.getenv("GEPA_MODEL", "qwen3:1.7b")),
+            ("MESH_GRPC_ENDPOINT", "http://mesh-hub:50051"),
+            ("MESH_WORKER_ENDPOINT", "http://mesh-worker:50052"),
+            ("MESH_NODE_ID", "9002"),
+            ("MESH_HUB_NODE_ID", "9001"),
+            ("MESH_TRAINER_NODE_ID", "9003"),
+            ("MESH_GATEWAY_NODE_ID", "9010"),
+            ("MESH_GATEWAY_DOMAIN", "edge"),
+            ("MESH_DOMAIN", "default"),
+            ("MESH_DOMAIN_ID", "1"),
+            ("MESH_SERVICES_FILE", "/etc/dspy/mesh-services.json"),
+            ("MESH_LISTEN_ADDR", "0.0.0.0:7000"),
+            ("MESH_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            ("MESH_METRICS_ADDR", "0.0.0.0:9100"),
+            ("MESH_EXTRA_ARGS", ""),
+        ):
+            content, did_change = _ensure(content, key, value)
+            changed = changed or did_change
         if changed:
             STACK_ENV.write_text(content, encoding="utf-8")
             if verbose:
-                print(f"[manage-stack] updated {STACK_ENV.relative_to(ROOT)} with host UID/GID")
+                print(f"[manage-stack] updated {STACK_ENV.relative_to(ROOT)} with mesh/UID defaults")
         return
 
     WORKSPACE_DIR = str(ROOT)
     token = secrets.token_hex(32)
+    default_model = os.getenv("MODEL_NAME") or os.getenv("OLLAMA_MODEL") or "deepseek-coder:1.3b"
+    default_ollama_model = os.getenv("OLLAMA_MODEL") or default_model
+    default_ollama_models = os.getenv("OLLAMA_MODELS") or "deepseek-coder:1.3b,qwen3:1.7b"
+    default_gepa_model = os.getenv("GEPA_MODEL") or "qwen3:1.7b"
+
     content = (
         f"WORKSPACE_DIR={WORKSPACE_DIR}\n"
         f"DSPY_UID={uid}\n"
         f"DSPY_GID={gid}\n"
+        f"MODEL_NAME={default_model}\n"
+        f"OLLAMA_MODEL={default_ollama_model}\n"
+        f"OLLAMA_MODELS={default_ollama_models}\n"
+        f"GEPA_MODEL={default_gepa_model}\n"
         "# RedDB Configuration\n"
         f"REDDB_ADMIN_TOKEN={token}\n"
         "REDDB_URL=http://reddb:8080\n"
         "REDDB_NAMESPACE=dspy\n"
         f"REDDB_TOKEN={token}\n"
         "DB_BACKEND=reddb\n"
+        "MESH_GRPC_ENDPOINT=http://mesh-hub:50051\n"
+        "MESH_WORKER_ENDPOINT=http://mesh-worker:50052\n"
+        "MESH_NODE_ID=9002\n"
+        "MESH_DOMAIN=default\n"
+        "MESH_DOMAIN_ID=1\n"
+        "MESH_HUB_NODE_ID=9001\n"
+        "MESH_TRAINER_NODE_ID=9003\n"
+        "MESH_GATEWAY_NODE_ID=9010\n"
+        "MESH_GATEWAY_DOMAIN=edge\n"
+        "MESH_SERVICES_FILE=/etc/dspy/mesh-services.json\n"
+        "MESH_LISTEN_ADDR=0.0.0.0:7000\n"
+        "MESH_GRPC_LISTEN_ADDR=0.0.0.0:50051\n"
+        "MESH_METRICS_ADDR=0.0.0.0:9100\n"
+        "MESH_EXTRA_ARGS=\n"
     )
     STACK_ENV.write_text(content, encoding="utf-8")
     if verbose:
@@ -119,6 +165,41 @@ def docker_available() -> None:
         )
 
 
+def _run_cmd(cmd: list[str], *, cwd: Path | None = None, desc: str) -> None:
+    try:
+        subprocess.run(cmd, check=True, cwd=cwd)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Required command not found for {desc}: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"Command failed ({desc}): {' '.join(cmd)}") from exc
+
+
+def ensure_protos_and_binaries() -> None:
+    """Ensure protobufs, Rust binaries, and Go binaries are up to date."""
+
+    print("[manage-stack] regenerating protobuf stubs via buf")
+    _run_cmd(["make", "streaming-proto"], desc="buf generate")
+
+    print("[manage-stack] building Rust worker (release)")
+    _run_cmd(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--manifest-path",
+            str(ROOT / "env_runner_rs" / "Cargo.toml"),
+        ],
+        desc="cargo build",
+    )
+
+    print("[manage-stack] building Go supervisor (mesh tag)")
+    _run_cmd(
+        ["go", "build", "-tags", "mesh_integration", "./..."],
+        cwd=ROOT / "orchestrator",
+        desc="go build",
+    )
+
+
 def cmd_init(_: argparse.Namespace) -> None:
     docker_available()
     ensure_stack_env()
@@ -128,6 +209,7 @@ def cmd_init(_: argparse.Namespace) -> None:
 def cmd_build(args: argparse.Namespace) -> None:
     docker_available()
     ensure_stack_env()
+    ensure_protos_and_binaries()
     runner = ComposeRunner()
     compose_args = ["build"]
     if args.service:
@@ -138,6 +220,7 @@ def cmd_build(args: argparse.Namespace) -> None:
 def cmd_up(args: argparse.Namespace) -> None:
     docker_available()
     ensure_stack_env()
+    ensure_protos_and_binaries()
     runner = ComposeRunner()
     compose_args = ["up", "-d", "--remove-orphans"]
     if args.force_recreate:

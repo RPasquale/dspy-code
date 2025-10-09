@@ -227,6 +227,163 @@ export interface RlMetricsResponse {
   timestamp: number;
 }
 
+export type WorkflowNodeType = 'signature' | 'verifier' | 'reward' | 'training' | 'deployment' | 'custom';
+
+export interface WorkflowPosition {
+  x: number;
+  y: number;
+}
+
+export interface WorkflowSignatureConfig {
+  prompt: string;
+  tools?: string[];
+  runtime?: string;
+  max_tokens?: number;
+  temperature?: number;
+  execution_domain?: string;
+}
+
+export interface WorkflowVerifierConfig {
+  command: string;
+  weight: number;
+  penalty?: number;
+  timeout_sec?: number;
+  success_signal?: string;
+}
+
+export interface WorkflowRewardConfig {
+  metric: string;
+  target?: number;
+  aggregator?: string;
+  window?: number;
+  scale?: number;
+}
+
+export interface WorkflowTrainingConfig {
+  method: string;
+  skill: string;
+  dataset?: string;
+  schedule?: string;
+  max_steps?: number;
+  slurm_profile?: string;
+  trigger_metric?: string;
+}
+
+export interface WorkflowDeploymentConfig {
+  tenant: string;
+  domain: string;
+  channel: string;
+  strategy?: string;
+  autopromote?: boolean;
+}
+
+export interface WorkflowNode {
+  id: string;
+  name: string;
+  type: WorkflowNodeType;
+  description?: string;
+  position?: WorkflowPosition;
+  signature?: WorkflowSignatureConfig;
+  verifier?: WorkflowVerifierConfig;
+  reward?: WorkflowRewardConfig;
+  training?: WorkflowTrainingConfig;
+  deployment?: WorkflowDeploymentConfig;
+  custom?: Record<string, any>;
+}
+
+export type WorkflowEdgeKind = 'data' | 'control' | 'reward';
+
+export interface WorkflowEdge {
+  id: string;
+  source: string;
+  target: string;
+  kind: WorkflowEdgeKind;
+  label?: string;
+}
+
+export interface WorkflowDefinition {
+  id?: string;
+  name: string;
+  description?: string;
+  tenant?: string;
+  version?: string;
+  tags: string[];
+  created_at?: string;
+  updated_at?: string;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+}
+
+export interface WorkflowSummary {
+  id: string;
+  name: string;
+  description?: string;
+  tenant?: string;
+  version?: string;
+  tags: string[];
+  updated_at: string;
+  node_count: number;
+  edge_count: number;
+}
+
+export interface WorkflowListResponse {
+  items: WorkflowSummary[];
+}
+
+export interface WorkflowRunStep {
+  node_id: string;
+  name: string;
+  type: string;
+  status: string;
+  attempts: number;
+  started_at?: string;
+  completed_at?: string;
+  error?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface WorkflowRunRecord {
+  id: string;
+  workflow_id: string;
+  workflow_name?: string;
+  workflow_version?: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
+  steps: WorkflowRunStep[];
+  metadata?: Record<string, any>;
+}
+
+export interface WorkflowRunListResponse {
+  items: WorkflowRunRecord[];
+}
+
+export interface HardwareAccelerator {
+  vendor: string;
+  model: string;
+  memory_mb: number;
+  count: number;
+  compute_capability?: string;
+}
+
+export interface RunnerHardwareSnapshot {
+  hostname: string;
+  detected_at: string;
+  cpu: {
+    brand: string;
+    logical_cores: number;
+    physical_cores: number;
+    min_frequency_mhz: number;
+    max_frequency_mhz: number;
+  };
+  memory: {
+    total_bytes: number;
+    available_bytes: number;
+  };
+  accelerators: HardwareAccelerator[];
+}
+
 export interface SystemNode {
   id: string;
   name: string;
@@ -320,6 +477,73 @@ export interface OverviewResponse {
   rl: RlMetricsResponse;
   bus: BusMetricsResponse;
   timestamp: number;
+}
+
+export interface GraphSnapshot {
+  timestamp: number;
+  nodes: Record<string, { language?: string; owner?: string; pagerank?: number }>;
+  edges: string[];
+}
+
+export interface GraphSnapshotsResponse {
+  namespace: string;
+  snapshots: GraphSnapshot[];
+}
+
+export interface GraphDiffResponse {
+  namespace: string;
+  a: string;
+  b: string;
+  nodes_added: string[];
+  nodes_removed: string[];
+  edges_added: string[];
+  edges_removed: string[];
+}
+
+export interface GraphMctsNode {
+  id: string;
+  label: string;
+  priority: number;
+  language?: string;
+  owner?: string;
+  pagerank?: number;
+  updated_at?: number;
+}
+
+export interface GraphMctsTopResponse {
+  namespace: string;
+  nodes: GraphMctsNode[];
+}
+
+export interface GraphMemoryRagResult {
+  mode: string;
+  answer: string;
+  context: Record<string, any>;
+}
+
+export interface GraphMemoryReportResponse {
+  namespace: string;
+  query: string;
+  fusion_score: number;
+  metrics: Record<string, number>;
+  reward: number;
+  reward_breakdown: Record<string, number>;
+  summary: string;
+  recommended_paths: string[];
+  verifier_targets: string[];
+  followups: string[];
+  rationale?: string;
+  rag: GraphMemoryRagResult;
+  context: Record<string, any>;
+  generated_at: number;
+  top_k: number;
+}
+
+export interface GraphPatternsResponse {
+  namespace: string;
+  mode: string;
+  cycles?: string[][];
+  nodes?: string[];
 }
 
 export interface BusMetricsResponse {

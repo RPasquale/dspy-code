@@ -13,9 +13,12 @@ return data with the shapes expected by the frontend.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
+import os
 import random
+import tempfile
 import threading
 import time
 from collections import Counter, deque
@@ -499,13 +502,46 @@ class WorkspaceAnalyzer:
     # ------------------------------------------------------------------
 
     def _resolve_logs_dir(self, workspace: Path) -> Path:
-        candidates = [workspace / "logs", Path.cwd() / "logs"]
+        env_logs = os.getenv("DSPY_LOGS") or os.getenv("LOGS_DIR")
+
+        candidates = []
+        if env_logs:
+            candidates.append(Path(env_logs).expanduser())
+
+        workspace_logs = workspace / "logs"
+        candidates.append(workspace_logs)
+
+        cwd_logs = Path.cwd() / "logs"
+        if cwd_logs != workspace_logs:
+            candidates.append(cwd_logs)
+
+        home_logs = Path.home() / ".dspy" / "logs"
+        candidates.append(home_logs)
+
+        tmp_logs = Path(tempfile.gettempdir()) / "dspy" / "logs"
+        candidates.append(tmp_logs)
+
+        resolved: List[Path] = []
         for candidate in candidates:
-            if candidate.exists():
+            path = candidate.resolve()
+            if path not in resolved:
+                resolved.append(path)
+
+        for candidate in resolved:
+            if candidate.exists() and candidate.is_dir():
                 return candidate
-        candidate = workspace / "logs"
-        candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                return candidate
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EROFS, errno.EEXIST}:  # fall through to next candidate
+                    continue
+                raise
+
+        raise RuntimeError(
+            "Unable to locate a writable logs directory. "
+            "Set DSPY_LOGS or LOGS_DIR to an accessible path."
+        )
 
     def _resolve_queue_dir(self, logs_dir: Path) -> Path:
         queue = logs_dir / "env_queue"

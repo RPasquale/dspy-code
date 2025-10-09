@@ -24,9 +24,9 @@ const SystemOverviewPage = () => {
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3">
-        <h1 className="text-3xl font-semibold text-white">System Overview</h1>
+        <h1 className="text-3xl font-semibold text-white">Health Status</h1>
         <p className="text-sm text-slate-300 max-w-3xl">
-          Inspect the infrastructure that powers the agent: message bus, RedDB, containers, and orchestration services.
+          Monitor the health and performance of your AI training system. Ensure everything is running smoothly for optimal learning.
         </p>
       </div>
 
@@ -46,10 +46,10 @@ const SystemOverviewPage = () => {
       </div>
 
       <div className="grid gap-6 xl:grid-cols-3">
-        <Card className="xl:col-span-2" title="System Resources" subtitle="CPU, memory, storage, and GPU utilization">
+        <Card className="xl:col-span-2" title="System Performance" subtitle="Computing resources and processing capacity">
           <SystemResourcesCard />
         </Card>
-        <Card title="Recent Performance" subtitle="Latency, throughput, and error trends">
+        <Card title="Learning Performance" subtitle="Training speed, accuracy, and progress trends">
           <MiniSystemCharts />
         </Card>
       </div>
@@ -90,26 +90,26 @@ const SystemOverviewPage = () => {
 function buildSummary(status?: StatusResponse, bus?: BusMetricsResponse, reddb?: { status: string; recent_actions: number; recent_training: number; signatures: number }) {
   return [
     {
-      name: 'Agent process',
-      status: status?.agent?.details || 'OK',
+      name: 'AI Learning Engine',
+      status: status?.agent?.details || 'Ready',
       state: status?.agent?.status,
-      detail: status?.learning_active ? 'Active learning session' : 'Idle'
+      detail: status?.learning_active ? 'Currently learning' : 'Ready to learn'
     },
     {
-      name: 'Message Bus',
-      status: bus ? `${bus.dlq.total} DLQ` : '—',
+      name: 'Data Pipeline',
+      status: bus ? `${bus.dlq.total === 0 ? 'Healthy' : `${bus.dlq.total} issues`}` : '—',
       state: bus && bus.dlq.total > 0 ? 'warning' : (status?.kafka?.status ?? 'unknown'),
-      detail: bus ? `${Object.keys(bus.bus.topics || {}).length} topics` : undefined
+      detail: bus ? `${Object.keys(bus.bus.topics || {}).length} data sources` : undefined
     },
     {
-      name: 'RedDB',
-      status: reddb ? `${reddb.signatures} signatures` : '—',
+      name: 'Knowledge Base',
+      status: reddb ? `${reddb.signatures} learned patterns` : '—',
       state: (reddb?.status as StatusResponse['agent']['status']) || status?.reddb?.status,
-      detail: reddb ? `${reddb.recent_actions} actions · ${reddb.recent_training} training` : undefined
+      detail: reddb ? `${reddb.recent_actions} recent actions · ${reddb.recent_training} training sessions` : undefined
     },
     {
-      name: 'Spark / Compute',
-      status: status?.spark?.details || 'Scheduler',
+      name: 'Processing Power',
+      status: status?.spark?.details || 'Available',
       state: status?.spark?.status,
       detail: status?.containers?.details
     }

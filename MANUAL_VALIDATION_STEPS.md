@@ -128,7 +128,7 @@ tail -f logs/agent_learning.jsonl
 
 ### Test RL Training
 ```bash
-uv run dspy-agent rl neural --workspace "$(pwd)" --steps 100 --n-envs 1 --log-jsonl logs/rl_trace.jsonl
+uv run dspy-agent rl train --workspace "$(pwd)" --steps 100 --n-envs 1 --log-jsonl logs/rl_trace.jsonl
 tail logs/rl_trace.jsonl
 ```
 

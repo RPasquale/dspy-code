@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional, Tuple, List, Dict
+import threading
+import time
+from typing import Optional, Tuple, List, Dict, Any
 
 import dspy
 
@@ -82,6 +84,13 @@ def _split_model_list(raw: Optional[str]) -> List[str]:
 
 def _ollama_tags(api_base: str, timeout: Optional[float] = None) -> List[str]:
     """Fetch available model tags from Ollama. Returns [] on error."""
+    cache_key = api_base.rstrip("/")
+    now = time.time()
+    with _OLLAMA_TAG_CACHE_LOCK:
+        cached = _OLLAMA_TAG_CACHE.get(cache_key)
+        if cached and (now - cached[0]) < _OLLAMA_TAG_TTL:
+            return list(cached[1])
+
     try:
         url = api_base.rstrip("/") + "/api/tags"
         req = _req.Request(url, method="GET")
@@ -96,6 +105,8 @@ def _ollama_tags(api_base: str, timeout: Optional[float] = None) -> List[str]:
                 tag = m.get("model") or m.get("name")
                 if isinstance(tag, str):
                     tags.append(tag)
+            with _OLLAMA_TAG_CACHE_LOCK:
+                _OLLAMA_TAG_CACHE[cache_key] = (now, list(tags))
             return tags
     except Exception:
         return []
@@ -193,6 +204,14 @@ def _truthy(env: str, default: bool = False) -> bool:
 
 
 _SAMPLING_HINTS: Dict[str, float] = {}
+_LM_CACHE: Dict[Tuple[Any, ...], dspy.LM] = {}
+_OLLAMA_LOCK = threading.Lock()
+_OLLAMA_ACTIVE_KEY: Optional[Tuple[str, str]] = None
+_OLLAMA_ACTIVE_LM: Optional[dspy.LM] = None
+_OLLAMA_WARNED_SWITCH = False
+_OLLAMA_TAG_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_OLLAMA_TAG_CACHE_LOCK = threading.Lock()
+_OLLAMA_TAG_TTL = 15.0
 
 
 def get_sampling_hints() -> Dict[str, float]:
@@ -220,6 +239,15 @@ def get_circuit_breaker_status() -> Dict[str, object]:
         return {"open": False, "next_retry_sec": 0.0}
 
 
+def _configure_dspy(lm: dspy.LM) -> None:
+    """Set the active DSPy LM, handling adapter compatibility."""
+
+    try:
+        dspy.configure(lm=lm, adapter=StrictJSONAdapter())
+    except TypeError:
+        dspy.configure(lm=lm)
+
+
 def configure_lm(
     provider: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -230,6 +258,7 @@ def configure_lm(
     target_entropy: Optional[float] = None,
     clip_higher: Optional[float] = None,
 ) -> Optional[dspy.LM]:
+    global _OLLAMA_ACTIVE_LM, _OLLAMA_ACTIVE_KEY, _OLLAMA_WARNED_SWITCH
     # If running with the lightweight local stub, skip LM entirely
     # However, in Docker environments, we need to override this to allow LM configuration
     try:
@@ -255,6 +284,7 @@ def configure_lm(
     effective_base_url = base_url or settings.openai_base_url
 
     lm_kwargs: dict = {}
+    cache_key: Optional[Tuple[Any, ...]] = None
 
     if provider == "ollama":
         # Use native Ollama API (not the OpenAI compatibility layer)
@@ -288,10 +318,22 @@ def configure_lm(
                 effective_base_url,
             )
         if server_ok and not model_ok and not _truthy("OLLAMA_ALLOW_MISSING_MODEL"):
-            logger.warning(
-                "Ollama model '%s' not found in tags; continuing (set OLLAMA_ALLOW_MISSING_MODEL=1 to suppress)",
-                effective_model,
-            )
+            available = detect_available_ollama_models()
+            fallback_model = next((m for m in available if m), None)
+            if fallback_model:
+                if fallback_model != effective_model:
+                    logger.warning(
+                        "Ollama model '%s' not found; falling back to '%s'",
+                        effective_model,
+                        fallback_model,
+                    )
+                effective_model = fallback_model
+                model_ok = True
+            else:
+                logger.warning(
+                    "Ollama model '%s' not found and no fallback model detected; continuing anyway",
+                    effective_model,
+                )
 
         provider_model = f"ollama/{effective_model}"
         lm_kwargs.update({
@@ -299,12 +341,29 @@ def configure_lm(
             "api_base": effective_base_url,
         })
 
-        max_tokens = _env_int("OLLAMA_MAX_TOKENS", 0)
-        if max_tokens > 0:
-            lm_kwargs["max_tokens"] = max_tokens
         keep_alive = os.getenv("OLLAMA_KEEP_ALIVE")
         if keep_alive:
             lm_kwargs["keep_alive"] = keep_alive
+
+        with _OLLAMA_LOCK:
+            ollama_key = (effective_model or "", effective_base_url or "")
+            if _OLLAMA_ACTIVE_LM is not None:
+                if _OLLAMA_ACTIVE_KEY != ollama_key:
+                    if not _OLLAMA_WARNED_SWITCH:
+                        logger.info(
+                            "Reusing existing Ollama model %s (requested %s). Set OLLAMA_ALLOW_SWITCH=1 to permit hot swaps.",
+                            _OLLAMA_ACTIVE_KEY[0] if _OLLAMA_ACTIVE_KEY else "",
+                            effective_model,
+                        )
+                        _OLLAMA_WARNED_SWITCH = True
+                    if not _truthy("OLLAMA_ALLOW_SWITCH"):
+                        if _OLLAMA_ACTIVE_LM is not None:
+                            _configure_dspy(_OLLAMA_ACTIVE_LM)
+                        return _OLLAMA_ACTIVE_LM
+                else:
+                    if _OLLAMA_ACTIVE_LM is not None:
+                        _configure_dspy(_OLLAMA_ACTIVE_LM)
+                    return _OLLAMA_ACTIVE_LM
     else:
         # Default to OpenAI
         provider = "openai"
@@ -357,16 +416,26 @@ def configure_lm(
         except Exception:
             pass
     
+    if cache_key is None:
+        cache_key = (provider, provider_model, effective_base_url, effective_api_key, tuple(sorted(lm_kwargs.items())))
+
+    cached = _LM_CACHE.get(cache_key)
+    if cached is not None:
+        _configure_dspy(cached)
+        return cached
+
     lm = dspy.LM(
         model=provider_model,
         **lm_kwargs,
     )
-    # Configure DSPy with LM and a strict JSON adapter when supported.
-    try:
-        dspy.configure(lm=lm, adapter=StrictJSONAdapter())
-    except TypeError:
-        # Older DSPy versions may not accept adapter kwarg.
-        dspy.configure(lm=lm)
+    _configure_dspy(lm)
+    _LM_CACHE[cache_key] = lm
+
+    if provider == "ollama":
+        with _OLLAMA_LOCK:
+            _OLLAMA_ACTIVE_LM = lm
+            _OLLAMA_ACTIVE_KEY = (effective_model or "", effective_base_url or "")
+
     return lm
 
 

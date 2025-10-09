@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
 import StatusPill from './StatusPill';
+import ThemeSwitcher from './ThemeSwitcher';
 
 interface HeaderProps {
   sidebarOpen: boolean;
@@ -49,33 +50,34 @@ const Header = ({ sidebarOpen, setSidebarOpen }: HeaderProps) => {
             </nav>
           </div>
 
-          {/* Center - Status indicators */}
+          {/* Center - Business Status indicators */}
           <div className="hidden lg:flex items-center gap-4">
             <div className="flex items-center gap-2 rounded-full border border-gray-200 dark:border-gray-700 px-3 py-1 text-xs">
-              <span className="text-gray-500 dark:text-gray-400">Agent</span>
+              <span className="text-gray-500 dark:text-gray-400">Learning</span>
               <StatusPill status={status?.agent?.status} size="sm" />
               <span className="text-gray-700 dark:text-gray-300">
-                {status?.agent?.details || 'Healthy'}
+                {status?.learning_active ? 'Active' : 'Ready'}
               </span>
             </div>
             <div className="flex items-center gap-2 rounded-full border border-gray-200 dark:border-gray-700 px-3 py-1 text-xs">
-              <span className="text-gray-500 dark:text-gray-400">Bus</span>
+              <span className="text-gray-500 dark:text-gray-400">Data Quality</span>
               <StatusPill status={status?.kafka?.status} size="sm" />
               <span className="text-gray-700 dark:text-gray-300">
-                DLQ {busMetrics?.dlq?.total ?? 0}
+                {busMetrics?.dlq?.total === 0 ? 'Good' : `${busMetrics?.dlq?.total ?? 0} issues`}
               </span>
             </div>
             <div className="flex items-center gap-2 rounded-full border border-gray-200 dark:border-gray-700 px-3 py-1 text-xs">
-              <span className="text-gray-500 dark:text-gray-400">Training</span>
+              <span className="text-gray-500 dark:text-gray-400">System</span>
               <StatusPill status={status?.pipeline?.status} size="sm" />
               <span className="text-gray-700 dark:text-gray-300">
-                {status?.learning_active ? 'Active' : 'Idle'}
+                Operational
               </span>
             </div>
           </div>
 
           {/* Right side */}
           <div className="flex items-center gap-3">
+            <ThemeSwitcher />
             {/* Search */}
             <div className="hidden sm:block">
               <div className="relative">
