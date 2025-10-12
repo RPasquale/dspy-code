@@ -119,6 +119,7 @@ class InteractiveShell:
             "patch_stats": bundle.get("stats", {}),
             "retrieval_events": bundle.get("retrieval_events", []),
             "kg_features": bundle.get("kg_features", []),
+            "graph_memory": bundle.get("graph_memory", {}),
         }
         return info
 
@@ -153,6 +154,7 @@ class InteractiveShell:
     def _render_memory_panel(self, memory: Dict[str, Any]) -> Panel:
         stats = memory.get("patch_stats", {})
         retrievals = memory.get("retrieval_events", [])
+        graph_memory = memory.get("graph_memory", {})
         lines = [
             f"Patches: {int(stats.get('total',0))} | success={stats.get('recent_success_rate',0.0):.2f}",
             f"Avg pass={stats.get('avg_pass_rate',0.0):.2f} | Avg blast={stats.get('avg_blast_radius',0.0):.2f}",
@@ -162,6 +164,11 @@ class InteractiveShell:
             lines.append(f"Last retrieval: '{last.get('query','')}' ({len(last.get('hits',[]))} hits)")
         else:
             lines.append("No retrieval events logged yet.")
+        if isinstance(graph_memory, dict) and graph_memory.get("top_files"):
+            top = graph_memory["top_files"][0]
+            lines.append(f"Graph focus: {top.get('path','')} (confidence={float(top.get('confidence',0.0)):.2f})")
+        else:
+            lines.append("Graph memory building...")
         return Panel("\n".join(lines), title="Memory", border_style="green")
 
     # ------------------------------------------------------------------

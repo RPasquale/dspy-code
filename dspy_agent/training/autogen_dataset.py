@@ -238,9 +238,45 @@ def make_context_dataset(workspace: Path, logs: Optional[Path], out: Path, max_e
 
 
 def make_code_dataset(workspace: Path, out: Path, max_examples: int = 10) -> Path:
-    snap = build_code_snapshot(workspace)
-    ids = extract_identifiers(workspace)
-    rows = [{"snapshot": snap[:8000], "ask": "Summarize this code snapshot.", "keywords": ids[:10], "task_type": "code"}]
+    rows: List[Dict] = []
+    history_path = workspace / '.dspy_patches' / 'history.jsonl'
+    if history_path.exists():
+        try:
+            lines = history_path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        except Exception:
+            lines = []
+        for line in reversed(lines):
+            if len(rows) >= max_examples:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            patch = rec.get('patch_content') or rec.get('patch') or ''
+            if not patch:
+                continue
+            test_results = rec.get('test_results') if isinstance(rec.get('test_results'), dict) else {}
+            row = {
+                "task": rec.get('task') or rec.get('prompt_hash') or "code_fix",
+                "context": rec.get('context') or rec.get('logs') or "",
+                "file_hints": rec.get('target_files') or test_results.get('target_files_summary') or "",
+                "patch": patch,
+                "reasoning_plan": test_results.get('reasoning_plan', ''),
+                "test_plan": test_results.get('test_plan', ''),
+                "metrics": {
+                    k: v for k, v in test_results.items()
+                    if isinstance(k, str) and isinstance(v, (int, float, str))
+                },
+                "task_type": "code_patch",
+            }
+            rows.append(row)
+    if not rows:
+        snap = build_code_snapshot(workspace)
+        ids = extract_identifiers(workspace)
+        rows = [{"snapshot": snap[:8000], "ask": "Summarize this code snapshot.", "keywords": ids[:10], "task_type": "code"}]
     path = out / "code_train.jsonl"
     write_jsonl(path, rows[:max_examples])
     return path

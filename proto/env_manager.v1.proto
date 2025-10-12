@@ -1,0 +1,160 @@
+syntax = "proto3";
+
+package env_manager.v1;
+
+option go_package = "github.com/dspy/orchestrator/internal/pb/envmanager";
+
+// Environment Manager service for container lifecycle management
+service EnvManagerService {
+  // Start all services with dependency resolution
+  rpc StartServices(StartServicesRequest) returns (stream ServiceStatusUpdate);
+  
+  // Stop all services gracefully
+  rpc StopServices(StopServicesRequest) returns (StopServicesResponse);
+  
+  // Restart a specific service
+  rpc RestartService(RestartServiceRequest) returns (RestartServiceResponse);
+  
+  // Get status of all services
+  rpc GetServicesStatus(GetServicesStatusRequest) returns (ServicesStatusResponse);
+  
+  // Stream health updates for services
+  rpc StreamHealth(StreamHealthRequest) returns (stream HealthUpdate);
+  
+  // Query resource availability
+  rpc GetResourceAvailability(GetResourceAvailabilityRequest) returns (ResourceAvailabilityResponse);
+  
+  // Execute a task in an isolated environment
+  rpc ExecuteTask(ExecuteTaskRequest) returns (ExecuteTaskResponse);
+  
+  // Pull container images
+  rpc PullImages(PullImagesRequest) returns (stream ImagePullProgress);
+}
+
+// Service startup
+message StartServicesRequest {
+  repeated string service_names = 1; // empty = all services
+  bool parallel = 2; // parallel startup where possible
+  map<string, string> overrides = 3; // service-specific config overrides
+}
+
+message ServiceStatusUpdate {
+  string service_name = 1;
+  string status = 2; // starting, healthy, unhealthy, stopped
+  string message = 3;
+  int32 progress = 4; // 0-100
+}
+
+message StopServicesRequest {
+  repeated string service_names = 1; // empty = all services
+  int32 timeout_seconds = 2;
+}
+
+message StopServicesResponse {
+  bool success = 1;
+  map<string, string> service_results = 2; // service_name -> result message
+}
+
+message RestartServiceRequest {
+  string service_name = 1;
+  int32 timeout_seconds = 2;
+}
+
+message RestartServiceResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Service status
+message GetServicesStatusRequest {
+  repeated string service_names = 1; // empty = all services
+}
+
+message ServicesStatusResponse {
+  map<string, ServiceStatus> services = 1;
+}
+
+message ServiceStatus {
+  string name = 1;
+  string status = 2; // running, stopped, starting, unhealthy
+  string container_id = 3;
+  repeated int32 ports = 4;
+  map<string, string> health_checks = 5;
+  int64 started_at = 6;
+  ResourceUsage resource_usage = 7;
+}
+
+message ResourceUsage {
+  double cpu_percent = 1;
+  int64 memory_bytes = 2;
+  int64 network_rx_bytes = 3;
+  int64 network_tx_bytes = 4;
+}
+
+// Health streaming
+message StreamHealthRequest {
+  repeated string service_names = 1; // empty = all services
+  int32 interval_seconds = 2; // polling interval
+}
+
+message HealthUpdate {
+  string service_name = 1;
+  bool healthy = 2;
+  string message = 3;
+  int64 timestamp = 4;
+  map<string, string> details = 5;
+}
+
+// Resource availability
+message GetResourceAvailabilityRequest {
+  string workload_class = 1; // cpu_short, cpu_long, gpu
+}
+
+message ResourceAvailabilityResponse {
+  bool available = 1;
+  int32 capacity = 2;
+  int32 in_use = 3;
+  HardwareInfo hardware = 4;
+}
+
+message HardwareInfo {
+  int32 cpu_cores = 1;
+  int64 memory_bytes = 2;
+  repeated GPU gpus = 3;
+}
+
+message GPU {
+  int32 index = 1;
+  string name = 2;
+  int64 memory_bytes = 3;
+  double utilization_percent = 4;
+}
+
+// Task execution
+message ExecuteTaskRequest {
+  string task_id = 1;
+  string workload_class = 2;
+  map<string, string> payload = 3;
+  int32 timeout_seconds = 4;
+}
+
+message ExecuteTaskResponse {
+  bool success = 1;
+  map<string, string> result = 2;
+  string error = 3;
+  double latency_ms = 4;
+}
+
+// Image pulling
+message PullImagesRequest {
+  repeated string image_names = 1; // empty = all required images
+}
+
+message ImagePullProgress {
+  string image_name = 1;
+  string status = 2; // downloading, extracting, complete, error
+  int64 current = 3;
+  int64 total = 4;
+  int32 progress_percent = 5;
+}
+

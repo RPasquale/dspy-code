@@ -1438,7 +1438,13 @@ def sample_get_verifiers():
         extra = list(_gmv())
     except Exception:
         extra = []
-    return [PassRateVerifier(), BlastRadiusVerifier(), BuildOkVerifier(), LintOkVerifier(), QualityAvgVerifier(), *extra]
+    code_quality = []
+    try:
+        from ..verifiers.code_quality import get_code_quality_verifiers as _cqv
+        code_quality = list(_cqv())
+    except Exception:
+        code_quality = []
+    return [PassRateVerifier(), BlastRadiusVerifier(), BuildOkVerifier(), LintOkVerifier(), QualityAvgVerifier(), *extra, *code_quality]
 
 
 def get_verifiers():

@@ -2,6 +2,7 @@ version: v1
 managed:
   enabled: true
 plugins:
+  # Go plugins
   - plugin: buf.build/protocolbuffers/go
     out: orchestrator/internal/pb
     opt:
@@ -10,3 +11,13 @@ plugins:
     out: orchestrator/internal/pb
     opt:
       - paths=source_relative
+  # Python plugins
+  - plugin: buf.build/protocolbuffers/python
+    out: dspy_agent/infra/pb
+  - plugin: buf.build/grpc/python
+    out: dspy_agent/infra/pb
+  # Rust plugins  
+  - plugin: buf.build/community/neoeinstein-prost
+    out: env_manager_rs/src/pb
+  - plugin: buf.build/community/neoeinstein-tonic
+    out: env_manager_rs/src/pb

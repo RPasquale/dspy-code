@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from typing import Optional
+from pathlib import Path
 
 import dspy  # type: ignore
+
+from ..reasoning import ReasoningHarness
 
 
 class RespondSig(dspy.Signature):
@@ -18,7 +21,7 @@ class RespondSig(dspy.Signature):
 class Responder(dspy.Module):
     """Lightweight module that turns short prompts into direct replies."""
 
-    def __init__(self, use_cot: bool = False):
+    def __init__(self, use_cot: bool = False, workspace: Optional[Path] = None):
         super().__init__()
         # Chain-of-thought adds latency and is unnecessary for chit-chat, so keep it simple.
         predict_kwargs = {"max_tokens": 768, "temperature": 0.15}
@@ -28,6 +31,10 @@ class Responder(dspy.Module):
         else:
             self.predict = dspy.ChainOfThought(RespondSig, **predict_kwargs)
             self._predict_careful = self.predict
+        try:
+            self.reasoner = ReasoningHarness(workspace)
+        except Exception:
+            self.reasoner = None
 
     def forward(self, query: str, context: str = "", workspace: Optional[str] = None):
         ws = workspace or ""
@@ -37,10 +44,21 @@ class Responder(dspy.Module):
             "Reference coding tools, strategies, or next steps when appropriate, and avoid emitting shell-style commands "
             "unless the user explicitly asked for them. Keep the reply actionable and self-contained."
         )
-        enriched_query = f"{guidance}\n\nUser request: {query.strip()}"
         enriched_context = context.strip() if context else ""
         if ws:
             enriched_context = (enriched_context + f"\nWorkspace root: {ws}").strip()
+        reasoning_prompt = ""
+        if self.reasoner is not None:
+            try:
+                bundle = self.reasoner.run(query, context=enriched_context)
+                reasoning_prompt = bundle.to_prompt(max_chars=420)
+            except Exception:
+                reasoning_prompt = ""
+        enriched_segments = [guidance]
+        if reasoning_prompt:
+            enriched_segments.append(f"Reasoning scaffold: {reasoning_prompt}")
+        enriched_segments.append(f"User request: {query.strip()}")
+        enriched_query = "\n\n".join(enriched_segments)
         result = self.predict(query=enriched_query, context=enriched_context, workspace=ws)
         reply = (getattr(result, "response", "") or "").strip()
         if not reply or reply.startswith("/") or reply.lower().startswith("command "):
@@ -91,6 +109,8 @@ class Responder(dspy.Module):
                         "4. Run lint/format tools and targeted tests after each milestone, logging outcomes for RL training.\n"
                         "5. Record follow-up tasks (performance benchmarks, docs) in the session memory for later runs."
                     )
+                elif reasoning_prompt:
+                    fallback_text = f"Structured approach:\n{reasoning_prompt}"
                 else:
                     fallback_text = (
                         "Here's a structured way to approach this request inside the DSPy workspace:\n"

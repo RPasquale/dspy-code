@@ -1,0 +1,43 @@
+.PHONY: proto proto-go proto-python proto-rust proto-clean
+
+# Generate all protobuf code
+proto: proto-go proto-python proto-rust
+	@echo "✅ All protobuf code generated"
+
+# Generate Go code
+proto-go:
+	@echo "🔧 Generating Go protobuf code..."
+	@mkdir -p orchestrator/internal/pb/orchestrator
+	@mkdir -p orchestrator/internal/pb/envmanager
+	protoc --go_out=orchestrator/internal/pb --go_opt=paths=source_relative \
+		--go-grpc_out=orchestrator/internal/pb --go-grpc_opt=paths=source_relative \
+		proto/orchestrator.v1.proto proto/env_manager.v1.proto
+	@echo "✅ Go protobuf code generated"
+
+# Generate Python code
+proto-python:
+	@echo "🔧 Generating Python protobuf code..."
+	@mkdir -p dspy_agent/infra/pb
+	python -m grpc_tools.protoc -I proto \
+		--python_out=dspy_agent/infra/pb \
+		--grpc_python_out=dspy_agent/infra/pb \
+		proto/orchestrator.v1.proto proto/env_manager.v1.proto
+	@touch dspy_agent/infra/pb/__init__.py
+	@echo "✅ Python protobuf code generated"
+
+# Generate Rust code (requires protoc-gen-prost and protoc-gen-tonic)
+proto-rust:
+	@echo "🔧 Generating Rust protobuf code..."
+	@mkdir -p env_manager_rs/src/pb
+	@echo "Note: Rust protobuf generation will be handled by build.rs in env_manager_rs"
+	@echo "✅ Rust protobuf setup complete"
+
+# Clean generated code
+proto-clean:
+	@echo "🧹 Cleaning generated protobuf code..."
+	rm -rf orchestrator/internal/pb/orchestrator
+	rm -rf orchestrator/internal/pb/envmanager
+	rm -rf dspy_agent/infra/pb
+	rm -rf env_manager_rs/src/pb
+	@echo "✅ Protobuf code cleaned"
+

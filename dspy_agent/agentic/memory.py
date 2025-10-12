@@ -8,11 +8,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Mapping, Optional
+from typing import Dict, Iterable, List, Tuple, Mapping, Optional, Any
 
 from ..db import get_enhanced_data_manager, create_log_entry, create_retrieval_event, Environment
 
 RETRIEVAL_LOG = '.dspy_agentic/retrieval.jsonl'
+GRAPH_MEMORY_FILE = '.dspy_agentic/graph_memory.json'
 
 
 @dataclass
@@ -23,23 +24,40 @@ class AgentKnowledgeGraph:
     def add_file_hint(self, task: str, file_hint: str, confidence: float) -> None:
         task_key = f"task::{task}"
         file_key = f"file::{file_hint}"
-        self._touch(task_key)
-        self._touch(file_key)
+        self._touch(task_key, degree_increment=1.0)
+        self._touch(file_key, degree_increment=1.0)
         edge = (task_key, file_key)
         data = self.edges.setdefault(edge, {"weight": 0.0, "count": 0.0})
-        data["weight"] = max(data["weight"], float(confidence))
-        data["count"] += 1.0
+        prev_count = float(data.get("count", 0.0))
+        new_count = prev_count + 1.0
+        prev_weight = float(data.get("weight", 0.0))
+        # Exponential moving average to emphasise recent confidence
+        alpha = min(1.0, 0.6 + (1.0 / max(new_count, 1.0)))
+        updated_weight = (1 - alpha) * prev_weight + alpha * float(confidence)
+        data["weight"] = max(0.0, min(1.0, updated_weight))
+        data["count"] = new_count
+        data["last_confidence"] = float(confidence)
+        data["updated_at"] = time.time()
 
     def add_reference(self, source: str, target: str, weight: float = 0.0) -> None:
         edge = (source, target)
-        self._touch(source)
-        self._touch(target)
+        self._touch(source, degree_increment=1.0)
+        self._touch(target, degree_increment=1.0)
         data = self.edges.setdefault(edge, {"weight": 0.0, "count": 0.0})
-        data["weight"] = max(data.get("weight", 0.0), float(weight))
-        data["count"] += 1.0
+        prev_count = float(data.get("count", 0.0))
+        new_count = prev_count + 1.0
+        prev_weight = float(data.get("weight", 0.0))
+        alpha = min(1.0, 0.5 + (1.0 / max(new_count, 1.0)))
+        updated_weight = (1 - alpha) * prev_weight + alpha * float(weight)
+        data["weight"] = max(0.0, min(1.0, updated_weight))
+        data["count"] = new_count
+        data["last_score"] = float(weight)
+        data["updated_at"] = time.time()
 
-    def _touch(self, node: str) -> None:
-        self.nodes.setdefault(node, {"degree": 0.0})
+    def _touch(self, node: str, *, degree_increment: float = 0.0) -> None:
+        rec = self.nodes.setdefault(node, {"degree": 0.0})
+        rec["degree"] = float(rec.get("degree", 0.0)) + float(degree_increment)
+        rec["last_seen"] = time.time()
 
     def summarise(self) -> Dict[str, float]:
         edge_weights = [v.get("weight", 0.0) for v in self.edges.values()]
@@ -55,13 +73,185 @@ class AgentKnowledgeGraph:
             "kg_avg_fanout": avg_fanout,
         }
 
+    def top_targets(self, *, prefix: str, limit: int = 10) -> List[Tuple[str, float]]:
+        scores: Dict[str, float] = {}
+        for (_src, dst), data in self.edges.items():
+            if not dst.startswith(prefix):
+                continue
+            weight = float(data.get("weight", 0.0))
+            if weight <= 0.0:
+                continue
+            name = dst[len(prefix):]
+            scores[name] = max(scores.get(name, 0.0), weight)
+        ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        return ordered[:limit]
+
+    def to_payload(self) -> Dict[str, Any]:
+        edges = []
+        for (src, dst), data in self.edges.items():
+            payload = dict(data)
+            payload["src"] = src
+            payload["dst"] = dst
+            edges.append(payload)
+        return {"nodes": self.nodes, "edges": edges}
+
+    @classmethod
+    def from_payload(cls, data: Mapping[str, Any]) -> "AgentKnowledgeGraph":
+        nodes = {}
+        edges: Dict[Tuple[str, str], Dict[str, float]] = {}
+        if isinstance(data.get("nodes"), dict):
+            nodes = {str(k): dict(v) for k, v in data["nodes"].items()}  # type: ignore[arg-type]
+        for raw in data.get("edges", []) or []:
+            if not isinstance(raw, Mapping):
+                continue
+            src = str(raw.get("src") or "")
+            dst = str(raw.get("dst") or "")
+            if not src or not dst:
+                continue
+            payload = {k: v for k, v in raw.items() if k not in {"src", "dst"}}
+            edges[(src, dst)] = payload  # type: ignore[assignment]
+        return cls(nodes=nodes, edges=edges)
+
+
+class GraphMemoryStore:
+    """Disk-backed store for the agent knowledge graph with lazy loading."""
+
+    def __init__(self, workspace: Path, *, filename: str = GRAPH_MEMORY_FILE) -> None:
+        try:
+            self.workspace = Path(workspace).resolve()
+        except Exception:
+            self.workspace = Path(workspace)
+        self.path = self.workspace / filename
+        self._graph: Optional[AgentKnowledgeGraph] = None
+        self._meta: Dict[str, set[str]] = {
+            "seen_events": set(),
+            "seen_patches": set(),
+        }
+
+    def _ensure_loaded(self) -> AgentKnowledgeGraph:
+        if self._graph is not None:
+            return self._graph
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                payload = data.get("graph") if isinstance(data, Mapping) else None
+                if not isinstance(payload, Mapping):
+                    payload = data
+                self._graph = AgentKnowledgeGraph.from_payload(payload)
+                meta = data.get("meta") if isinstance(data, Mapping) else {}
+                if isinstance(meta, Mapping):
+                    seen_events = meta.get("seen_events", [])
+                    seen_patches = meta.get("seen_patches", [])
+                    self._meta["seen_events"] = {str(x) for x in seen_events if x}
+                    self._meta["seen_patches"] = {str(x) for x in seen_patches if x}
+            except Exception:
+                self._graph = AgentKnowledgeGraph()
+        else:
+            self._graph = AgentKnowledgeGraph()
+        return self._graph
+
+    def graph(self) -> AgentKnowledgeGraph:
+        return self._ensure_loaded()
+
+    def flush(self) -> None:
+        if self._graph is None:
+            return
+        payload = {
+            "graph": self._graph.to_payload(),
+            "updated_at": time.time(),
+            "workspace": str(self.workspace),
+            "meta": {
+                "seen_events": sorted(self._meta.get("seen_events", [])),
+                "seen_patches": sorted(self._meta.get("seen_patches", [])),
+            },
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception:
+            pass
+
+    def update_from_signals(
+        self,
+        *,
+        patches: Iterable[Mapping[str, object]] = (),
+        retrieval_events: Iterable[Mapping[str, object]] = (),
+    ) -> AgentKnowledgeGraph:
+        graph = self.graph()
+        seen_events = self._meta.setdefault("seen_events", set())
+        seen_patches = self._meta.setdefault("seen_patches", set())
+        for rec in patches or []:
+            task = str(rec.get("task") or rec.get("prompt_id") or rec.get("prompt_hash") or "task")
+            patch_id = str(rec.get("patch_id") or rec.get("prompt_hash") or rec.get("task") or "")
+            patch_key = patch_id or task
+            if patch_key and patch_key in seen_patches:
+                continue
+            hints = rec.get("file_candidates") or rec.get("file_hints") or ""
+            metrics = rec.get("metrics") or {}
+            try:
+                confidence = float(metrics.get("pass_rate", 0.0))
+            except Exception:
+                confidence = 0.0
+            candidates: List[str] = []
+            if isinstance(hints, str):
+                candidates = [h.strip() for h in hints.split(",") if h.strip()]
+            elif isinstance(hints, (list, tuple)):
+                candidates = [str(h).strip() for h in hints if str(h).strip()]
+            for hint in candidates:
+                graph.add_file_hint(task, hint, confidence)
+            if patch_key:
+                seen_patches.add(patch_key)
+        for event in retrieval_events or []:
+            query = str(event.get("query") or "")
+            if not query:
+                continue
+            event_id = str(event.get("event_id") or "")
+            if not event_id:
+                event_id = f"{query}::{event.get('timestamp', '')}"
+            if event_id and event_id in seen_events:
+                continue
+            query_key = f"query::{query}"
+            hits = event.get("hits") or []
+            for hit in hits:
+                try:
+                    path = str(hit.get("path") or "")
+                except Exception:
+                    path = ""
+                if not path:
+                    continue
+                try:
+                    score = float(hit.get("score", 0.0))
+                except Exception:
+                    score = 0.0
+                graph.add_reference(query_key, f"file::{path}", weight=score)
+            if event_id:
+                seen_events.add(event_id)
+        self.flush()
+        return graph
+
+    def summary(self, *, limit: int = 8) -> Dict[str, Any]:
+        graph = self.graph()
+        top_files = graph.top_targets(prefix="file::", limit=limit)
+        top_queries = graph.top_targets(prefix="query::", limit=limit)
+        return {
+            "top_files": [{"path": path, "confidence": score} for path, score in top_files],
+            "top_queries": [{"query": query, "strength": score} for query, score in top_queries],
+            "totals": graph.summarise(),
+        }
+
 
 def compute_retrieval_features(
     workspace: Path,
     patches: Iterable[Dict[str, object]],
     retrieval_events: Optional[Iterable[Dict[str, object]]] = None,
+    *,
+    update_memory: bool = True,
 ) -> List[float]:
-    kg = AgentKnowledgeGraph()
+    store = GraphMemoryStore(workspace)
+    if update_memory:
+        kg = store.update_from_signals(patches=patches, retrieval_events=retrieval_events or [])
+    else:
+        kg = store.graph()
     precision_samples = []
     coverage_nodes: set[str] = set()
     retrieval_scores: List[float] = []
@@ -80,8 +270,7 @@ def compute_retrieval_features(
         elif isinstance(hints, (list, tuple)):
             candidates = [str(h).strip() for h in hints if str(h).strip()]
         for hint in candidates:
-                kg.add_file_hint(task, hint, pass_rate)
-                coverage_nodes.add(hint)
+            coverage_nodes.add(hint)
         if candidates:
             precision_samples.append(pass_rate)
     if retrieval_events:
@@ -105,12 +294,13 @@ def compute_retrieval_features(
                     score = float(hit.get('score', 0.0))
                 except Exception:
                     score = 0.0
-                kg.add_reference(query_key, f"file::{path}", weight=score)
                 retrieval_scores.append(score)
                 coverage_nodes.add(path)
             query_count += 1.0
     summary = kg.summarise()
     precision = sum(precision_samples) / len(precision_samples) if precision_samples else 0.0
+    if not coverage_nodes:
+        coverage_nodes = {name for name, _ in kg.top_targets(prefix="file::", limit=128)}
     coverage = len(coverage_nodes)
     avg_score = sum(retrieval_scores) / len(retrieval_scores) if retrieval_scores else 0.0
     return [
@@ -121,8 +311,14 @@ def compute_retrieval_features(
         float(precision),
         float(coverage),
         float(avg_score),
-        float(query_count),
+        float(query_count) if query_count else float(len(kg.top_targets(prefix="query::", limit=256))),
     ]
+
+
+def summarize_graph_memory(workspace: Path, *, limit: int = 8) -> Dict[str, Any]:
+    """Return a cached summary of the graph memory for UI/prompt consumption."""
+    store = GraphMemoryStore(workspace)
+    return store.summary(limit=limit)
 
 
 def log_retrieval_event(workspace: Path, query: str, hits: Iterable[Mapping[str, object]], *, limit: int = 20) -> None:
@@ -160,6 +356,15 @@ def log_retrieval_event(workspace: Path, query: str, hits: Iterable[Mapping[str,
     try:
         with log_path.open('a', encoding='utf-8') as fh:
             fh.write(json.dumps(record) + '\n')
+    except Exception:
+        pass
+
+    # Update persistent graph memory
+    try:
+        GraphMemoryStore(ww).update_from_signals(
+            patches=[],
+            retrieval_events=[record],
+        )
     except Exception:
         pass
 

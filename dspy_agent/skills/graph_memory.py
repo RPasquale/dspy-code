@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import dspy
 
-from ..agentic import load_retrieval_events
+from ..agentic import load_retrieval_events, summarize_graph_memory
 from ..context.context_manager import ContextManager
 from ..rl.rlkit import AgentResult, RewardConfig, aggregate_reward, get_verifiers
 from ..signatures.graph_memory import GraphMemorySummary, GraphMemorySummarySig
@@ -206,6 +206,14 @@ class GraphMemoryExplorer:
             query = str(ev.get('query', ''))
             hits = len(ev.get('hits', []) or [])
             focus_lines.append(f"Retrieval: {query[:60]} ({hits} hits)")
+        try:
+            gm_summary = summarize_graph_memory(self.workspace, limit=5)
+        except Exception:
+            gm_summary = {}
+        top_files = gm_summary.get('top_files') if isinstance(gm_summary, dict) else None
+        if top_files:
+            for entry in top_files[:3]:
+                focus_lines.append(f"Graph focus: {entry.get('path','')} ({float(entry.get('confidence',0.0)):.2f})")
         metrics = {
             'memory_precision': float(feats[4]) if len(feats) > 4 else 0.0,
             'memory_coverage': min(1.0, float(feats[5]) / 50.0) if len(feats) > 5 else 0.0,

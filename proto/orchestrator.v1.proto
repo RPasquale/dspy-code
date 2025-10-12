@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package orchestrator.v1;
+
+option go_package = "github.com/dspy/orchestrator/internal/pb/orchestrator";
+
+// Orchestrator service for Python agent communication
+service OrchestratorService {
+  // Submit a task for execution
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  
+  // Stream task results as they complete
+  rpc StreamTaskResults(StreamTaskResultsRequest) returns (stream TaskResult);
+  
+  // Create a workflow
+  rpc CreateWorkflow(CreateWorkflowRequest) returns (CreateWorkflowResponse);
+  
+  // Start a workflow run
+  rpc StartWorkflowRun(StartWorkflowRunRequest) returns (StartWorkflowRunResponse);
+  
+  // Stream workflow run status updates
+  rpc StreamWorkflowStatus(StreamWorkflowStatusRequest) returns (stream WorkflowStatusUpdate);
+  
+  // Get system metrics
+  rpc GetMetrics(GetMetricsRequest) returns (MetricsResponse);
+  
+  // Stream system events
+  rpc StreamEvents(StreamEventsRequest) returns (stream SystemEvent);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Task submission
+message SubmitTaskRequest {
+  string id = 1;
+  string class = 2; // cpu_short, cpu_long, gpu, gpu_slurm
+  map<string, string> payload = 3;
+  int32 priority = 4;
+  string workflow_id = 5;
+}
+
+message SubmitTaskResponse {
+  bool success = 1;
+  string task_id = 2;
+  string error = 3;
+}
+
+// Task results streaming
+message StreamTaskResultsRequest {
+  repeated string task_ids = 1; // empty = all tasks
+  bool include_completed = 2;
+}
+
+message TaskResult {
+  string task_id = 1;
+  string status = 2; // pending, running, completed, failed
+  map<string, string> result = 3;
+  string error = 4;
+  double duration_ms = 5;
+  int64 completed_at = 6;
+}
+
+// Workflow management
+message CreateWorkflowRequest {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  bytes spec = 4; // JSON workflow specification
+}
+
+message CreateWorkflowResponse {
+  bool success = 1;
+  string workflow_id = 2;
+  string error = 3;
+}
+
+message StartWorkflowRunRequest {
+  string workflow_id = 1;
+  string idempotency_key = 2;
+  map<string, string> input = 3;
+}
+
+message StartWorkflowRunResponse {
+  bool success = 1;
+  string run_id = 2;
+  string error = 3;
+}
+
+message StreamWorkflowStatusRequest {
+  string run_id = 1;
+}
+
+message WorkflowStatusUpdate {
+  string run_id = 1;
+  string status = 2; // pending, running, completed, failed
+  string current_step = 3;
+  int32 steps_completed = 4;
+  int32 total_steps = 5;
+  map<string, string> output = 6;
+  string error = 7;
+}
+
+// Metrics
+message GetMetricsRequest {
+  repeated string metric_names = 1; // empty = all metrics
+}
+
+message MetricsResponse {
+  map<string, double> metrics = 1;
+  int64 timestamp = 2;
+}
+
+// Event streaming
+message StreamEventsRequest {
+  repeated string event_types = 1; // empty = all events
+  int64 since_timestamp = 2;
+}
+
+message SystemEvent {
+  string event_type = 1; // task_submitted, task_completed, task_failed, workflow_started, etc.
+  string resource_id = 2; // task_id, workflow_id, etc.
+  map<string, string> data = 3;
+  int64 timestamp = 4;
+}
+
+// Health
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string version = 2;
+  map<string, string> services = 3; // service_name -> status
+}
+

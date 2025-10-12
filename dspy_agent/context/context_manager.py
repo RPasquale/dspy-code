@@ -12,7 +12,12 @@ from ..db import (
     get_enhanced_data_manager, ContextState, PatchRecord, LogEntry,
     Environment, AgentState, create_log_entry
 )
-from ..agentic import compute_retrieval_features, load_retrieval_events
+from ..agentic import (
+    GraphMemoryStore,
+    compute_retrieval_features,
+    load_retrieval_events,
+    summarize_graph_memory,
+)
 
 
 def _tail_jsonl(path: Path, limit: int = 10) -> List[Dict[str, Any]]:
@@ -59,6 +64,11 @@ class ContextManager:
         patches = self._recent_patches(max_patches)
         retrieval_events = self._recent_retrieval_events(max_patches)
         summary = self._code_summary()
+        graph_summary = {}
+        try:
+            graph_summary = summarize_graph_memory(self.workspace, limit=8)
+        except Exception:
+            graph_summary = {}
         segments: List[str] = []
         if logs_text:
             segments.append("Recent errors and logs:\n" + logs_text)
@@ -82,6 +92,15 @@ class ContextManager:
                 hits = ev.get('hits') or []
                 retrieval_lines.append(f"- {ev.get('query', '')} → {len(hits)} hit(s)")
             segments.append("Recent retrievals:\n" + "\n".join(retrieval_lines))
+        if graph_summary:
+            top_files = graph_summary.get('top_files') or []
+            if top_files:
+                lines = []
+                for entry in top_files[:max_patches]:
+                    path = entry.get('path', '')
+                    conf = entry.get('confidence', 0.0)
+                    lines.append(f"- {path} (confidence={float(conf):.2f})")
+                segments.append("Graph memory recommendations:\n" + "\n".join(lines))
         combined = ("\n\n".join(segments)).strip()
         stats = self._history_stats(patches)
         unique_hints = list(dict.fromkeys([hint for hint in file_candidates if hint]))
@@ -96,6 +115,7 @@ class ContextManager:
             'file_hints': ','.join(unique_hints),
             'retrieval_events': retrieval_events,
             'kg_features': kg_features,
+            'graph_memory': graph_summary,
         }
 
     def _recent_logs(self, max_chars: int = 4000) -> str:
@@ -301,6 +321,18 @@ class ContextManager:
             environment=self.environment
         )
         self.data_manager.log(patch_log)
+
+        # Update graph memory with confirmed patch outcome
+        try:
+            GraphMemoryStore(self.workspace).update_from_signals(
+                patches=[{
+                    'task': patch_record.prompt_hash,
+                    'file_candidates': target_files,
+                    'metrics': {'pass_rate': confidence_score},
+                }]
+            )
+        except Exception:
+            pass
         
         return patch_record
     
@@ -344,7 +376,8 @@ class ContextManager:
             'performance_summary': performance_summary,
             'workspace_size': self._get_workspace_size(),
             'environment': self.environment.value,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'graph_memory': traditional_context.get('graph_memory', {}),
         }
         
         return enhanced_context

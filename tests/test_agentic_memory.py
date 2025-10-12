@@ -17,7 +17,9 @@ import pytest
 
 from dspy_agent.agentic.memory import (
     AgentKnowledgeGraph,
+    GraphMemoryStore,
     compute_retrieval_features,
+    summarize_graph_memory,
     log_retrieval_event,
     load_retrieval_events,
     query_retrieval_events,
@@ -61,8 +63,9 @@ class TestAgentKnowledgeGraph:
         kg.add_file_hint("task", "file.py", 0.3)
         
         edge = ("task::task", "file::file.py")
-        assert kg.edges[edge]["weight"] == 0.9  # Should keep max weight
-        assert kg.edges[edge]["count"] == 3.0   # Should increment count
+        assert kg.edges[edge]["count"] == 3.0
+        assert 0.0 <= kg.edges[edge]["weight"] <= 1.0
+        assert kg.edges[edge]["last_confidence"] == pytest.approx(0.3)
 
     def test_add_reference(self):
         """Test adding references between nodes."""
@@ -158,123 +161,96 @@ class TestAgentKnowledgeGraph:
 class TestComputeRetrievalFeatures:
     """Test the compute_retrieval_features function."""
 
-    def test_compute_features_empty_input(self):
-        """Test with empty patches and no retrieval events."""
-        workspace = Path("/tmp/test")
-        features = compute_retrieval_features(workspace, [], None)
-        
-        expected = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        assert features == expected
+    def test_compute_features_empty_input(self, tmp_path):
+        features = compute_retrieval_features(tmp_path, [], None)
+        assert features == [0.0] * 8
 
-    def test_compute_features_with_patches(self):
-        """Test feature computation with patch data."""
-        workspace = Path("/tmp/test")
+    def test_compute_features_with_patches(self, tmp_path):
         patches = [
-            {
-                "task": "implement feature",
-                "file_hints": "src/main.py,src/utils.py",
-                "metrics": {"pass_rate": 0.8}
-            },
-            {
-                "task": "fix bug",
-                "file_candidates": ["src/bug.py"],
-                "metrics": {"pass_rate": 0.6}
-            }
+            {"task": "implement feature", "file_hints": "src/main.py,src/utils.py", "metrics": {"pass_rate": 0.8}},
+            {"task": "fix bug", "file_candidates": ["src/bug.py"], "metrics": {"pass_rate": 0.6}},
         ]
-        
-        features = compute_retrieval_features(workspace, patches, None)
-        
-        # Should have 8 features
-        assert len(features) == 8
-        # Should have nodes and edges from the patches
-        assert features[0] > 0  # kg_nodes
-        assert features[1] > 0  # kg_edges
-        assert features[4] > 0  # precision (average pass_rate)
-        assert features[5] > 0  # coverage (unique files)
-
-    def test_compute_features_with_retrieval_events(self):
-        """Test feature computation with retrieval events."""
-        workspace = Path("/tmp/test")
-        patches = []
-        retrieval_events = [
-            {
-                "query": "find function",
-                "hits": [
-                    {"path": "src/func.py", "score": 0.9},
-                    {"path": "src/helper.py", "score": 0.7}
-                ]
-            }
-        ]
-        
-        features = compute_retrieval_features(workspace, patches, retrieval_events)
-        
+        features = compute_retrieval_features(tmp_path, patches, None)
         assert len(features) == 8
         assert features[0] > 0  # kg_nodes
         assert features[1] > 0  # kg_edges
-        assert features[6] > 0  # avg_score
-        assert features[7] == 1.0  # query_count
+        assert features[4] > 0  # precision
+        assert features[5] == 3.0  # coverage for three files
 
-    def test_compute_features_mixed_data(self):
-        """Test with both patches and retrieval events."""
-        workspace = Path("/tmp/test")
-        patches = [
-            {
-                "task": "test task",
-                "file_hints": "test.py",
-                "metrics": {"pass_rate": 0.5}
-            }
-        ]
-        retrieval_events = [
-            {
-                "query": "test query",
-                "hits": [{"path": "test.py", "score": 0.8}]
-            }
-        ]
-        
-        features = compute_retrieval_features(workspace, patches, retrieval_events)
-        
+    def test_compute_features_with_retrieval_events(self, tmp_path):
+        retrieval_events = [{
+            "event_id": "evt-1",
+            "query": "find function",
+            "hits": [
+                {"path": "src/func.py", "score": 0.9},
+                {"path": "src/helper.py", "score": 0.7},
+            ],
+        }]
+        features = compute_retrieval_features(tmp_path, [], retrieval_events)
         assert len(features) == 8
-        # Should combine data from both sources
-        assert features[0] > 0  # kg_nodes
-        assert features[1] > 0  # kg_edges
+        assert features[0] > 0
+        assert features[1] > 0
+        assert features[6] > 0
+        assert features[7] == 1.0
 
-    def test_compute_features_error_handling(self):
-        """Test error handling in feature computation."""
-        workspace = Path("/tmp/test")
-        patches = [
-            {
-                "task": "test",
-                "file_hints": "file.py",
-                "metrics": {"pass_rate": "invalid"}  # Invalid pass_rate
-            }
-        ]
-        
-        features = compute_retrieval_features(workspace, patches, None)
-        
-        # Should handle errors gracefully
+    def test_compute_features_mixed_data(self, tmp_path):
+        patches = [{"task": "test task", "file_hints": "test.py", "metrics": {"pass_rate": 0.5}}]
+        retrieval_events = [{"event_id": "evt-2", "query": "test query", "hits": [{"path": "test.py", "score": 0.8}]}]
+        features = compute_retrieval_features(tmp_path, patches, retrieval_events)
         assert len(features) == 8
-        assert features[4] == 0.0  # precision should be 0 due to error
+        assert features[0] > 0
+        assert features[1] > 0
+        assert features[4] > 0
+        assert features[6] > 0
 
-    def test_compute_features_different_hint_formats(self):
-        """Test with different file hint formats."""
-        workspace = Path("/tmp/test")
-        patches = [
-            {
-                "task": "task1",
-                "file_hints": "file1.py,file2.py",  # String format
-                "metrics": {"pass_rate": 0.5}
-            },
-            {
-                "task": "task2",
-                "file_candidates": ["file3.py", "file4.py"],  # List format
-                "metrics": {"pass_rate": 0.7}
-            }
-        ]
-        
-        features = compute_retrieval_features(workspace, patches, None)
-        
+    def test_compute_features_error_handling(self, tmp_path):
+        patches = [{"task": "test", "file_hints": "file.py", "metrics": {"pass_rate": "invalid"}}]
+        features = compute_retrieval_features(tmp_path, patches, None)
         assert len(features) == 8
-        assert features[5] == 4.0  # coverage should be 4 unique files
+        assert features[4] == 0.0
+
+    def test_compute_features_different_hint_formats(self, tmp_path):
+        patches = [
+            {"task": "task1", "file_hints": "file1.py,file2.py", "metrics": {"pass_rate": 0.5}},
+            {"task": "task2", "file_candidates": ["file3.py", "file4.py"], "metrics": {"pass_rate": 0.7}},
+        ]
+        features = compute_retrieval_features(tmp_path, patches, None)
+        assert len(features) == 8
+        assert features[5] == 4.0
+
+
+class TestGraphMemoryStore:
+    """Tests for persistent graph memory storage and summaries."""
+
+    def test_graph_memory_store_persistence_and_dedup(self, tmp_path):
+        store = GraphMemoryStore(tmp_path)
+        patches = [{
+            "task": "fix login",
+            "patch_id": "patch-1",
+            "file_candidates": ["app/auth.py"],
+            "metrics": {"pass_rate": 0.9},
+        }]
+        retrievals = [{
+            "event_id": "event-1",
+            "query": "login failure",
+            "hits": [{"path": "app/auth.py", "score": 0.75}],
+        }]
+
+        store.update_from_signals(patches=patches, retrieval_events=retrievals)
+        summary = store.summary(limit=5)
+        assert summary["top_files"]
+        assert summary["top_files"][0]["path"] == "app/auth.py"
+        graph = store.graph()
+        edge = ("task::fix login", "file::app/auth.py")
+        assert edge in graph.edges
+        assert graph.edges[edge]["count"] == pytest.approx(1.0)
+
+        store.update_from_signals(patches=patches, retrieval_events=retrievals)
+        graph_after = store.graph()
+        assert graph_after.edges[edge]["count"] == pytest.approx(1.0)
+
+        summary_again = summarize_graph_memory(tmp_path, limit=3)
+        assert summary_again["top_files"][0]["path"] == "app/auth.py"
 
 
 class TestLogRetrievalEvent:
@@ -648,7 +624,7 @@ class TestIntegration:
         
         # Verify node degrees are tracked
         task_node = kg.nodes["task::task1"]
-        assert task_node["degree"] == 0.0  # Default degree
+        assert task_node["degree"] == pytest.approx(2.0)
         
         # Verify edge weights are correct
         edge1 = ("task::task1", "file::file1.py")

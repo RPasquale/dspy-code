@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import hashlib
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Iterable
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import deque
@@ -16,6 +16,9 @@ from ..db import (
     Environment, ActionType, AgentState, 
     create_action_record, create_log_entry
 )
+from ..agentic import summarize_graph_memory
+from ..context.context_manager import ContextManager
+from ..reasoning import ReasoningHarness
 
 
 TOOLS = [
@@ -446,6 +449,19 @@ class Orchestrator(dspy.Module):
         # Initialize memory if workspace provided
         if workspace:
             self.memory = SessionMemory(workspace)
+        self._context_manager: Optional[ContextManager] = None
+        self._reasoning_cache: Dict[str, Tuple[float, str]] = {}
+        self.reasoner: Optional[ReasoningHarness] = None
+        if workspace:
+            try:
+                logs_path = workspace / 'logs'
+                self._context_manager = ContextManager(workspace, logs_path if logs_path.exists() else None)
+            except Exception:
+                self._context_manager = None
+            try:
+                self.reasoner = ReasoningHarness(workspace)
+            except Exception:
+                self.reasoner = None
             
         # Optional signature tagging for analytics
         self.signature_name: Optional[str] = None
@@ -467,6 +483,91 @@ class Orchestrator(dspy.Module):
     def set_signature_name(self, name: Optional[str]) -> None:
         """Tag subsequent actions with a signature name for analytics (optional)."""
         self.signature_name = name if (isinstance(name, str) and name.strip()) else None
+
+    def _build_reasoning_cues(self, query: str, *, ttl: float = 25.0) -> str:
+        """Assemble a compact reasoning scaffold for the orchestrator LLM."""
+        if not self.workspace:
+            return ""
+        cache_key = "__workspace__"
+        now = time.time()
+        cached = self._reasoning_cache.get(cache_key)
+        if cached and (now - cached[0]) < ttl:
+            base_context = cached[1]
+        else:
+            parts: List[str] = []
+            # Graph memory hotspots
+            try:
+                summary = summarize_graph_memory(self.workspace, limit=5)
+            except Exception:
+                summary = {}
+            if isinstance(summary, dict) and summary:
+                top_files = summary.get("top_files") or []
+                if top_files:
+                    focus = ", ".join(
+                        f"{entry.get('path','')[:60]}({float(entry.get('confidence',0.0)):.2f})"
+                        for entry in top_files[:3]
+                    )
+                    if focus:
+                        parts.append(f"graph_focus={focus}")
+                totals = summary.get("totals") or {}
+                if isinstance(totals, dict) and totals:
+                    nodes = float(totals.get("kg_nodes", 0.0) or 0.0)
+                    edges = float(totals.get("kg_edges", 0.0) or 0.0)
+                    avg_weight = float(totals.get("kg_avg_weight", 0.0) or 0.0)
+                    parts.append(f"graph_stats=nodes:{nodes:.0f}/edges:{edges:.0f}/avg_w:{avg_weight:.2f}")
+            # Recent context features
+            bundle: Dict[str, Any] = {}
+            if self._context_manager is not None:
+                try:
+                    bundle = self._context_manager.build_patch_context("orchestrator-brief", max_patches=3)
+                except Exception:
+                    bundle = {}
+            if bundle:
+                stats = bundle.get("stats") or {}
+                if isinstance(stats, dict) and stats:
+                    success = float(stats.get("recent_success_rate", 0.0) or 0.0)
+                    failures = float(stats.get("recent_failure_rate", 0.0) or 0.0)
+                    parts.append(f"recent_stats=success:{success:.2f}/fail:{failures:.2f}")
+                hints = (bundle.get("file_hints") or "").strip()
+                if hints:
+                    parts.append(f"recent_hints={hints[:160]}")
+                kg_feats = bundle.get("kg_features") or []
+                if isinstance(kg_feats, list) and len(kg_feats) >= 6:
+                    parts.append(
+                        "memory_metrics=precision:{:.2f}/coverage:{:.0f}/avg_score:{:.2f}".format(
+                            float(kg_feats[4]), float(kg_feats[5]), float(kg_feats[6])
+                        )
+                    )
+                retrievals = bundle.get("retrieval_events") or []
+                if isinstance(retrievals, list) and retrievals:
+                    recents = []
+                    for ev in retrievals[:2]:
+                        query_txt = str(ev.get("query", ""))[:60]
+                        hits = len(ev.get("hits", []) or [])
+                        recents.append(f"{query_txt} ({hits} hits)")
+                    if recents:
+                        parts.append("recent_retrievals=" + " | ".join(recents))
+            base_context = "; ".join(parts[:6])
+            self._reasoning_cache[cache_key] = (now, base_context)
+        if self.memory:
+            mission = (self.memory.mission or "").strip()
+            if mission:
+                base_context = f"{base_context}; mission={mission}" if base_context else f"mission={mission}"
+            scratch = []
+            for bucket in ("hypotheses", "todos"):
+                entries = self.memory.scratchpad.get(bucket) or []
+                if entries:
+                    scratch.append(f"{bucket}={'; '.join(entries[-2:])}")
+            if scratch:
+                scratch_text = " | ".join(scratch)
+                base_context = f"{base_context}; memory={scratch_text}" if base_context else f"memory={scratch_text}"
+        # Mention the current query focus to steer the LLM but avoid redundancy.
+        query_focus = query.strip().replace("\n", " ")[:160]
+        if base_context:
+            cue = f"{base_context}; query_focus={query_focus}"
+        else:
+            cue = f"query_focus={query_focus}"
+        return cue[:600]
 
     def __call__(self, query: str, state: str, memory: Optional[SessionMemory] = None):
         """Enhanced forward with memory, caching, and performance tracking"""
@@ -512,6 +613,27 @@ class Orchestrator(dspy.Module):
                     initial_state["policy_applied"] = True
             except Exception:
                 pass
+        reasoning_cues = self._build_reasoning_cues(query)
+        if reasoning_cues:
+            enhanced_state = f"{enhanced_state} | reasoning: {reasoning_cues}"
+            initial_state["reasoning_cues"] = reasoning_cues
+        reasoning_plan_text = ""
+        reasoning_bundle = None
+        if self.reasoner is not None:
+            try:
+                reasoning_bundle = self.reasoner.run(query, context=reasoning_cues)
+            except Exception:
+                reasoning_bundle = None
+        if reasoning_bundle is not None:
+            reasoning_plan_text = reasoning_bundle.to_prompt(max_chars=500)
+            initial_state["reasoning_plan"] = reasoning_bundle.to_dict()
+        if reasoning_plan_text:
+            enhanced_state = f"{enhanced_state} | plan: {reasoning_plan_text}"
+            if self.memory:
+                try:
+                    self.memory.add_scratchpad_entry("hypotheses", reasoning_plan_text[:200])
+                except Exception:
+                    pass
         
         # Check cache first
         cache_key = self._get_cache_key(query, enhanced_state)

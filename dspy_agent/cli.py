@@ -147,7 +147,7 @@ from .code_tools.code_search import (
     ast_grep_available,
 )
 from .code_tools.code_snapshot import build_code_snapshot
-from .code_tools.patcher import apply_unified_patch, summarize_patch
+from .code_tools.patcher import apply_unified_patch, summarize_patch, revert_unified_patch, run_shell, files_from_patch
 from .embedding.indexer import build_index, save_index, load_index, semantic_search
 # Many heavy dependencies are imported lazily inside command handlers to
 # keep CLI startup lightweight in constrained environments.
@@ -156,6 +156,7 @@ from .training.train_prefs import train_preference_rewriter
 from .training.train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
 from .training.train_codegen import run_gepa_codegen
 from .training.autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
+from .infra import AgentInfra
 from .training.rl_sweep import run_sweep as _run_rl_sweep, load_sweep_config as _load_sweep_config, SweepSettings as _SweepSettings
 from .agents.orchestrator_runtime import evaluate_tool_choice
 from .embedding.indexer import tokenize
@@ -2336,6 +2337,32 @@ def _build_patch_context_bundle(workspace: Path, logs: Path, task: str) -> dict:
                 parts.append("Recent retrievals:\n" + "\n".join(sample))
         except Exception:
             pass
+    graph_memory = bundle.get('graph_memory') or {}
+    if isinstance(graph_memory, dict) and graph_memory:
+        top_files = graph_memory.get('top_files') or []
+        if top_files:
+            try:
+                gm_lines = []
+                for entry in top_files[:5]:
+                    path = str(entry.get('path', ''))
+                    conf = float(entry.get('confidence', 0.0) or 0.0)
+                    gm_lines.append(f"- {path} (confidence={conf:.2f})")
+                if gm_lines:
+                    parts.append("Graph memory focus:\n" + "\n".join(gm_lines))
+            except Exception:
+                pass
+        totals = graph_memory.get('totals') or {}
+        if isinstance(totals, dict) and totals:
+            try:
+                parts.append(
+                    "Graph memory stats: nodes={nodes:.0f} edges={edges:.0f} avg_weight={avg:.2f}".format(
+                        nodes=float(totals.get('kg_nodes', 0.0) or 0.0),
+                        edges=float(totals.get('kg_edges', 0.0) or 0.0),
+                        avg=float(totals.get('kg_avg_weight', 0.0) or 0.0),
+                    )
+                )
+            except Exception:
+                pass
     hist_stats = bundle.get('stats') or {}
     if isinstance(hist_stats, dict) and hist_stats:
         try:
@@ -6139,6 +6166,103 @@ def teleprompt(
             console.print(f"[yellow]Could not save program: {e}[/yellow]")
 
 
+def _append_feedback(existing: str, message: str) -> str:
+    msg = (message or "").strip()
+    if not msg:
+        return existing
+    return f"{existing}\n{msg}" if existing else msg
+
+
+def _extract_primary_command(plan_text: str) -> Optional[str]:
+    for line in (plan_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if lower.startswith("commands:"):
+            candidate = stripped.split(":", 1)[1].strip()
+            if candidate:
+                return candidate
+        if lower.startswith("- "):
+            candidate = stripped[1:].strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _detect_default_commands(workspace: Path) -> Tuple[Optional[str], Optional[str]]:
+    lint_cmd: Optional[str] = None
+    test_cmd: Optional[str] = None
+    ws = workspace.resolve()
+    pyproject = ws / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            snippet = pyproject.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            snippet = ""
+        lowered = snippet.lower()
+        if "tool.ruff" in lowered:
+            lint_cmd = lint_cmd or "uv run ruff check ."
+        elif "flake8" in lowered:
+            lint_cmd = lint_cmd or "uv run flake8 ."
+        elif "isort" in lowered:
+            lint_cmd = lint_cmd or "uv run isort --check-only ."
+        if "pytest" in lowered:
+            test_cmd = test_cmd or "uv run pytest"
+    if lint_cmd is None:
+        if (ws / "ruff.toml").exists() or (ws / ".ruff.toml").exists():
+            lint_cmd = "uv run ruff check ."
+        elif (ws / ".flake8").exists():
+            lint_cmd = "uv run flake8 ."
+    if test_cmd is None:
+        if (ws / "pytest.ini").exists() or (ws / "conftest.py").exists() or (ws / "tests").exists():
+            test_cmd = "uv run pytest"
+    package_json = ws / "package.json"
+    if package_json.exists():
+        try:
+            pkg = json.loads(package_json.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            pkg = {}
+        scripts = pkg.get("scripts") if isinstance(pkg, dict) else {}
+        if isinstance(scripts, dict):
+            if "lint" in scripts:
+                lint_cmd = lint_cmd or "npm run lint"
+            if "test" in scripts:
+                test_cmd = test_cmd or "npm test"
+    return lint_cmd, test_cmd
+
+
+def _run_validation_commands(
+    workspace: Path,
+    patch_text: str,
+    commands: List[Tuple[str, str]],
+    *,
+    timeout: int = 600,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Apply the patch temporarily, run validation commands, then revert."""
+    results: Dict[str, Any] = {}
+    if not commands:
+        return True, "", results
+
+    ok_apply, apply_msg = apply_unified_patch(patch_text, workspace)
+    if not ok_apply:
+        return False, f"failed to apply patch for validation: {apply_msg}", results
+    try:
+        for label, cmd in commands:
+            results[f"{label}_command"] = cmd
+            code, stdout, stderr = run_shell(cmd, workspace, timeout=timeout)
+            results[f"{label}_exit_code"] = code
+            if stdout:
+                results[f"{label}_stdout"] = stdout[-4000:]
+            if stderr:
+                results[f"{label}_stderr"] = stderr[-4000:]
+            if code != 0:
+                return False, f"{label} command failed (exit {code}):\n{stderr or stdout}", results
+        return True, "", results
+    finally:
+        revert_unified_patch(patch_text, workspace)
+
+
 @app.command("edit")
 def code_edit(
     task: str = typer.Argument(..., help="Describe the code change you want"),
@@ -6155,9 +6279,23 @@ def code_edit(
     speculative: bool = typer.Option(False, '--speculative/--no-speculative', help='Use draft model for speculative pass'),
     draft_model: Optional[str] = typer.Option(None, '--draft-model', help='Draft LM (e.g., qwen2:0.5b)'),
     profile: Optional[str] = typer.Option(None, '--profile', help='Performance profile: fast|balanced|maxquality'),
+    iterations: int = typer.Option(2, '--iterations', help='Maximum refinement iterations'),
+    auto_tests: bool = typer.Option(False, '--auto-tests/--no-auto-tests', help='Run validation tests when available'),
+    auto_lint: bool = typer.Option(False, '--auto-lint/--no-auto-lint', help='Run lint command when available'),
+    lint_cmd: Optional[str] = typer.Option(None, '--lint-cmd', help='Lint command to execute when auto-lint is enabled'),
+    test_cmd: Optional[str] = typer.Option(None, '--test-cmd', help='Override test command (defaults to plan suggestion)'),
 ):
     # Metrics: tool.start for non-chat command
-    _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _args = {'task': task, 'workspace': str(workspace), 'apply': bool(apply), 'beam_k': int(beam_k), 'speculative': bool(speculative)}
+    _t0 = time.time(); _sess = f"cli:{int(_t0)}"; _args = {
+        'task': task,
+        'workspace': str(workspace),
+        'apply': bool(apply),
+        'beam_k': int(beam_k),
+        'speculative': bool(speculative),
+        'iterations': int(iterations),
+        'auto_tests': bool(auto_tests),
+        'auto_lint': bool(auto_lint),
+    }
     try:
         _stream_metric_event(workspace, 'tool.start', {'tool': 'code_edit', 'args': _args, 'step': 0, 'session': _sess})
     except Exception:
@@ -6172,17 +6310,21 @@ def code_edit(
     _render_recent_fixes(console, bundle)
     ctx_text = context or bundle.get('combined_context', '')
     from .skills.code_edit import CodeEdit
+    from .reasoning.coding import CodingReasoner
     code_graph = _get_code_summary(workspace)
     hints = file_hints or bundle.get('file_hints', '')
-    locator_info = None
-    try:
-        if not hints:
-            fl = FileLocator()
-            loc = fl(task=task, context=ctx_text, code_graph=code_graph)
-            locator_info = loc
-            hints = (loc.file_candidates or "")
-    except Exception:
-        pass
+
+    coding_reasoner = CodingReasoner(workspace)
+    coding_plan = coding_reasoner.build(task, ctx_text, code_graph=code_graph, existing_file_hints=hints)
+    plan_block = coding_plan.as_context_block()
+    if plan_block:
+        console.print(Panel(plan_block, title='Coding plan', border_style='magenta'))
+    hints_combined = coding_plan.merged_file_hints(hints)
+    ctx_with_plan = ctx_text
+    if plan_block:
+        ctx_with_plan = f"{ctx_text}\n\n{plan_block}"
+    test_strategy = coding_plan.test_plan
+    plan_text = coding_plan.plan
     # Profile defaults
     # Load persisted profile if not provided
     if not profile:
@@ -6215,39 +6357,140 @@ def code_edit(
 
     _apply_profile()
 
-    # Speculative draft pass
-    out = None
+    if coding_plan.target_files.strip():
+        console.print(Panel(coding_plan.target_files.strip(), title="Target Files", border_style="blue"))
+    if coding_plan.notes.strip():
+        console.print(Panel(coding_plan.notes.strip(), title="Reasoning Notes", border_style="dim"))
+    if coding_plan.test_plan.strip():
+        console.print(Panel(coding_plan.test_plan.strip(), title="Suggested Tests", border_style="green"))
+
+    iterations = max(1, int(iterations))
+    validation_commands: List[Tuple[str, str]] = []
+    detected_lint, detected_test = _detect_default_commands(workspace)
+    lint_command_value = (lint_cmd or os.getenv("DSPY_DEFAULT_LINT_CMD", "") or detected_lint or "").strip()
+    metrics_summary: Dict[str, Any] = {}
+    if auto_lint:
+        if lint_command_value:
+            validation_commands.append(("lint", lint_command_value))
+            metrics_summary['lint_command'] = lint_command_value
+        else:
+            console.print("[yellow]auto-lint enabled but no lint command provided; skipping lint.[/yellow]")
+    effective_test_cmd = (test_cmd or "").strip()
+    if auto_tests:
+        if not effective_test_cmd:
+            effective_test_cmd = detected_test or ""
+        if not effective_test_cmd:
+            inferred = _extract_primary_command(test_strategy)
+            effective_test_cmd = inferred or ""
+        effective_test_cmd = effective_test_cmd.strip()
+        if effective_test_cmd:
+            validation_commands.append(("tests", effective_test_cmd))
+            metrics_summary['tests_command'] = effective_test_cmd
+        else:
+            console.print("[yellow]auto-tests enabled but no test command available; skipping tests.[/yellow]")
+
+    candidate_queue: List[Tuple[str, SimpleNamespace]] = []
+    prior_errors = ""
     if speculative and draft_model:
         draft_lm = configure_lm(provider="ollama" if ollama else None, model_name=draft_model, base_url=base_url, api_key=api_key)
         with temporary_lm(draft_lm):
             ce_fast = CodeEdit(use_cot=None, beam_k=max(1, int(beam_k)))
-            cand = ce_fast(task=task, context=ctx_text[:8000], code_graph=code_graph, file_hints=hints)
-        # Verify quickly: must be ok and small
-        if getattr(cand, 'ok', False) and (getattr(cand, 'files', 0) <= 2) and (int(getattr(cand, 'added', 0)) + int(getattr(cand, 'removed', 0)) <= 80):
-            out = cand
+            draft_candidate = ce_fast(
+                task=task,
+                context=ctx_with_plan[:8000],
+                code_graph=code_graph,
+                file_hints=hints_combined,
+                reasoning_plan=plan_text,
+                target_files=coding_plan.target_files,
+                test_strategy=test_strategy,
+                prior_errors=prior_errors,
+            )
+        if draft_candidate is not None:
+            candidate_queue.append(("speculative", draft_candidate))
+
+    best_out: Optional[SimpleNamespace] = None
+    best_verifier: Optional[Any] = None
+    last_out: Optional[SimpleNamespace] = None
+    last_verifier: Optional[Any] = None
+    validation_metrics: Dict[str, Any] = {}
+
+    for iteration_index in range(1, iterations + 1):
+        if candidate_queue:
+            _, candidate = candidate_queue.pop(0)
+        else:
+            ce = CodeEdit(use_cot=None, beam_k=max(1, int(beam_k)))
+            candidate = ce(
+                task=task,
+                context=ctx_with_plan[:8000],
+                code_graph=code_graph,
+                file_hints=hints_combined,
+                reasoning_plan=plan_text,
+                target_files=coding_plan.target_files,
+                test_strategy=test_strategy,
+                prior_errors=prior_errors,
+            )
+        last_out = candidate
+        _print_header(f"Proposed Patch (iteration {iteration_index})")
+        console.print(candidate.patch or "(no patch)")
+        _maybe_panel_rationale(getattr(candidate, 'rationale', None), title="Rationale")
+        verifier = PatchVerifier(max_files=4, max_lines=200)
+        current_verifier = verifier(task=task, context=ctx_with_plan, patch=candidate.patch or "")
+        last_verifier = current_verifier
+        verdict = str(getattr(current_verifier, 'verdict', '')).lower()
+        if verdict != "pass":
+            feedback = getattr(current_verifier, 'reasons', '') or getattr(current_verifier, 'fix_suggestions', '') or verdict
+            console.print(Panel(str(feedback), title="Verifier feedback", border_style="red"))
+            prior_errors = _append_feedback(prior_errors, str(feedback))
+            continue
+        ok_validation, validation_feedback, validation_metrics = _run_validation_commands(
+            workspace,
+            candidate.patch or "",
+            validation_commands,
+        )
+        if not ok_validation:
+            console.print(Panel(validation_feedback, title="Validation failed", border_style="red"))
+            prior_errors = _append_feedback(prior_errors, validation_feedback)
+            continue
+        best_out = candidate
+        best_verifier = current_verifier
+        metrics_summary['iterations_used'] = iteration_index
+        break
+    else:
+        best_out = last_out
+        best_verifier = last_verifier
+        metrics_summary.setdefault('iterations_used', iterations)
+
+    out = best_out or last_out
     if out is None:
-        ce = CodeEdit(use_cot=None, beam_k=max(1, int(beam_k)))
-        out = ce(task=task, context=ctx_text[:8000], code_graph=code_graph, file_hints=hints)
-    _print_header("Proposed Patch")
-    console.print(out.patch or "(no patch)")
-    _maybe_panel_rationale(getattr(out, 'rationale', None), title="Rationale")
-    # Show locator output if available
-    if locator_info is not None:
-        _print_header("File Candidates")
-        try:
-            console.print(locator_info.file_candidates)
-            console.print(Panel.fit(str(getattr(locator_info, 'notes', '') or ''), title="Locator Notes", border_style="dim"))
-        except Exception:
-            pass
-    # Verify patch before applying
-    verifier = PatchVerifier(max_files=4, max_lines=200)
-    v = verifier(task=task, context=ctx_text, patch=out.patch or "")
+        out = SimpleNamespace(patch="", rationale="")
+    v = best_verifier or PatchVerifier(max_files=4, max_lines=200)(task=task, context=ctx_with_plan, patch=(out.patch if out else ""))
     _print_header("Patch Verification")
     console.print(Panel.fit(f"verdict={getattr(v, 'verdict', 'fail')} risk={getattr(v, 'risk_level', 'high')}", title="verifier", border_style="accent"))
     if getattr(v, 'reasons', None):
         console.print(Panel.fit(escape(getattr(v, 'reasons')), title="Reasons", border_style="yellow"))
     if getattr(v, 'fix_suggestions', None):
         console.print(Panel.fit(escape(getattr(v, 'fix_suggestions')), title="Suggestions", border_style="green"))
+    metrics_summary.update(validation_metrics)
+    metrics_summary['verifier_verdict'] = getattr(v, 'verdict', '')
+    metrics_summary['verifier_risk'] = getattr(v, 'risk_level', '')
+    metrics_summary.setdefault('iterations_used', iterations)
+    if out and out.patch:
+        try:
+            preview = summarize_patch(out.patch)
+            metrics_summary.setdefault('blast_radius', float(preview['added_lines'] + preview['removed_lines']))
+        except Exception:
+            pass
+    if 'lint_exit_code' in metrics_summary:
+        try:
+            metrics_summary['lint_ok'] = 1.0 if int(metrics_summary['lint_exit_code']) == 0 else 0.0
+        except Exception:
+            metrics_summary['lint_ok'] = 0.0
+    if 'tests_exit_code' in metrics_summary:
+        try:
+            metrics_summary['tests_passed'] = 1.0 if int(metrics_summary['tests_exit_code']) == 0 else 0.0
+            metrics_summary['tests_total'] = 1.0
+        except Exception:
+            metrics_summary['tests_passed'] = 0.0
     if apply and out.patch:
         if getattr(v, 'verdict', 'fail').lower() != 'pass':
             console.print(Panel.fit("Refusing to apply: verifier did not pass.", title="apply blocked", border_style="red"))
@@ -6258,10 +6501,11 @@ def code_edit(
                 # Record patch to RedDB for integrated learning
                 try:
                     from .context import ContextManager
-                    from .code_tools.patcher import summarize_patch, files_from_patch
                     cm_rec = ContextManager(workspace, workspace / 'logs')
                     summ = summarize_patch(out.patch)
                     targets = files_from_patch(out.patch)
+                    blast = float(summ.get('added_lines', 0) + summ.get('removed_lines', 0))
+                    metrics_summary['blast_radius'] = blast
                     test_meta = {
                         'verifier_verdict': getattr(v, 'verdict', ''),
                         'risk_level': getattr(v, 'risk_level', ''),
@@ -6269,9 +6513,14 @@ def code_edit(
                         'suggestions': getattr(v, 'fix_suggestions', ''),
                         'added_lines': summ.get('added_lines', 0),
                         'removed_lines': summ.get('removed_lines', 0),
+                        'reasoning_plan': plan_text,
+                        'test_plan': test_strategy,
+                        'target_files_summary': coding_plan.target_files,
                     }
+                    for key, value in metrics_summary.items():
+                        if isinstance(value, (int, float, str)):
+                            test_meta[key] = value
                     conf = 1.0 if str(getattr(v, 'verdict', '')).lower() == 'pass' else 0.6
-                    blast = float(summ.get('added_lines', 0) + summ.get('removed_lines', 0))
                     cm_rec.store_patch_record(
                         patch_content=out.patch,
                         target_files=targets,
@@ -6286,7 +6535,7 @@ def code_edit(
                 try:
                     tp = TestPlanner()
                     repo_layout = _repo_layout_summary(workspace)
-                    tp_out = tp(task=task, context=ctx_text, repo_layout=repo_layout)
+                    tp_out = tp(task=task, context=ctx_with_plan, repo_layout=repo_layout)
                     if getattr(tp_out, 'commands', None):
                         _print_header("Test Plan")
                         console.print(Panel.fit(escape(getattr(tp_out, 'tests_to_run', '') or ''), title="Tests To Run", border_style="cyan"))
@@ -6297,9 +6546,23 @@ def code_edit(
                     pass
             else:
                 console.print(Panel(msg, title="apply failed", border_style="red"))
+    _update_rl_config_weights(workspace, {
+        'lint_clean': 0.4,
+        'tests_passed': 0.8,
+        'diff_size': 0.3,
+    })
     try:
         _dur = time.time() - _t0
-        _stream_metric_event(workspace, 'tool.end', {'tool': 'code_edit', 'args': _args, 'step': 0, 'success': True, 'score': 1.0, 'duration_sec': float(_dur), 'session': _sess})
+        _stream_metric_event(workspace, 'tool.end', {
+            'tool': 'code_edit',
+            'args': _args,
+            'step': 0,
+            'success': True,
+            'score': 1.0,
+            'duration_sec': float(_dur),
+            'session': _sess,
+            'metrics': metrics_summary,
+        })
     except Exception:
         pass
 
@@ -6769,38 +7032,16 @@ def start_command(
     ws = Path(workspace) if workspace else Path.cwd()
     logs_path = Path(logs) if logs else (ws / 'logs')
 
-    streaming_threads: List[threading.Thread] = []
-    streaming_bus = None
+    infra: Optional[AgentInfra] = None
+    infra_started = False
     try:
-        from .db.factory import get_storage as _get_storage
-        storage = _get_storage()
-    except Exception:
-        storage = None
-    try:
-        workspace_log = logs_path / 'workspace' / 'workspace_changes.log'
-        workspace_log.parent.mkdir(parents=True, exist_ok=True)
-        workspace_log.touch(exist_ok=True)
-    except Exception:
-        pass
-    try:
-        kafka_logger = get_kafka_logger()
-    except Exception:
-        kafka_logger = None
-    if kafka_logger is None:
-        console.print("[dim]Kafka broker unavailable; streaming will buffer locally only.[/dim]")
-    try:
-        streaming_threads, streaming_bus = start_local_stack(ws, None, storage=storage, kafka=kafka_logger)
-        if streaming_threads:
-            discovered = autodiscover_logs(ws)
-            containers = sorted({d.container for d in discovered}) if discovered else []
-            label = ", ".join(containers) if containers else "workspace"
-            console.print(f"[dim]Log streaming active for: {label}[/dim]")
-        else:
-            console.print("[dim]No log files discovered yet. Create logs/ or *.log files to enable streaming.[/dim]")
-    except Exception as e:
-        console.print(Panel(f"log streaming unavailable: {e}", title="streaming", border_style="yellow"))
-        streaming_threads = []
-        streaming_bus = None
+        infra = AgentInfra(workspace=ws)
+        asyncio.run(infra.start())
+        infra_started = True
+        console.print("[dim]Infrastructure initialised via unified CLI.[/dim]")
+    except Exception as exc:
+        console.print(Panel(str(exc), title="Infrastructure start failed", border_style="red"))
+        raise typer.Exit(1)
 
     toolchain_executor: Optional[ToolchainExecutor] = None
 
@@ -7185,39 +7426,110 @@ def start_command(
             info: Dict[str, Any] = {}
             task_text = args.get("task") or nl
             file_hints = args.get("file_hints") or args.get("files") or ""
+            iterations_local = max(1, int(args.get("iterations", 2) or 2))
             auto_apply_flag = bool(args.get("apply", True))
-            lm = _maybe_configure_lm(use_lm, provider_is_ollama, model, base_url, api_key, workspace=ws)
-            if lm is None:
+            lm_local = _maybe_configure_lm(use_lm, provider_is_ollama, model, base_url, api_key, workspace=ws)
+            if lm_local is None:
                 console.print("[yellow]No LLM configured; cannot generate patch.[/yellow]")
                 return metrics, info
             bundle_logs, _ = load_logs([logs_path])
             ctx_text = extract_key_events(bundle_logs) if bundle_logs else ""
             from .skills.code_edit import CodeEdit
+            from .reasoning.coding import CodingReasoner
             code_graph = _get_code_summary(ws)
-            ce = CodeEdit(use_cot=True)
-            out = ce(task=task_text, context=ctx_text, code_graph=code_graph, file_hints=file_hints)
-            _print_header("Proposed Patch")
-            console.print(out.patch or "(no patch)")
-            _maybe_panel_rationale(getattr(out, 'rationale', None), title="Rationale")
+            coding_reasoner = CodingReasoner(ws)
+            coding_plan = coding_reasoner.build(task_text, ctx_text, code_graph=code_graph, existing_file_hints=file_hints)
+            plan_block = coding_plan.as_context_block()
+            hints_combined = coding_plan.merged_file_hints(file_hints)
+            ctx_with_plan = ctx_text
+            if plan_block:
+                ctx_with_plan = f"{ctx_text}\n\n{plan_block}"
+                console.print(Panel(plan_block, title="Coding plan", border_style="magenta"))
+            if coding_plan.target_files.strip():
+                console.print(Panel(coding_plan.target_files.strip(), title="Target Files", border_style="blue"))
+            if coding_plan.notes.strip():
+                console.print(Panel(coding_plan.notes.strip(), title="Reasoning Notes", border_style="dim"))
+            if coding_plan.test_plan.strip():
+                console.print(Panel(coding_plan.test_plan.strip(), title="Suggested Tests", border_style="green"))
+
+            prior_errors_local = ""
+            best_out_local: Optional[SimpleNamespace] = None
+            best_verifier_local: Optional[Any] = None
+            last_out_local: Optional[SimpleNamespace] = None
+            last_verifier_local: Optional[Any] = None
+
+            for iteration_index in range(1, iterations_local + 1):
+                ce = CodeEdit(use_cot=True)
+                candidate = ce(
+                    task=task_text,
+                    context=ctx_with_plan[:8000],
+                    code_graph=code_graph,
+                    file_hints=hints_combined,
+                    reasoning_plan=coding_plan.plan,
+                    target_files=coding_plan.target_files,
+                    test_strategy=coding_plan.test_plan,
+                    prior_errors=prior_errors_local,
+                )
+                last_out_local = candidate
+                _print_header(f"Proposed Patch (iteration {iteration_index})")
+                console.print(candidate.patch or "(no patch)")
+                _maybe_panel_rationale(getattr(candidate, 'rationale', None), title="Rationale")
+                verifier_local = PatchVerifier(max_files=4, max_lines=200)
+                result_local = verifier_local(task=task_text, context=ctx_with_plan, patch=candidate.patch or "")
+                last_verifier_local = result_local
+                verdict_local = str(getattr(result_local, 'verdict', '')).lower()
+                if verdict_local != "pass":
+                    feedback_local = getattr(result_local, 'reasons', '') or getattr(result_local, 'fix_suggestions', '') or verdict_local
+                    console.print(Panel(str(feedback_local), title="Verifier feedback", border_style="red"))
+                    prior_errors_local = _append_feedback(prior_errors_local, str(feedback_local))
+                    continue
+                best_out_local = candidate
+                best_verifier_local = result_local
+                metrics['iterations_used'] = iteration_index
+                break
+            else:
+                best_out_local = last_out_local
+                best_verifier_local = last_verifier_local
+                metrics['iterations_used'] = iterations_local
+
+            out = best_out_local or last_out_local
+            if out is None:
+                console.print("[red]Failed to generate a patch.[/red]")
+                return metrics, info
+
+            verifier_result = best_verifier_local or PatchVerifier(max_files=4, max_lines=200)(task=task_text, context=ctx_with_plan, patch=out.patch or "")
+            metrics['verifier_verdict'] = getattr(verifier_result, 'verdict', '')
+            if getattr(verifier_result, 'reasons', None):
+                console.print(Panel.fit(escape(getattr(verifier_result, 'reasons')), title="Verifier reasons", border_style="yellow"))
             info["patch"] = out.patch or ""
+            info["reasoning_plan"] = coding_plan.plan
+            info["target_files"] = coding_plan.target_files
+            info["test_plan"] = coding_plan.test_plan
+            try:
+                summ_preview = summarize_patch(out.patch)
+                metrics.setdefault('blast_radius', float(summ_preview['added_lines'] + summ_preview['removed_lines']))
+            except Exception:
+                pass
+
             if auto_apply_flag and out.patch:
                 do_apply = True
                 if approval_mode == "manual":
                     do_apply = typer.confirm("Apply this patch?", default=False)
                 if do_apply:
                     ok, msg = apply_unified_patch(out.patch, ws)
-                    metrics = {"applied": bool(ok)}
+                    metrics["applied"] = bool(ok)
                     if ok:
                         console.print(f"[green]{msg}[/green]")
                         summ = summarize_patch(out.patch)
                         blast = float(summ['added_lines'] + summ['removed_lines'])
-                        metrics.update({"blast_radius": blast})
+                        metrics["blast_radius"] = blast
                         console.print(Panel.fit(
                             f"files: {summ['files']}  +lines: {summ['added_lines']}  -lines: {summ['removed_lines']}",
                             title="patch metrics", border_style="accent"
                         ))
                     else:
                         console.print(Panel(msg, title="apply failed", border_style="red"))
+            _update_rl_config_weights(ws, {'lint_clean': 0.4, 'tests_passed': 0.8, 'diff_size': 0.3})
             return metrics, info
         for step in range(1, max_steps + 1):
             base_state = build_state()
@@ -8751,6 +9063,12 @@ def start_command(
 
     if auto_runner:
         auto_runner.stop()
+
+    if infra_started and infra:
+        try:
+            asyncio.run(infra.stop())
+        except Exception as exc:
+            console.print(f"[dim]Infrastructure shutdown reported: {exc}[/dim]")
 
 
 def _handle_build_command(args: List[str], ws: Path):

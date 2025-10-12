@@ -20,6 +20,10 @@ class CodeEditSig(dspy.Signature):
     context: str = dspy.InputField()
     code_graph: str = dspy.InputField(desc="Optional code graph summary", default="")
     file_hints: str = dspy.InputField(desc="Optional hints: files/modules to touch", default="")
+    reasoning_plan: str = dspy.InputField(desc="Structured implementation plan", default="")
+    target_files: str = dspy.InputField(desc="Prioritized files derived from planning", default="")
+    test_strategy: str = dspy.InputField(desc="Tests/validation strategy", default="")
+    prior_errors: str = dspy.InputField(desc="Errors or critiques from previous attempts", default="")
 
     patch: str = dspy.OutputField(desc="Unified diff patch (git-style)")
     rationale: str = dspy.OutputField(desc="Brief reasoning and safety checks")
@@ -97,17 +101,55 @@ class CodeEdit(dspy.Module):
         self.attempts = max(1, int(attempts))
         self.beam_k = max(1, int(beam_k))
 
-    def forward(self, task: str, context: str, code_graph: str = "", file_hints: str = ""):
+    def forward(
+        self,
+        task: str,
+        context: str,
+        code_graph: str = "",
+        file_hints: str = "",
+        reasoning_plan: str = "",
+        target_files: str = "",
+        test_strategy: str = "",
+        prior_errors: str = "",
+    ):
         constraints = (
             f"Caps: files <= {self.max_files}, total changed lines (add+remove) <= {self.max_lines}. "
             "Output pure unified diff (no prose), with correct headers and minimal scope."
         )
 
+        enriched_context = context
+        if reasoning_plan.strip():
+            enriched_context = f"{enriched_context}\n\nPlan:\n{reasoning_plan.strip()}"
+        if target_files.strip():
+            enriched_context = f"{enriched_context}\n\nTarget files:\n{target_files.strip()}"
+        if test_strategy.strip():
+            enriched_context = f"{enriched_context}\n\nValidation strategy:\n{test_strategy.strip()}"
+        if prior_errors.strip():
+            enriched_context = f"{enriched_context}\n\nPrevious errors or critiques:\n{prior_errors.strip()}"
+
         # Propose patch (fast → slow gating unless explicitly forced)
         if self.use_cot is True:
-            pred = self.propose_slow(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+            pred = self.propose_slow(
+                task=task,
+                context=enriched_context,
+                code_graph=code_graph,
+                file_hints=file_hints,
+                reasoning_plan=reasoning_plan,
+                target_files=target_files,
+                test_strategy=test_strategy,
+                prior_errors=prior_errors,
+            )
         else:
-            pred = self.propose_fast(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+            pred = self.propose_fast(
+                task=task,
+                context=enriched_context,
+                code_graph=code_graph,
+                file_hints=file_hints,
+                reasoning_plan=reasoning_plan,
+                target_files=target_files,
+                test_strategy=test_strategy,
+                prior_errors=prior_errors,
+            )
         patch = getattr(pred, 'patch', '') or ''
         rationale = getattr(pred, 'rationale', '') or ''
 
@@ -120,7 +162,16 @@ class CodeEdit(dspy.Module):
 
         # Escalate to CoT if fast path was low-signal
         if not ok and self.use_cot is None:
-            pred = self.propose_slow(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+            pred = self.propose_slow(
+                task=task,
+                context=enriched_context,
+                code_graph=code_graph,
+                file_hints=file_hints,
+                reasoning_plan=reasoning_plan,
+                target_files=target_files,
+                test_strategy=test_strategy,
+                prior_errors=prior_errors,
+            )
             patch = getattr(pred, 'patch', '') or ''
             rationale = getattr(pred, 'rationale', '') or rationale
             files, add, rem = _summarize_patch(patch)
@@ -147,7 +198,16 @@ class CodeEdit(dspy.Module):
         proposer = self.propose_slow if (self.use_cot is True or (self.use_cot is None and not ok)) else self.propose_fast
         if self.beam_k > 1:
             for _ in range(self.beam_k - 1):
-                cand = proposer(task=task, context=context, code_graph=code_graph, file_hints=file_hints)
+                cand = proposer(
+                    task=task,
+                    context=enriched_context,
+                    code_graph=code_graph,
+                    file_hints=file_hints,
+                    reasoning_plan=reasoning_plan,
+                    target_files=target_files,
+                    test_strategy=test_strategy,
+                    prior_errors=prior_errors,
+                )
                 cpatch = getattr(cand, 'patch', '') or ''
                 cscore = _score_candidate(cpatch)
                 if cscore > best_score:
@@ -167,9 +227,9 @@ class CodeEdit(dspy.Module):
         last_critique = ""
         while not ok and attempts < self.attempts:
             attempts += 1
-            critique = self.critic(task=task, context=context, patch=patch, constraints=constraints)
+            critique = self.critic(task=task, context=enriched_context, patch=patch, constraints=constraints)
             last_critique = f"{getattr(critique, 'problems', '')}\n\n{getattr(critique, 'revise_instructions', '')}"
-            revised = self.reviser(task=task, context=context, patch=patch, critique=last_critique, constraints=constraints)
+            revised = self.reviser(task=task, context=enriched_context, patch=patch, critique=last_critique, constraints=constraints)
             patch = getattr(revised, 'patch', '') or ''
             rationale = getattr(revised, 'rationale', '') or rationale
             files, add, rem = _summarize_patch(patch)

@@ -2,7 +2,9 @@
 
 from .memory import (
     AgentKnowledgeGraph,
+    GraphMemoryStore,
     compute_retrieval_features,
+    summarize_graph_memory,
     log_retrieval_event,
     load_retrieval_events,
     query_retrieval_events,
@@ -11,7 +13,9 @@ from .memory import (
 
 __all__ = [
     "AgentKnowledgeGraph",
+    "GraphMemoryStore",
     "compute_retrieval_features",
+    "summarize_graph_memory",
     "log_retrieval_event",
     "load_retrieval_events",
     "query_retrieval_events",
