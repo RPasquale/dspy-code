@@ -63,7 +63,7 @@ class OrchestratorRuntime:
 
 
 SAFE_TOOLS = {
-    "context", "plan", "grep", "extract", "codectx", "index", "esearch",
+    "respond", "context", "plan", "grep", "extract", "codectx", "index", "esearch",
     "knowledge", "vretr", "intel", "edit", "patch", "run_tests", "lint", "build"
 }
 
@@ -169,7 +169,21 @@ def evaluate_tool_choice(
     if t not in SAFE_TOOLS:
         return EvalOutcome(score=0.0, feedback=f"Tool '{t}' is not evaluated in training; focus on safe tools.", evidence="")
 
-    if t == "grep":
+    if t == "respond":
+        reply = info.get("response_text") or ""
+        if reply:
+            length_bonus = min(len(reply) / 400.0, 0.6)
+            score = 0.2 + length_bonus
+            cov_ratio, missing = cov(reply, targets)
+            score += 0.3 * cov_ratio
+            evidence.append(f"respond length={len(reply)} coverage={cov_ratio:.2f}")
+            if missing:
+                fb.append("Responder could reference targets: " + ", ".join(missing[:3]))
+            fb.append("Direct reply delivered; modest reward to encourage investigative follow-ups.")
+        else:
+            fb.append("Responder produced no text; consider re-trying with more context.")
+
+    elif t == "grep":
         pattern = argd.get("pattern") or argd.get("query") or ""
         globs = argd.get("globs") or ["**/*"]
         hits = search_text(workspace, pattern, regex=True, include_globs=globs)
@@ -498,10 +512,15 @@ def evaluate_tool_choice(
 
     elif t == "plan":
         # Heuristic: plan text should contain multiple steps-like lines
-        plan_text = (argd.get("plan_text") or "")  # During training, we don't call LLM; rely on downstream plan execution elsewhere
-        steps = [ln for ln in plan_text.splitlines() if ln.strip().startswith(('-','1','2','3'))]
-        score += 1.0 if len(steps) >= 2 else 0.2
-        evidence.append(f"plan steps_detected={len(steps)}")
+        plan_text = (info.get("plan_text") or argd.get("plan_text") or "")
+        step_lines = [ln for ln in plan_text.splitlines() if ln.strip().startswith(('-', '1', '2', '3'))]
+        score += 1.0 if len(step_lines) >= 3 else 0.2 * max(1, len(step_lines))
+        evidence.append(f"plan steps_detected={len(step_lines)}")
+        if plan_text:
+            cov_ratio, miss = cov(plan_text, targets)
+            score += 0.3 * cov_ratio
+            if miss:
+                fb.append("plan: consider covering " + ", ".join(miss[:3]))
 
     elif t == "knowledge":
         # Query code knowledge graph stored in KV

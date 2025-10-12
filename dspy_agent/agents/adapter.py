@@ -255,8 +255,10 @@ class StrictJSONAdapter(JSONAdapter):
                     fallback[field_name] = "plan"
                 elif "search" in sig_name or "grep" in sig_name:
                     fallback[field_name] = "grep"
+                elif "orchestrate" in sig_name or "controller" in sig_name:
+                    fallback[field_name] = "respond"
                 else:
-                    fallback[field_name] = "plan"
+                    fallback[field_name] = "respond"
             elif field_name == "args_json":
                 fallback[field_name] = "{}"
             elif field_name == "rationale":

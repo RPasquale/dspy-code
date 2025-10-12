@@ -12,6 +12,7 @@ import asyncio
 from datetime import datetime
 from dataclasses import asdict
 from typing import Optional, List, Iterable, Tuple, Dict, Any, Literal, Mapping
+import json
 
 import typer
 from rich.console import Console
@@ -136,6 +137,7 @@ from .skills.file_locator import FileLocator
 from .skills.patch_verifier import PatchVerifier
 from .skills.test_planner import TestPlanner
 from .skills.orchestrator import Orchestrator
+from .skills.responder import Responder
 from .code_tools.code_search import (
     search_text,
     search_file as file_search,
@@ -4589,6 +4591,9 @@ def chat(
     history_summary = ""
     last_tool = None
     last_args = None
+    last_response_text = ""
+    used_tools: set[str] = set()
+    touched_paths: set[str] = set()
     def _normalize_tool(name: str) -> str:
         key = (name or "").strip().lower()
         aliases = {
@@ -4598,8 +4603,57 @@ def chat(
             "vector_search": "vretr",
             "vector-retr": "vretr",
             "vector-retrieval": "vretr",
+            "chat": "respond",
+            "answer": "respond",
         }
         return aliases.get(key, key)
+
+    def _should_direct_respond(query: str, proposed_tool: Optional[str]) -> bool:
+        text = (query or "").strip()
+        if not text:
+            return False
+        tool_lower = (proposed_tool or "").strip().lower()
+        if tool_lower and tool_lower not in {"", "plan", "context"}:
+            return False
+
+        text_lower = text.lower()
+        tokens = [tok.lower() for tok in tokenize(text)]
+        if not tokens:
+            return False
+
+        smalltalk = {"hi", "hello", "hey", "howdy"}
+        filler = {"there", "team", "agent"}
+        gratitude = {"thanks", "thank", "thankyou", "thx", "ty", "appreciate", "cheers"}
+        acknowledgements = {"ok", "okay", "k", "kk", "sure", "yep", "yup", "cool", "awesome", "great", "fine", "alright"}
+
+        token_set = set(tokens)
+        if text_lower in smalltalk or text_lower in gratitude:
+            return True
+        if tokens[0] in smalltalk and token_set.issubset(smalltalk | filler | {"there", "everyone", "all"}):
+            return True
+        if token_set.issubset(gratitude | {"so", "very", "much", "you", "for", "that"}):
+            return True
+        if len(tokens) <= 3 and token_set.issubset(acknowledgements | smalltalk | gratitude | filler | {"you", "too"}):
+            return True
+        ack_pairs = {("sounds", "good"), ("looks", "good"), ("all", "good"), ("sounds", "great")}
+        if len(tokens) == 2 and tuple(tokens) in ack_pairs:
+            return True
+
+        question_words = {"how", "what", "why", "can", "should", "would", "could", "where", "when"}
+        if text_lower.endswith("?") and text_lower not in {"how are you?"}:
+            return False
+        if any(tok in question_words for tok in tokens):
+            return False
+
+        request_keywords = {
+            "make", "build", "create", "design", "develop", "compose", "produce",
+            "implement", "explain", "write", "generate", "construct", "draft",
+            "transformer", "plan", "help", "need", "show", "teach"
+        }
+        if any(tok in request_keywords for tok in tokens):
+            return False
+
+        return False
 
     printed_lm_hint = False
     # Session summary (rolling) for dashboards
@@ -4670,6 +4724,13 @@ def chat(
                 pass
         if tool:
             tool = _normalize_tool(tool)
+        if _should_direct_respond(task, tool):
+            tool = "respond"
+            args = {
+                "style": "friendly",
+                "query": task,
+                "context": history_summary,
+            }
         if not tool:
             # Secondary fallback if routing failed
             tool = "context" if logs_path.exists() else "codectx"; args = {}
@@ -4699,7 +4760,19 @@ def chat(
                     console.print("[dim]Tool execution skipped by user.[/dim]")
                     continue
             # dispatch_tool is nested in start; inline minimal relevant calls
-            if tool == "context":
+            if tool == "respond":
+                responder = Responder()
+                resp = responder(query=task, context=history_summary, workspace=str(ws))
+                reply = (getattr(resp, 'response', '') or '').strip()
+                if reply:
+                    console.print(escape(reply))
+                    tool_metrics = {"responded": True, "response_length": len(reply)}
+                    tool_info = {"response_text": reply}
+                else:
+                    console.print("[yellow]Responder produced no text.[/yellow]")
+                    tool_metrics = {"responded": False}
+                    tool_info = {"response_text": ""}
+            elif tool == "context":
                 bundle, _ = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""; _print_header("Log Key Events"); console.print(Panel.fit(escape(key), title="Extracted Events", border_style="magenta"))
             elif tool == "codectx":
                 snap = build_code_snapshot(ws); _print_header("Code Snapshot"); console.print(Panel.fit(escape(snap[:8000] + ("\n..." if len(snap)>8000 else "")), title=str(ws), border_style="magenta"))
@@ -6696,6 +6769,39 @@ def start_command(
     ws = Path(workspace) if workspace else Path.cwd()
     logs_path = Path(logs) if logs else (ws / 'logs')
 
+    streaming_threads: List[threading.Thread] = []
+    streaming_bus = None
+    try:
+        from .db.factory import get_storage as _get_storage
+        storage = _get_storage()
+    except Exception:
+        storage = None
+    try:
+        workspace_log = logs_path / 'workspace' / 'workspace_changes.log'
+        workspace_log.parent.mkdir(parents=True, exist_ok=True)
+        workspace_log.touch(exist_ok=True)
+    except Exception:
+        pass
+    try:
+        kafka_logger = get_kafka_logger()
+    except Exception:
+        kafka_logger = None
+    if kafka_logger is None:
+        console.print("[dim]Kafka broker unavailable; streaming will buffer locally only.[/dim]")
+    try:
+        streaming_threads, streaming_bus = start_local_stack(ws, None, storage=storage, kafka=kafka_logger)
+        if streaming_threads:
+            discovered = autodiscover_logs(ws)
+            containers = sorted({d.container for d in discovered}) if discovered else []
+            label = ", ".join(containers) if containers else "workspace"
+            console.print(f"[dim]Log streaming active for: {label}[/dim]")
+        else:
+            console.print("[dim]No log files discovered yet. Create logs/ or *.log files to enable streaming.[/dim]")
+    except Exception as e:
+        console.print(Panel(f"log streaming unavailable: {e}", title="streaming", border_style="yellow"))
+        streaming_threads = []
+        streaming_bus = None
+
     toolchain_executor: Optional[ToolchainExecutor] = None
 
     def _refresh_toolchain() -> None:
@@ -6721,9 +6827,13 @@ def start_command(
 
     _refresh_toolchain()
 
+    mission_statement = os.getenv("DSPY_MISSION", "Build a resilient streaming agent that learns from every action.")
     use_lm = True
     provider_is_ollama = ollama
     last_extract: Optional[str] = None
+    session_memory: Optional[SessionMemory] = None
+    last_tool_metrics: Dict[str, Any] = {}
+    last_tool_info: Dict[str, Any] = {}
     
     # Initialize LM
     from .llm import configure_lm
@@ -6903,15 +7013,85 @@ def start_command(
                 title="DSPy Agent Commands", border_style="cyan"
         ))
 
+    last_response_text = ""
+
+    def _read_recent_workspace_events(limit: int = 3) -> str:
+        log_file = logs_path / 'workspace' / 'workspace_changes.log'
+        if not log_file.exists():
+            return ""
+        try:
+            lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-limit:]
+        except Exception:
+            return ""
+        summaries: List[str] = []
+        for raw in reversed(lines):
+            if not raw.strip():
+                continue
+            try:
+                data = json.loads(raw)
+                path = str(data.get("path") or data.get("abs_path") or "")
+                snippet = str(data.get("snippet") or "")[:120].replace("\n", " ")
+                summaries.append(f"{path}: {snippet}" if path else snippet)
+            except Exception:
+                summaries.append(raw[:120])
+        return " | ".join(reversed(summaries)) if summaries else ""
+
+    def _record_rl_event(tool_name: str, reward_value: float, meta: Optional[Dict[str, Any]] = None) -> None:
+        evt = {
+            "ts": int(time.time()),
+            "tool": tool_name,
+            "reward": float(reward_value),
+            "meta": meta or {}
+        }
+        try:
+            event_path = ws / '.dspy_rl_events.jsonl'
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(evt) + "\n")
+            console.print(f"[dim]📝 Event recorded: {tool_name} → {reward_value:.2f}[/dim]")
+        except Exception as e:
+            console.print(f"[dim red]⚠️  Event write failed: {e}[/dim red]")
+        try:
+            state_path = ws / '.dspy_rl_state.json'
+            if state_path.exists():
+                state = json.loads(state_path.read_text(encoding='utf-8'))
+            else:
+                state = {"counts": {}, "reward_sum": {}}
+            counts = state.setdefault("counts", {})
+            rewards = state.setdefault("reward_sum", {})
+            counts[tool_name] = int(counts.get(tool_name, 0)) + 1
+            rewards[tool_name] = float(rewards.get(tool_name, 0.0)) + float(reward_value)
+            state["last_event"] = evt
+            state_path.write_text(json.dumps(state, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+    def _policy_hint_for_query(text: str) -> str:
+        verbs = {"build", "create", "make", "enhance", "improve", "plan", "design", "implement", "refactor", "debug", "investigate", "analyze", "help"}
+        TLAs = {"transformer", "logging", "streaming", "pipeline", "tests", "refactor"}
+        words = set(tokenize(text.lower()))
+        if any(v in words for v in verbs) or any(term in text.lower() for term in TLAs):
+            return "policy_hint: gather context, prefer plan/context/index/grep before respond."
+        return ""
+
     def build_state() -> str:
         # Summarize env for orchestrator
         idx_dir = ws / ".dspy_index"
         has_idx = (idx_dir / "index.jsonl").exists()
         has_emb = (idx_dir / "emb_index.jsonl").exists()
         has_logs = logs_path.exists()
+        workspace_delta = _read_recent_workspace_events()
+        delta_piece = f", recent_changes={workspace_delta}" if workspace_delta else ""
+        mission_piece = f", mission={mission_statement}" if mission_statement else ""
+        enrichment_piece = ""
+        if session_memory:
+            enrichment = session_memory.get_enrichment_summary()
+            if enrichment:
+                enrichment_piece = f", memory={enrichment}"
         return (
             f"workspace={ws}, logs={logs_path}, logs_exist={has_logs}, "
             f"has_index={has_idx}, has_emb_index={has_emb}, last_extract={'yes' if last_extract else 'no'}"
+            f"{mission_piece}{delta_piece}{enrichment_piece}"
         )
 
     def _extract_targets_from_query(nl: str, k: int = 5) -> list[str]:
@@ -6925,7 +7105,55 @@ def start_command(
                 break
         return seen
 
+    def _should_direct_respond(query: str, proposed_tool: Optional[str]) -> bool:
+        text = (query or "").strip()
+        if not text:
+            return False
+        tool_lower = (proposed_tool or "").strip().lower()
+        if tool_lower and tool_lower not in {"", "plan", "context"}:
+            return False
+
+        text_lower = text.lower()
+        tokens = [tok.lower() for tok in tokenize(text)]
+        if not tokens:
+            return False
+
+        smalltalk = {"hi", "hello", "hey", "howdy"}
+        filler = {"there", "team", "agent"}
+        gratitude = {"thanks", "thank", "thankyou", "thx", "ty", "appreciate", "cheers"}
+        acknowledgements = {"ok", "okay", "k", "kk", "sure", "yep", "yup", "cool", "awesome", "great", "fine", "alright"}
+
+        token_set = set(tokens)
+        if text_lower in smalltalk or text_lower in gratitude:
+            return True
+        if tokens[0] in smalltalk and token_set.issubset(smalltalk | filler | {"there", "everyone", "all"}):
+            return True
+        if token_set.issubset(gratitude | {"so", "very", "much", "you", "for", "that"}):
+            return True
+        if len(tokens) <= 3 and token_set.issubset(acknowledgements | smalltalk | gratitude | filler | {"you", "too"}):
+            return True
+        ack_pairs = {("sounds", "good"), ("looks", "good"), ("all", "good"), ("sounds", "great")}
+        if len(tokens) == 2 and tuple(tokens) in ack_pairs:
+            return True
+
+        question_words = {"how", "what", "why", "can", "should", "would", "could", "where", "when"}
+        if text_lower.endswith("?") and text_lower not in {"how are you?"}:
+            return False
+        if any(tok in question_words for tok in tokens):
+            return False
+
+        request_keywords = {
+            "make", "build", "create", "design", "develop", "compose", "produce",
+            "implement", "explain", "write", "generate", "construct", "draft",
+            "transformer", "plan", "help", "need", "show", "teach"
+        }
+        if any(tok in request_keywords for tok in tokens):
+            return False
+
+        return False
+
     def orchestrate_chain(nl: str, max_steps: int = 4, lm=None):
+        nonlocal last_response_text, session_memory
         # Try LLM orchestrator, fall back to heuristics
         history_summary = ""
         last_tool = None
@@ -6936,10 +7164,13 @@ def start_command(
         from .skills.orchestrator import Orchestrator, SessionMemory, ToolResult, ChainSummary
         orchestrator = Orchestrator(use_cot=True, workspace=ws)
         memory = orchestrator.get_memory() or orchestrator.create_memory(ws)
+        session_memory = memory
+        if session_memory and mission_statement:
+            session_memory.set_mission(mission_statement)
         
         # Online RL over safe tools
         rl_enabled = True  # enable by default; can later wire to settings
-        rl_tools = ["context", "codectx", "grep", "esearch", "plan", "tree", "ls", "index", "emb-index", "intel", "vretr", "edit"]
+        rl_tools = ["respond", "context", "codectx", "grep", "esearch", "plan", "tree", "ls", "index", "emb-index", "intel", "vretr", "edit"]
         rl_state_path = ws / '.dspy_rl_state.json'
         bandit = _OnlineBandit(rl_tools, rl_state_path)
         # Per-tool cooldowns (seconds) to avoid heavy repetition
@@ -6989,7 +7220,13 @@ def start_command(
                         console.print(Panel(msg, title="apply failed", border_style="red"))
             return metrics, info
         for step in range(1, max_steps + 1):
-            state = build_state() + (f" | history: {history_summary[:4000]}" if history_summary else "")
+            base_state = build_state()
+            policy_hint = _policy_hint_for_query(nl)
+            state = base_state
+            if policy_hint:
+                state = f"{state} | {policy_hint}"
+            if history_summary:
+                state = f"{state} | history: {history_summary[:4000]}"
             tool = None
             args = {}
             
@@ -7066,6 +7303,8 @@ def start_command(
                     args = {"model": "all-MiniLM-L6-v2", "hf": True}
                 elif tool == 'edit':
                     args = {"task": nl, "apply": False}
+                elif tool == 'respond':
+                    args = {"style": "friendly", "query": nl, "context": history_summary}
             # If RL not enabled or failed, try LLM orchestrator
             if not tool:
                 lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
@@ -7083,15 +7322,34 @@ def start_command(
                     except Exception as e:
                         console.print(f"[yellow]LLM failed ({e}), using fallback[/yellow]")
                         tool = None
+            if tool == 'respond':
+                args = dict(args or {})
+                args.setdefault("query", nl)
+                args.setdefault("context", history_summary)
+                args.setdefault("style", "friendly")
+                if policy_hint:
+                    console.print("[dim]Policy hint suggests investigative tooling before responding; switching to 'plan'.[/dim]")
+                    tool = "plan"
+                    args = {"task": nl}
+            if _should_direct_respond(nl, tool):
+                tool = "respond"
+                args = {"style": "friendly", "query": nl, "context": history_summary}
             if not tool:
                 # fallback heuristic single shot
                 tool = "context" if (logs_path.exists() if isinstance(logs_path, Path) else True) else "codectx"
                 args = {}
-
+            tool_metrics: Dict[str, Any] = {}
+            tool_info: Dict[str, Any] = {}
             console.print(Panel.fit(f"{tool} {args}", title=f"Step {step}: action", border_style="yellow"))
             # Stop if repeating same choice
             if last_tool == tool and last_args == args:
                 console.print("[dim]No new action; summarizing results.[/dim]")
+                if session_memory:
+                    session_memory.record_event("stall", f"repeat {tool}", metadata={"args": args})
+                penalty = -0.1
+                if tool in rl_tools:
+                    bandit.update(tool, penalty)
+                    _record_rl_event(tool, penalty, {"reason": "repeat"})
                 break
             last_tool, last_args = tool, dict(args)
 
@@ -7103,7 +7361,10 @@ def start_command(
                         console.print("[dim]Tool execution skipped by user.[/dim]")
                         # Do not update history summary, simply continue to next step
                         continue
+                last_response_text = ""
                 dispatch_tool(tool, args)
+                tool_metrics = dict(last_tool_metrics)
+                tool_info = dict(last_tool_info)
                 # Record last run time for cooldowns
                 try:
                     import time as _t
@@ -7116,8 +7377,24 @@ def start_command(
 
             # Summarize outcome to feed back
             try:
-                outcome = evaluate_tool_choice(tool, args, workspace=ws, logs_path=logs_path, targets=targets)
+                info_payload = {}
+                if last_response_text:
+                    info_payload["response_text"] = last_response_text
+                info_payload.update(tool_info)
+                outcome = evaluate_tool_choice(
+                    tool,
+                    args,
+                    workspace=ws,
+                    logs_path=logs_path,
+                    targets=targets,
+                    result_metrics=tool_metrics or None,
+                    result_info=info_payload or None,
+                )
                 piece = f"{tool}: score={outcome.score:.2f}; {outcome.evidence}"
+                if session_memory:
+                    session_memory.record_event("tool", piece, metadata={"query": nl, "score": outcome.score})
+                    if tool == "respond" and last_response_text:
+                        session_memory.add_scratchpad_entry("hypotheses", last_response_text[:120])
                 
                 # Create and record tool result for memory
                 if memory:
@@ -7146,28 +7423,29 @@ def start_command(
                 try:
                     r = float(outcome.score)
                     r = 0.0 if not (r == r) else max(0.0, min(1.0, r / 2.0))
+                    curiosity = 0.0
+                    if tool not in used_tools:
+                        curiosity += 0.1
+                        used_tools.add(tool)
+                    candidate_path = None
+                    for key in ("file", "path", "target", "module"):
+                        if isinstance(args.get(key), str):
+                            candidate_path = args.get(key)
+                            break
+                    if isinstance(candidate_path, str):
+                        norm = str(Path(candidate_path)).strip()
+                        if norm and norm not in touched_paths:
+                            touched_paths.add(norm)
+                            curiosity += 0.1
+                    if curiosity:
+                        r = max(0.0, min(1.0, r + curiosity))
+                        if session_memory:
+                            session_memory.record_event("curiosity_bonus", f"{tool} +{curiosity:.2f}", metadata={"path": candidate_path})
+                    # Record RL event for ALL tools, not just those in rl_tools
+                    _record_rl_event(tool, r, {"reason": "tool_reward", "curiosity": curiosity, "raw_score": float(outcome.score)})
                     if tool in rl_tools:
                         bandit.update(tool, r)
                         console.print(f"[dim]RL updated: {tool} reward={r:.2f}[/dim]")
-                        # Append event for background trainer to learn from
-                        try:
-                            import time as _t2
-                            evt = {"ts": int(_t2.time()), "tool": tool, "reward": float(r)}
-                            # Append to local events file
-                            (ws / '.dspy_rl_events.jsonl').open('a').write(json.dumps(evt) + "\n")
-                            # Also publish to Kafka if available
-                            try:
-                                from confluent_kafka import Producer  # type: ignore
-                                bootstrap = os.getenv('KAFKA_BOOTSTRAP') or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
-                                if _kafka_is_available(bootstrap):
-                                    silent = logging.getLogger('kafka.silent'); silent.addHandler(logging.NullHandler()); silent.setLevel(logging.CRITICAL)
-                                    p = Producer({'bootstrap.servers': bootstrap}, logger=silent)
-                                    p.produce('agent.learning', json.dumps(evt).encode('utf-8'))
-                                    p.flush(0)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
                     # Keep in history
                     step_history.append({"tool": tool, "args": args, "score": float(outcome.score), "evidence": str(outcome.evidence)})
                 except Exception:
@@ -7176,6 +7454,9 @@ def start_command(
                 piece = f"{tool}: done"
                 step_history.append({"tool": tool, "args": args, "score": 0.0, "evidence": ""})
             history_summary = (history_summary + " | " + piece).strip()
+            if tool == "respond":
+                patch_done = True
+                break
             # Simple stop conditions
             if tool in {"esearch", "grep", "extract"} and "hits=0" in piece:
                 continue
@@ -7237,6 +7518,8 @@ def start_command(
                 "evidence": forced_evidence,
             })
             history_summary = (history_summary + " | " + piece).strip()
+            if session_memory:
+                session_memory.record_event("tool", piece, metadata={"query": nl, "score": float(forced_outcome.score) if forced_outcome else 0.0})
 
         # Enhanced session summary with memory
         try:
@@ -7264,21 +7547,68 @@ def start_command(
                     console.print(Panel.fit("\n".join(f"- {r}" for r in recs), title="suggested next steps", border_style="yellow"))
                 else:
                     console.print(Panel.fit("No actions executed.", title="actions", border_style="yellow"))
+            if step_history:
+                total_reward = sum(h.get("score", 0.0) for h in step_history)
+                average_reward = total_reward / max(1, len(step_history))
+                top_entry = max(step_history, key=lambda h: h.get("score", 0.0))
+                snapshot = (
+                    f"avg_reward={average_reward:.2f}\n"
+                    f"steps={len(step_history)}\n"
+                    f"best_step={top_entry['tool']} ({top_entry.get('score',0.0):.2f})"
+                )
+                console.print(Panel.fit(snapshot, title="learning snapshot", border_style="green"))
         except Exception:
             pass
 
     def dispatch_tool(tool: str, args: dict):
-        nonlocal last_extract, logs_path, ws, model, provider_is_ollama, base_url, api_key
+        nonlocal last_extract, logs_path, ws, model, provider_is_ollama, base_url, api_key, last_response_text, session_memory, last_tool_metrics, last_tool_info
+        last_tool_metrics = {}
+        last_tool_info = {}
+
+        raw_args = dict(args or {})
+        meta_flags = {k: raw_args.pop(k) for k in list(raw_args) if k.startswith("_")}
+        args = raw_args
         t = tool.lower().strip()
         # Normalize common synonyms for better UX
         if t in {"summarize", "summary", "summarise", "describe", "overview", "summarize_repo", "repo_summary"}:
             t = "codectx"
+        if t == "respond":
+            message = (args.get("query") or "").strip()
+            ctx = args.get("context") or ""
+            if not message:
+                console.print("[yellow]respond: missing query text.[/yellow]")
+                return
+            responder = Responder()
+            resp = responder(query=message, context=ctx, workspace=str(ws))
+            reply = (getattr(resp, 'response', '') or '').strip()
+            last_response_text = reply
+            if reply:
+                if reply.startswith("/") or reply.lower().startswith("command ") or reply.lower().startswith("/command"):
+                    if meta_flags.get("_from_respond"):
+                        console.print("[yellow]Responder returned a command-style reply; skipping to avoid recursion.[/yellow]")
+                        return
+                    console.print("[dim]Responder suggested a command; escalating to planner instead.[/dim]")
+                    dispatch_tool("plan", {"task": message, "_from_respond": True})
+                    return
+                console.print(escape(reply))
+                last_tool_metrics = {"response_length": len(reply), "responded": True}
+            else:
+                if meta_flags.get("_from_respond"):
+                    console.print("[yellow]Responder produced no text.[/yellow]")
+                else:
+                    console.print("[yellow]Responder produced no text; switching to planner.[/yellow]")
+                    dispatch_tool("plan", {"task": message, "_from_respond": True})
+                last_tool_metrics = {"responded": False}
+            return
         if t == "context":
             bundle, count = load_logs([logs_path])
             if not bundle:
                 console.print("[yellow]No logs found.[/yellow]"); return
             _print_header("Log Key Events"); key = extract_key_events(bundle)
             console.print(Panel.fit(escape(key), title="Extracted Events", border_style="magenta"))
+            recent_workspace = _read_recent_workspace_events(limit=5)
+            if recent_workspace:
+                console.print(Panel.fit(escape(recent_workspace), title="Recent Workspace Changes", border_style="cyan"))
         elif t == "plan":
             bundle, count = load_logs([logs_path]); key = extract_key_events(bundle) if bundle else ""
             lm = _maybe_configure_lm(True, provider_is_ollama, model, base_url, api_key, workspace=ws)
@@ -7291,6 +7621,13 @@ def start_command(
             out = agent(task=args.get("task", ""), context=fused_context)
             console.print(Panel.fit(out.plan, title="Proposed Plan", border_style="blue"))
             console.print(Panel.fit(out.commands or "(no commands)", title="Suggested Commands", border_style="yellow"))
+            plan_lines = [ln.strip("-• ").strip() for ln in out.plan.splitlines() if ln.strip()]
+            last_tool_metrics = {"step_count": sum(1 for ln in plan_lines if ln[:1].isdigit() or ln.startswith("-"))}
+            last_tool_info = {"plan_text": out.plan}
+            if session_memory:
+                for line in plan_lines[:5]:
+                    if line:
+                        session_memory.add_scratchpad_entry("todos", line)
         elif t == "grep":
             pattern = args.get("pattern") or args.get("query") or ""
             if not pattern: console.print("[yellow]No pattern provided.[/yellow]"); return

@@ -1,6 +1,6 @@
 module github.com/dspy/orchestrator
 
-go 1.22
+go 1.20
 
 
 require (
@@ -21,4 +21,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240318140521-94a12d6c2237 // indirect
 )
 
-replace github.com/dspy/orchestrator => .
+replace github.com/dspy/orchestrator => ./

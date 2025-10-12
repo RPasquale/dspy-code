@@ -3,11 +3,19 @@ import os
 import json
 import time
 import hashlib
+import logging
 from typing import Dict, Any
 
 from kafka import KafkaConsumer
+from kafka.errors import NoBrokersAvailable, KafkaError
 import requests
 import math
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | [emb-indexer] %(message)s",
+)
+logger = logging.getLogger("dspy.embeddings.indexer")
 
 
 def main():
@@ -60,58 +68,110 @@ def main():
             return None
         return None
 
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=bootstrap,
-        group_id=group,
-        auto_offset_reset='latest',
-        enable_auto_commit=True,
-        value_deserializer=lambda v: json.loads(v.decode('utf-8', errors='ignore'))
-    )
-
-    for msg in consumer:
-        val = msg.value if isinstance(msg.value, dict) else {}
-        text = val.get('text')
-        vec = val.get('vector')
-        if not isinstance(text, str) or not isinstance(vec, list) or not vec:
-            continue
-        doc_id = val.get('doc_id')
-        if not isinstance(doc_id, str) or not doc_id.strip():
-            doc_id = hashlib.sha256(text.encode('utf-8')).hexdigest()
-        # compute norm and unit vector for fast cosine
-        norm = math.sqrt(sum(float(x) * float(x) for x in vec)) or 1.0
-        unit = [float(x) / norm for x in vec]
-        record = {
-            'doc_id': doc_id,
-            'vector': vec,
-            'norm': norm,
-            'unit': unit,
-            'topic': val.get('topic'),
-            'kafka_ts': val.get('kafka_ts'),
-            'embedded_ts': val.get('embedded_ts'),
-            'model': val.get('model'),
-        }
-        reddb_append(record)
-        reddb_put(f'embvec:{doc_id}', record)
-
-        # shard assignment
-        try:
-            shard = int(hashlib.sha256(doc_id.encode('utf-8')).hexdigest(), 16) % max(1, SHARDS)
-        except Exception:
-            shard = 0
-        # maintain shard id list for simple kNN candidate search
-        ids_key = f'shard:{shard}:ids'
-        ids = reddb_get(ids_key)
-        if not isinstance(ids, list):
-            ids = []
-        if doc_id not in ids:
-            ids.append(doc_id)
-            if len(ids) > SHARD_MAX_IDS:
-                ids = ids[-SHARD_MAX_IDS:]
+    def build_consumer() -> KafkaConsumer:
+        delay = 1.0
+        while True:
             try:
-                reddb_put(ids_key, ids)
+                consumer = KafkaConsumer(
+                    topic,
+                    bootstrap_servers=bootstrap,
+                    group_id=group,
+                    auto_offset_reset='latest',
+                    enable_auto_commit=True,
+                    value_deserializer=lambda v: json.loads(v.decode('utf-8', errors='ignore'))
+                )
+                logger.info("Connected to Kafka at %s (topic=%s, group=%s)", bootstrap, topic, group)
+                return consumer
+            except NoBrokersAvailable:
+                logger.warning(
+                    "Kafka brokers not yet available at %s (topic=%s); retrying in %.1fs",
+                    bootstrap,
+                    topic,
+                    delay,
+                )
+            except KafkaError as exc:
+                logger.warning(
+                    "Kafka error while connecting to %s (topic=%s): %s; retrying in %.1fs",
+                    bootstrap,
+                    topic,
+                    exc,
+                    delay,
+                )
+            except Exception as exc:  # pragma: no cover - safety log
+                logger.exception(
+                    "Unexpected error creating Kafka consumer for %s; retrying in %.1fs",
+                    bootstrap,
+                    delay,
+                )
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+    consumer = build_consumer()
+
+    try:
+        while True:
+            try:
+                msg = next(consumer)
+            except StopIteration:  # pragma: no cover - kafka iterator contract
+                continue
+            except (KafkaError, NoBrokersAvailable) as exc:
+                logger.warning("Kafka consumer error: %s; reconnecting", exc)
+                consumer.close(autocommit=False)
+                consumer = build_consumer()
+                continue
+            except Exception as exc:
+                logger.exception("Unexpected consumer error, continuing: %s", exc)
+                continue
+
+            val = msg.value if isinstance(msg.value, dict) else {}
+            text = val.get('text')
+            vec = val.get('vector')
+            if not isinstance(text, str) or not isinstance(vec, list) or not vec:
+                continue
+            doc_id = val.get('doc_id')
+            if not isinstance(doc_id, str) or not doc_id.strip():
+                doc_id = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            # compute norm and unit vector for fast cosine
+            norm = math.sqrt(sum(float(x) * float(x) for x in vec)) or 1.0
+            unit = [float(x) / norm for x in vec]
+            record = {
+                'doc_id': doc_id,
+                'vector': vec,
+                'norm': norm,
+                'unit': unit,
+                'topic': val.get('topic'),
+                'kafka_ts': val.get('kafka_ts'),
+                'embedded_ts': val.get('embedded_ts'),
+                'model': val.get('model'),
+            }
+            reddb_append(record)
+            reddb_put(f'embvec:{doc_id}', record)
+
+            # shard assignment
+            try:
+                shard = int(hashlib.sha256(doc_id.encode('utf-8')).hexdigest(), 16) % max(1, SHARDS)
             except Exception:
-                pass
+                shard = 0
+            # maintain shard id list for simple kNN candidate search
+            ids_key = f'shard:{shard}:ids'
+            ids = reddb_get(ids_key)
+            if not isinstance(ids, list):
+                ids = []
+            if doc_id not in ids:
+                ids.append(doc_id)
+                if len(ids) > SHARD_MAX_IDS:
+                    ids = ids[-SHARD_MAX_IDS:]
+                try:
+                    reddb_put(ids_key, ids)
+                except Exception:
+                    pass
+    except KeyboardInterrupt:
+        logger.info("Received interrupt; shutting down embedding indexer")
+    finally:
+        try:
+            consumer.close(autocommit=False)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

@@ -178,10 +178,18 @@ class Discovered:
 def autodiscover_logs(root: Path) -> List[Discovered]:
     candidates: List[Tuple[str, str, Path]] = []
     for p in root.rglob("*"):
-        if not p.is_file(): continue
+        if not p.is_file():
+            continue
         if p.suffix.lower() == ".log" or p.name.lower().endswith((".out", ".err")) or p.parts[-2:] == ("logs", p.name):
             parts = [x for x in p.parts if x not in (".",)]
-            container = "backend" if any("back" in seg.lower() for seg in parts) else ("frontend" if any("front" in seg.lower() for seg in parts) else "app")
+            lowered = [seg.lower() for seg in parts]
+            container = "app"
+            if any("workspace" in seg for seg in lowered):
+                container = "workspace"
+            elif any("back" in seg for seg in lowered):
+                container = "backend"
+            elif any("front" in seg for seg in lowered):
+                container = "frontend"
             service = p.parent.name or "core"
             candidates.append((container, service, p))
     chosen: Dict[str, Discovered] = {}

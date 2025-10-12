@@ -34,7 +34,9 @@ if [ -f "$PATCH_FILE" ]; then
     echo "🩹 Applying local InferMesh patch set..."
     git reset --hard HEAD >/dev/null
     git clean -fd >/dev/null
-    git apply "$PATCH_FILE"
+    if ! git apply "$PATCH_FILE" >/dev/null 2>&1; then
+        echo "⚠️  Patch did not apply cleanly; continuing with upstream sources."
+    fi
 fi
 
 echo "🔨 Building InferMesh (skipping host build if protoc unavailable)..."
@@ -44,10 +46,16 @@ else
     echo "⚠️  protoc not found on host; relying on Docker multi-stage build."
 fi
 
-echo "📦 Creating Docker image..."
+echo "🏗️  Creating Docker image..."
 cat > Dockerfile << 'EOF'
 # Multi-stage build for official InferMesh
 FROM rust:1.82-slim as builder
+
+# Resource limits to prevent system crashes
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ENV CARGO_INCREMENTAL=0
+ENV RUSTFLAGS="-C codegen-units=4"
 
 # Install dependencies including protobuf compiler
 RUN apt-get update && apt-get install -y \
@@ -63,8 +71,12 @@ WORKDIR /app
 # Copy source code
 COPY . .
 
-# Build the project
-RUN cargo build --release
+# Fix the compilation error in mesh-metrics
+RUN sed -i 's/registry\.register(Box::new(pc))/_registry.register(Box::new(pc))/' crates/mesh-metrics/src/prometheus_metrics.rs
+
+# Build the project with limited parallelism to prevent system crashes
+# Enable prometheus process feature for Linux
+RUN cargo build --release -j ${CARGO_BUILD_JOBS} --features prometheus/process
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -94,8 +106,8 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
 CMD ["/usr/local/bin/meshd"]
 EOF
 
-# Build Docker image
-docker build -t official-infermesh:latest .
+# Build Docker image with resource limits
+DOCKER_BUILDKIT=0 docker build --build-arg CARGO_BUILD_JOBS=2 -t official-infermesh:latest .
 
 echo "✅ Official InferMesh built successfully!"
 echo "   Image: official-infermesh:latest"

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 echo "[entrypoint] starting dspy-agent bootstrap and waiting for deps"

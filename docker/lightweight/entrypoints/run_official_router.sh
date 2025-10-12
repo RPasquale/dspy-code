@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 AGENT_SERVICE=${AGENT_SERVICE:-infermesh-node-a:50051}

@@ -1031,12 +1031,14 @@ def _classify_by_path(parts: List[str]) -> str:
     frontend_keywords = ['frontend', 'front', 'web', 'ui', 'client', 'react', 'vue', 'angular', 'public', 'static']
     backend_keywords = ['backend', 'back', 'api', 'server', 'app', 'django', 'flask', 'express', 'fastapi', 'src']
     
+    workspace_keywords = ['workspace', 'code_watch', 'codewatch']
+    if any(keyword in path_str for keyword in workspace_keywords):
+        return 'workspace'
     if any(keyword in path_str for keyword in frontend_keywords):
         return 'frontend'
-    elif any(keyword in path_str for keyword in backend_keywords):
+    if any(keyword in path_str for keyword in backend_keywords):
         return 'backend'
-    else:
-        return 'app'
+    return 'app'
 
 
 def _find_service_logs(root: Path, service_name: str) -> List[Path]:

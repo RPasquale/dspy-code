@@ -48,6 +48,12 @@ All dependencies (Kafka, Redis, RL services, streaming workers, dashboards, and 
 `deepseek-coder:1.3b` plus `qwen3:1.7b`) are brought up automatically. The models are pulled the
 first time you run the command and cached for subsequent launches.
 
+After the stack is up, verify Kafka connectivity from inside the embeddings indexer container:
+
+```bash
+docker compose -f docker/lightweight/docker-compose.yml exec emb-indexer bash -lc 'source /entrypoints/wait_for_kafka.sh'
+```
+
 > Need the legacy “direct” CLI without Docker? Use `uv run dspy-cli --help`.
 
 ## Build

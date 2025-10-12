@@ -19,7 +19,7 @@ from ..db import (
 
 
 TOOLS = [
-    "context", "plan", "grep", "extract", "tree", "ls",
+    "respond", "context", "plan", "grep", "extract", "tree", "ls",
     "codectx", "index", "esearch", "emb_index", "emb_search", "knowledge", "vretr", "intel",
     "edit", "patch", "run_tests", "lint", "build",
     "open", "watch", "sg", "diff", "git_status", "git_add", "git_commit",
@@ -64,6 +64,14 @@ class SessionMemory:
         self.chain_history: deque = deque(maxlen=max_history)
         self.tool_cache: Dict[str, ToolResult] = {}
         self.query_cache: Dict[str, str] = {}
+        self.mission: str = "Build a resilient streaming agent that learns from every action."
+        self.scratchpad: Dict[str, List[str]] = {
+            "hypotheses": [],
+            "questions": [],
+            "todos": []
+        }
+        self.timeline: List[Dict[str, Any]] = []
+        self.timeline_limit = 80
         
         # Expert-level learning components
         self.expert_patterns: Dict[str, List[Dict]] = {}  # Learned patterns by context
@@ -83,6 +91,9 @@ class SessionMemory:
                     self.chain_history = deque(data.get('chain_history', []), maxlen=self.max_history)
                     self.tool_cache = data.get('tool_cache', {})
                     self.query_cache = data.get('query_cache', {})
+                    self.mission = data.get('mission', self.mission)
+                    self.scratchpad = data.get('scratchpad', self.scratchpad)
+                    self.timeline = data.get('timeline', [])
                     
                     # Load expert-level learning data
                     self.expert_patterns = data.get('expert_patterns', {})
@@ -100,6 +111,9 @@ class SessionMemory:
                 'chain_history': list(self.chain_history),
                 'tool_cache': self.tool_cache,
                 'query_cache': self.query_cache,
+                'mission': self.mission,
+                'scratchpad': self.scratchpad,
+                'timeline': self.timeline,
                 'expert_patterns': self.expert_patterns,
                 'tool_effectiveness': self.tool_effectiveness,
                 'context_insights': self.context_insights,
@@ -350,11 +364,57 @@ class SessionMemory:
         
         return ""
 
+    def record_event(self, event_type: str, detail: str, *, metadata: Optional[Dict[str, Any]] = None) -> None:
+        entry = {
+            "ts": time.time(),
+            "event": event_type,
+            "detail": detail,
+            "meta": metadata or {}
+        }
+        self.timeline.append(entry)
+        if len(self.timeline) > self.timeline_limit:
+            self.timeline = self.timeline[-self.timeline_limit:]
+        self._save_memory()
+
+    def add_scratchpad_entry(self, category: str, text: str) -> None:
+        bucket = self.scratchpad.setdefault(category, [])
+        bucket.append(text)
+        if len(bucket) > 25:
+            del bucket[0]
+        self._save_memory()
+
+    def set_mission(self, mission: str) -> None:
+        mission = (mission or "").strip()
+        if mission:
+            self.mission = mission
+            self._save_memory()
+
+    def get_enrichment_summary(self, recent_events: int = 3) -> str:
+        pieces: List[str] = []
+        if self.mission:
+            pieces.append(f"mission={self.mission}")
+        for cat, items in self.scratchpad.items():
+            if items:
+                latest = "; ".join(items[-2:])
+                pieces.append(f"{cat}={latest}")
+        if self.timeline:
+            recent = [
+                f"{time.strftime('%H:%M:%S', time.localtime(ev['ts']))}:{ev['event']}:{ev['detail'][:80]}"
+                for ev in self.timeline[-recent_events:]
+            ]
+            pieces.append("timeline=" + " | ".join(recent))
+        return " | ".join(pieces)
+
 
 class OrchestrateToolSig(dspy.Signature):
     """Choose the best CLI tool and arguments for the user's intent.
 
-    Tools: context, plan, grep, extract, tree, ls, codectx, index, esearch, emb_index, emb_search, knowledge, vretr, intel, open, watch, sg, patch, diff, git_status, git_add, git_commit
+    Tools include:
+    - respond: answer the user directly when no tooling is required.
+    - context, plan, grep, extract, tree, ls, codectx, index, esearch,
+      emb_index, emb_search, knowledge, vretr, intel, open, watch, sg,
+      patch, diff, git_status, git_add, git_commit.
+
     Return JSON in args_json with the arguments for that tool.
     Keep choices safe and non-destructive unless explicitly requested by the user.
     """
