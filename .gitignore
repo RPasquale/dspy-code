@@ -9,6 +9,28 @@ __pycache__/
 .ruff_cache/
 *.so
 *.pyc
+
+# Go
+.gocache/
+.gomod/
+.gomodcache/
+vendor/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# Rust
+target/
+Cargo.lock
+**/target/
+**/Cargo.lock
+
 # Virtual environments
 .venv/
 venv/
@@ -28,6 +50,19 @@ dist/
 *.egg
 *.whl
 target/
+
+# Binary executables and build artifacts
+orchestrator-linux
+cmd/dspy-agent/dspy-agent
+*.tar.gz
+go1.*.linux-amd64.tar.gz
+
+# Temporary and cache files
+=1.75.1
+.gocache/
+**/.gocache/
+**/.gomod/
+**/.gomodcache/
 
 # Editor / OS
 .DS_Store
