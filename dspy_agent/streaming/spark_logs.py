@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import os
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, expr
+
+from ..infra.runtime import ensure_infra, ensure_infra_sync
 
 
 def parse_args():
@@ -14,6 +18,11 @@ def parse_args():
 
 
 def main():
+    try:
+        ensure_infra_sync()
+    except RuntimeError:
+        asyncio.get_running_loop().create_task(ensure_infra(auto_start_services=True))
+
     args = parse_args()
 
     os.environ.setdefault("HADOOP_USER_NAME", "spark")

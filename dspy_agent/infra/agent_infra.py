@@ -68,7 +68,7 @@ class AgentInfra:
         self._bootstrapped_process = False
 
     # ------------------------------------------------------------------
-    async def start(self) -> "AgentInfra":
+    async def start_async(self) -> "AgentInfra":
         if self._started:
             logger.warning("Infrastructure already started")
             return self
@@ -97,6 +97,10 @@ class AgentInfra:
         self._started = True
         logger.info("Infrastructure ready")
         return self
+
+    async def start(self) -> "AgentInfra":
+        """Backward-compatible wrapper for ``start_async``."""
+        return await self.start_async()
 
     async def stop(self) -> None:
         if not self._started:
@@ -169,7 +173,7 @@ class AgentInfra:
             auto_start_services=auto_start_services,
             cli_path=cli_path,
         )
-        await infra.start()
+        await infra.start_async()
         try:
             yield infra
         finally:

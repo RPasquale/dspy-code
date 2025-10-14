@@ -179,7 +179,8 @@ fn headers_include_runner_metadata_when_available() {
         offset: 0,
         partition: "p0".into(),
     };
-    assignment.payload = Bytes::from(serde_json::to_vec(&json!({"workflow_id": "WF", "tenant": "Studio"})).unwrap());
+    assignment.payload =
+        Bytes::from(serde_json::to_vec(&json!({"workflow_id": "WF", "tenant": "Studio"})).unwrap());
     let mut snapshot = HardwareSnapshot::default();
     snapshot.accelerators = vec![AcceleratorInfo {
         vendor: "amd".into(),
@@ -196,5 +197,8 @@ fn headers_include_runner_metadata_when_available() {
             found = true;
         }
     }
-    assert!(found, "runner_hardware header should be present when accelerators exist");
+    assert!(
+        found,
+        "runner_hardware header should be present when accelerators exist"
+    );
 }

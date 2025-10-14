@@ -1,6 +1,8 @@
 """gRPC client for communicating with Go orchestrator."""
 
+import importlib
 import os
+import sys
 import grpc
 import logging
 from typing import Any, Dict, List, Optional, AsyncIterator
@@ -8,13 +10,37 @@ from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
-# Note: These imports will work once protobuf code is generated
-# For now, we provide stubs to show the structure
-try:
-    from .pb import orchestrator_v1_pb2 as orchestrator_pb
-    from .pb import orchestrator_v1_pb2_grpc as orchestrator_grpc
-except ImportError:
-    logger.warning("Protobuf modules not generated yet. Run: make proto-python")
+_ORCHESTRATOR_PB = None
+_ORCHESTRATOR_GRPC = None
+
+
+def _ensure_proto_loaded() -> bool:
+    global _ORCHESTRATOR_PB, _ORCHESTRATOR_GRPC
+    if _ORCHESTRATOR_PB is not None and _ORCHESTRATOR_GRPC is not None:
+        return True
+    try:
+        module_pb = importlib.import_module("dspy_agent.infra.pb.orchestrator.v1_pb2")
+        orchestrator_pkg = sys.modules.setdefault("orchestrator", type(sys)("orchestrator"))
+        orchestrator_pkg.v1_pb2 = module_pb
+        sys.modules.setdefault("orchestrator.v1_pb2", module_pb)
+
+        module_grpc = importlib.import_module("dspy_agent.infra.pb.orchestrator.v1_pb2_grpc")
+        orchestrator_pkg.v1_pb2_grpc = module_grpc
+        sys.modules.setdefault("orchestrator.v1_pb2_grpc", module_grpc)
+        _ORCHESTRATOR_PB = module_pb
+        _ORCHESTRATOR_GRPC = module_grpc
+        return True
+    except ImportError as exc:
+        logger.warning("Protobuf modules not generated yet. Run: make proto-python (%s)", exc)
+        _ORCHESTRATOR_PB = None
+        _ORCHESTRATOR_GRPC = None
+        return False
+
+
+if _ensure_proto_loaded():
+    orchestrator_pb = _ORCHESTRATOR_PB
+    orchestrator_grpc = _ORCHESTRATOR_GRPC
+else:
     orchestrator_pb = None
     orchestrator_grpc = None
 
@@ -104,13 +130,17 @@ class OrchestratorClient:
             raise RuntimeError("Not connected to orchestrator")
 
         try:
+            str_payload = {str(k): str(v) for k, v in (payload or {}).items()}
             request = orchestrator_pb.SubmitTaskRequest(
                 id=task_id,
-                class_=task_class,
-                payload=payload or {},
+                payload=str_payload,
                 priority=priority,
                 workflow_id=workflow_id or ""
             )
+            try:
+                setattr(request, "class", task_class)
+            except AttributeError:
+                request.class_ = task_class
             
             response = await self.stub.SubmitTask(request)
             
@@ -192,10 +222,12 @@ class OrchestratorClient:
         try:
             request = orchestrator_pb.GetTaskStatusRequest(task_id=task_id)
             response = await self.stub.GetTaskStatus(request)
+            result = dict(response.result or {})
             return {
                 "task_id": response.task_id,
                 "status": response.status,
-                "result_payload": dict(response.result or {}),
+                "result": result,
+                "result_payload": result,
                 "error": response.error,
             }
         except Exception as exc:

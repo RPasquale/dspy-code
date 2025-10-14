@@ -28,6 +28,12 @@ toml = "0.8"
 # HTTP client for health checks
 reqwest = { version = "0.12", features = ["json"] }
 
+# Metrics
+prometheus = "0.13"
+axum = "0.7"
+hyper = { version = "1.0", features = ["full"] }
+tower = "0.4"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -32,6 +32,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sysinfo = { version = "0.30", features = ["multithread"] }
 which = "4"
+sha2 = "0.10"
+hex = "0.4"
 
 [build-dependencies]
 prost-build = "0.12"

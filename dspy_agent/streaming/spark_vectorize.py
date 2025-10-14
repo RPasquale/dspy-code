@@ -23,12 +23,16 @@ Environment variables:
   ST_MODEL             - sentence-transformers model (default 'all-MiniLM-L6-v2')
 
 """
+import asyncio
+import hashlib
+import json
+import os
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import ArrayType, DoubleType, StringType
-import os
-import json
-import hashlib
+
+from ..infra.runtime import ensure_infra, ensure_infra_sync
 
 
 def ensure_kafka_topics(bootstrap: str, topics, partitions: int = 3, replication_factor: int = 1) -> None:
@@ -139,6 +143,12 @@ def wait_for_kafka(bootstrap, max_retries=30, retry_delay=2):
     return False
 
 def main():
+    # Ensure the unified infrastructure layer is online before the Spark job starts.
+    try:
+        ensure_infra_sync()
+    except RuntimeError:
+        asyncio.get_running_loop().create_task(ensure_infra(auto_start_services=True))
+
     bootstrap = os.getenv('KAFKA_BOOTSTRAP') or os.getenv('KAFKA_BOOTSTRAP_SERVERS') or 'kafka:9092'
     print(f"[spark-vectorizer] Original bootstrap: {bootstrap}")
     bootstrap = _resolve_bootstrap(bootstrap)

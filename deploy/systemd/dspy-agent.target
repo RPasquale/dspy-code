@@ -1,0 +1,9 @@
+[Unit]
+Description=DSPy Agent Infrastructure Stack
+Documentation=https://github.com/dspy/orchestrator
+After=docker.service
+Requires=docker.service
+
+[Install]
+WantedBy=multi-user.target
+

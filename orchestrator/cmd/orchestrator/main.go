@@ -17,7 +17,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dspy/orchestrator/internal/dispatcher"
 	"github.com/dspy/orchestrator/internal/events"
+	grpcsvc "github.com/dspy/orchestrator/internal/grpc"
 	"github.com/dspy/orchestrator/internal/metrics"
 	"github.com/dspy/orchestrator/internal/queue"
 	"github.com/dspy/orchestrator/internal/runner"
@@ -113,11 +115,26 @@ func main() {
 
 	runnerClient := runner.NewHTTPClient(os.Getenv("ENV_RUNNER_URL"))
 	runnerHardware := newRunnerHardwareCache()
+	taskDispatcher := dispatcher.NewTaskDispatcher(
+		orchestrator,
+		runnerClient,
+		eventBus,
+		queueWatcher,
+		queueGauge,
+		runnerHardware.SnapshotAsMap,
+		workflowStore,
+		pendDir,
+		doneDir,
+	)
 	go pollRunnerMetrics(ctx, runnerClient, queueWatcher, runnerHardware, queueGauge, gpuWaitGauge, errorGauge, runnerGpuGauge)
 
 	executor := workflow.NewExecutor(orchestrator, runStore, workflowStore, runnerClient, slurmBridge, eventBus, workflow.WithHardwareProvider(runnerHardware.SnapshotAsMap))
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
 	mux.Handle("/metrics", registry.Handler())
 	mux.HandleFunc("/workflows", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -330,8 +347,8 @@ func main() {
 			log.Printf("failed to publish submission event: %v", err)
 		}
 
-		refreshQueueGauge(queueWatcher, queueGauge)
-		scheduleEnvTask(ctx, orchestrator, runnerClient, eventBus, queueWatcher, queueGauge, runnerHardware, workflowStore, pendDir, doneDir, envelope)
+		taskDispatcher.RefreshQueueGauge()
+		taskDispatcher.Dispatch(ctx, envelope)
 
 		respondJSON(w, map[string]interface{}{"ok": true, "id": id})
 	})
@@ -350,121 +367,40 @@ func main() {
 		respondJSON(w, queueWatcher.GetQueueStats())
 	})
 
-	server := &http.Server{Addr: ":9097", Handler: mux}
+	// Start HTTP server
+	httpAddr := os.Getenv("ORCHESTRATOR_HTTP_ADDR")
+	if strings.TrimSpace(httpAddr) == "" {
+		httpAddr = ":9097"
+	}
+	server := &http.Server{Addr: httpAddr, Handler: mux}
 	go func() {
-		log.Printf("orchestrator listening on %s", server.Addr)
+		log.Printf("HTTP server listening on %s", server.Addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("server error: %v", err)
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Start gRPC server
+	// Create a simple adapter for the gRPC server's EventBus interface
+	grpcServer := grpcsvc.NewServer(orchestrator, eventBus, registry, taskDispatcher, pendDir)
+	grpcAddr := os.Getenv("ORCHESTRATOR_GRPC_ADDR")
+	if grpcAddr == "" {
+		grpcAddr = ":50052"
+	}
+	go func() {
+		log.Printf("gRPC server starting on %s", grpcAddr)
+		if err := grpcServer.Serve(grpcAddr); err != nil {
+			log.Printf("gRPC server error: %v", err)
 		}
 	}()
 
 	<-ctx.Done()
 	log.Println("shutting down orchestrator")
 	_ = server.Shutdown(context.Background())
+	grpcServer.Stop()
 	if err := orchestrator.Shutdown(); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
-}
-
-func scheduleEnvTask(parent context.Context, orchestrator *workflow.Orchestrator, runnerClient *runner.HTTPClient, eventBus *events.EventBus, queueWatcher *queue.QueueWatcher, queueGauge *telemetry.Gauge, hardwareCache *runnerHardwareCache, workflowStore workflowspec.Store, pendDir, doneDir string, envelope map[string]interface{}) {
-	id, _ := envelope["id"].(string)
-	class, _ := envelope["class"].(string)
-	rawPayload, _ := envelope["payload"].(map[string]interface{})
-
-	payloadCopy := make(map[string]interface{})
-	for k, v := range rawPayload {
-		payloadCopy[k] = v
-	}
-	attachWorkflowContext(payloadCopy, workflowStore)
-	attachRunnerHardwarePayload(payloadCopy, hardwareCache)
-
-	orchestrator.Go("env_task_"+id, func(ctx context.Context) error {
-		sourcePath := filepath.Join(pendDir, id+".json")
-		lockPath := sourcePath + ".lock"
-
-		// Acquire exclusive ownership of the file for execution
-		if err := os.Rename(sourcePath, lockPath); err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-			// If the lock already exists we reuse it
-			if _, statErr := os.Stat(lockPath); statErr != nil {
-				return fmt.Errorf("task file missing for %s", id)
-			}
-		}
-
-		start := time.Now()
-		req := runner.TaskRequest{ID: id, Class: class, Payload: payloadCopy}
-		resp, err := runnerClient.ExecuteTask(ctx, req)
-		duration := time.Since(start)
-
-		if err != nil {
-			_ = os.Rename(lockPath, sourcePath)
-			if publishErr := eventBus.PublishTaskFailed(ctx, id, err.Error()); publishErr != nil {
-				log.Printf("publish failure event: %v", publishErr)
-			}
-			refreshQueueGauge(queueWatcher, queueGauge)
-			return err
-		}
-
-		doneRecord := map[string]interface{}{
-			"id":            id,
-			"class":         class,
-			"payload":       payloadCopy,
-			"runner_result": resp,
-			"completed_at":  time.Now().Format(time.RFC3339Nano),
-			"duration_ms":   duration.Seconds() * 1000,
-		}
-		doneBytes, err := json.MarshalIndent(doneRecord, "", "  ")
-		if err != nil {
-			log.Printf("marshal done record: %v", err)
-		} else {
-			_ = os.MkdirAll(doneDir, 0o755)
-			if writeErr := os.WriteFile(filepath.Join(doneDir, id+".json"), doneBytes, 0o644); writeErr != nil {
-				log.Printf("write done file: %v", writeErr)
-			}
-		}
-
-		_ = os.Remove(lockPath)
-		refreshQueueGauge(queueWatcher, queueGauge)
-
-		completionPayload := map[string]interface{}{"latency_ms": resp.LatencyMs, "class": class}
-		if wfCtx, ok := payloadCopy["workflow_context"]; ok {
-			completionPayload["workflow_context"] = wfCtx
-		}
-		if wfID, ok := payloadCopy["workflow_id"]; ok {
-			completionPayload["workflow_id"] = wfID
-		}
-		if publishErr := eventBus.PublishTaskCompleted(ctx, id, completionPayload); publishErr != nil {
-			log.Printf("publish completion event: %v", publishErr)
-		}
-
-		inputs := extractInputs(payloadCopy)
-		if len(inputs) == len(resp.Embeddings) && len(inputs) > 0 {
-			for idx, input := range inputs {
-				tokens := tokenize(input)
-				vectorPayload := map[string]interface{}{
-					"task_id":   id,
-					"index":     idx,
-					"input":     input,
-					"tokens":    tokens,
-					"embedding": resp.Embeddings[idx],
-					"timestamp": time.Now().Unix(),
-				}
-				if err := eventBus.PublishVectorizedMessage(ctx, id, vectorPayload); err != nil {
-					if wfCtx, ok := payloadCopy["workflow_context"]; ok {
-						vectorPayload["workflow_context"] = wfCtx
-					}
-					if wfID, ok := payloadCopy["workflow_id"].(string); ok && wfID != "" {
-						vectorPayload["workflow_id"] = wfID
-					}
-					log.Printf("publish vectorized message: %v", err)
-				}
-			}
-		}
-
-		return nil
-	})
 }
 
 func pollRunnerMetrics(ctx context.Context, client *runner.HTTPClient, queueWatcher *queue.QueueWatcher, hardware *runnerHardwareCache, queueGauge, gpuWaitGauge, errorGauge, gpuTotalGauge *telemetry.Gauge) {
@@ -497,16 +433,9 @@ func pollRunnerMetrics(ctx context.Context, client *runner.HTTPClient, queueWatc
 			}
 
 			// Fallback to watcher for instantaneous updates
-			refreshQueueGauge(queueWatcher, queueGauge)
+			dispatcher.RefreshQueueGauge(queueWatcher, queueGauge)
 		}
 	}
-}
-
-func refreshQueueGauge(queueWatcher *queue.QueueWatcher, gauge *telemetry.Gauge) {
-	if queueWatcher == nil || gauge == nil {
-		return
-	}
-	gauge.Set(float64(queueWatcher.GetQueueDepth()))
 }
 
 type runnerHardwareCache struct {
@@ -559,78 +488,6 @@ func (c *runnerHardwareCache) SnapshotAsMap() map[string]any {
 	return clone
 }
 
-func tokenize(input string) []string {
-	lower := strings.ToLower(input)
-	fields := strings.Fields(lower)
-	tokens := make([]string, 0, len(fields))
-	for _, field := range fields {
-		trimmed := strings.Trim(field, ".,;:!?")
-		if trimmed != "" {
-			tokens = append(tokens, trimmed)
-		}
-	}
-	return tokens
-}
-
-func attachWorkflowContext(payload map[string]interface{}, store workflowspec.Store) {
-	if store == nil || payload == nil {
-		return
-	}
-	idRaw, ok := payload["workflow_id"]
-	if !ok {
-		return
-	}
-	wfID, ok := idRaw.(string)
-	if !ok || strings.TrimSpace(wfID) == "" {
-		return
-	}
-	wf, err := store.Get(wfID)
-	if err != nil {
-		log.Printf("workflow lookup failed for %s: %v", wfID, err)
-		return
-	}
-	ctxPayload := workflow.BuildWorkflowContext(wf)
-	if ctxPayload == nil {
-		return
-	}
-	payload["workflow_context"] = ctxPayload
-	if _, exists := payload["tenant"]; !exists {
-		if tenant, ok := ctxPayload["tenant"].(string); ok && tenant != "" {
-			payload["tenant"] = tenant
-		}
-	}
-}
-
-func attachRunnerHardwarePayload(payload map[string]interface{}, cache *runnerHardwareCache) {
-	if cache == nil || payload == nil {
-		return
-	}
-	if _, exists := payload["runner_hardware"]; exists {
-		return
-	}
-	if snapshot := cache.SnapshotAsMap(); snapshot != nil {
-		payload["runner_hardware"] = snapshot
-	}
-}
-
-func extractInputs(payload map[string]interface{}) []string {
-	inputsVal, ok := payload["inputs"]
-	if !ok {
-		return nil
-	}
-	arr, ok := inputsVal.([]interface{})
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(arr))
-	for _, item := range arr {
-		if s, ok := item.(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 func refreshWorkflowGauge(store workflowspec.Store, gauge *telemetry.Gauge) {
 	if store == nil || gauge == nil {
 		return
@@ -649,3 +506,10 @@ func respondJSON(w http.ResponseWriter, payload interface{}) {
 		log.Printf("respond json: %v", err)
 	}
 }
+
+// grpcEventBusAdapter adapts the events.EventBus to the gRPC server's EventBus interface
+type grpcEventBusAdapter struct {
+	eventBus *events.EventBus
+}
+
+// Subscribe implements the gRPC EventBus interface

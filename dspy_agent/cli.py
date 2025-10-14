@@ -155,8 +155,9 @@ from .training.train_gepa import run_gepa, run_gepa_with_val, evaluate_on_set
 from .training.train_prefs import train_preference_rewriter
 from .training.train_orchestrator import run_gepa_orchestrator, run_gepa_orchestrator_with_val, evaluate_orchestrator
 from .training.train_codegen import run_gepa_codegen
+from .training.gepa_pipeline import GEPAModuleConfig, run_gepa_pipeline
 from .training.autogen_dataset import bootstrap_datasets, bootstrap_datasets_with_splits
-from .infra import AgentInfra
+from .infra import AgentInfra, ensure_infra_sync
 from .training.rl_sweep import run_sweep as _run_rl_sweep, load_sweep_config as _load_sweep_config, SweepSettings as _SweepSettings
 from .agents.orchestrator_runtime import evaluate_tool_choice
 from .embedding.indexer import tokenize
@@ -6070,6 +6071,82 @@ def gepa_orchestrator(
 
 
 @app.command()
+def gepa_orchestrator(
+    dataset_dir: Path = typer.Option(..., '--dataset-dir', exists=True, file_okay=False, help="Directory containing <module>_train.jsonl"),
+    module: List[str] = typer.Option([], '--module', help="One or more GEPA modules (context, task, code)"),
+    auto: str = typer.Option('light', '--auto', help="GEPA auto budget label"),
+    workspace: Optional[Path] = typer.Option(None, '--workspace', dir_okay=True, help="Workspace root for saving outcomes"),
+    orchestrator_addr: Optional[str] = typer.Option(None, '--orchestrator-addr', help="Orchestrator gRPC address"),
+    tenant: str = typer.Option('gepa', '--tenant', help="Tenant label for orchestrator queue"),
+    priority: int = typer.Option(0, '--priority', help="Task priority"),
+    task_class: str = typer.Option('cpu_long', '--task-class', help="Orchestrator task class"),
+    use_ollama: bool = typer.Option(False, '--use-ollama/--no-use-ollama', help="Flag to enable Ollama reflection LM inside tasks"),
+    model: Optional[str] = typer.Option(None, '--model', help="Reflection model name"),
+    base_url: Optional[str] = typer.Option(None, '--base-url', help="Reflection base URL"),
+    api_key: Optional[str] = typer.Option(None, '--api-key', help="Reflection API key"),
+    output_json: Optional[Path] = typer.Option(None, '--output-json', help="Optional path to write aggregated results"),
+):
+    """Submit GEPA optimisation tasks to the orchestrator runner."""
+    module_list = [m.lower().strip() for m in module if m.strip()] or ["context", "task", "code"]
+    configs: List[GEPAModuleConfig] = []
+    ds = dataset_dir.resolve()
+    for name in module_list:
+        train = ds / f"{name}_train.jsonl"
+        if not train.exists():
+            console.print(f"[yellow]Missing training dataset for module '{name}': {train}[/yellow]")
+            raise typer.Exit(2)
+        val = ds / f"{name}_val.jsonl"
+        if not val.exists():
+            val = None
+        test = ds / f"{name}_test.jsonl"
+        if not test.exists():
+            test = None
+        configs.append(
+            GEPAModuleConfig(
+                name=name,
+                train_jsonl=train,
+                val_jsonl=val,
+                test_jsonl=test,
+            )
+        )
+
+    ws = (workspace or Path.cwd()).resolve()
+    extra_args = {
+        "--use-ollama": use_ollama or os.getenv("DSPY_USE_OLLAMA", "0") == "1",
+        "--model": model,
+        "--base-url": base_url,
+        "--api-key": api_key,
+    }
+    console.print(Panel.fit(
+        f"Submitting {len(configs)} GEPA tasks via orchestrator {orchestrator_addr or os.getenv('ORCHESTRATOR_GRPC_ADDR', '127.0.0.1:50052')}",
+        title="GEPA Orchestrator",
+        border_style="cyan",
+    ))
+
+    results = asyncio.run(
+        run_gepa_pipeline(
+            configs,
+            orchestrator_addr=orchestrator_addr,
+            task_class=task_class,
+            tenant=tenant,
+            priority=priority,
+            auto=auto,
+            workspace=ws,
+            extra_args=extra_args,
+        )
+    )
+
+    if output_json:
+        try:
+            output_json.parent.mkdir(parents=True, exist_ok=True)
+            output_json.write_text(json.dumps(results, indent=2))
+        except Exception as exc:
+            console.print(f"[yellow]Failed to write output JSON: {exc}[/yellow]")
+
+    for entry in results:
+        console.print(Panel(json.dumps(entry, indent=2), title=f"Module {entry.get('module')}"))
+
+@app.command()
 def gepa_codegen(
     train_jsonl: Path = typer.Option(..., '--train-jsonl', exists=True, help="Train JSONL for code edits: {task, context, file_hints?}"),
     workspace: Path = typer.Option(Path.cwd(), '--workspace', exists=True, dir_okay=True, help="Workspace to test patches in"),
@@ -7035,10 +7112,12 @@ def start_command(
     infra: Optional[AgentInfra] = None
     infra_started = False
     try:
-        infra = AgentInfra(workspace=ws)
-        asyncio.run(infra.start())
+        infra = ensure_infra_sync(workspace=ws)
         infra_started = True
         console.print("[dim]Infrastructure initialised via unified CLI.[/dim]")
+    except RuntimeError as exc:
+        console.print(Panel(str(exc), title="Infrastructure start failed", border_style="red"))
+        raise typer.Exit(1)
     except Exception as exc:
         console.print(Panel(str(exc), title="Infrastructure start failed", border_style="red"))
         raise typer.Exit(1)

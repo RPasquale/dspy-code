@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import importlib
+import logging
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from queue import Queue, Empty, Full
@@ -2495,6 +2496,24 @@ class StreamingRuntime:
         self.is_initialized = False
 
     async def initialize(self) -> None:
+        if not self.is_initialized:
+            if os.getenv("DSPY_STREAM_SKIP_INFRA_CHECK", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+                try:
+                    from ..infra import AgentInfra
+                    from ..infra.agent_infra import CLI_ENV_SKIP_START
+
+                    prev_skip = os.getenv(CLI_ENV_SKIP_START)
+                    os.environ[CLI_ENV_SKIP_START] = "1"
+                    try:
+                        async with AgentInfra.start(auto_start_services=False) as infra:
+                            await infra.health_check()
+                    finally:
+                        if prev_skip is None:
+                            os.environ.pop(CLI_ENV_SKIP_START, None)
+                        else:
+                            os.environ[CLI_ENV_SKIP_START] = prev_skip
+                except Exception as exc:
+                    logging.getLogger(__name__).debug("Streaming infra health check skipped: %s", exc)
         self.is_initialized = True
 
     async def publish(self, topic: str, message: Any) -> None:

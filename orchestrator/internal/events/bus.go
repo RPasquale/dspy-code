@@ -27,6 +27,9 @@ type EventBus struct {
 	vectorWriter *spoolWriter
 	reddbClient  *http.Client
 	reddbURL     string
+	subMux       sync.RWMutex
+	subscribers  map[int64]*eventSubscriber
+	nextSubID    int64
 }
 
 // Event represents a system event.
@@ -35,6 +38,11 @@ type Event struct {
 	Timestamp time.Time              `json:"timestamp"`
 	Data      map[string]interface{} `json:"data"`
 	Source    string                 `json:"source"`
+}
+
+type eventSubscriber struct {
+	ch      chan Event
+	filters map[string]struct{}
 }
 
 // NewEventBus creates a new event bus instance.
@@ -80,16 +88,55 @@ func NewEventBus(registry *telemetry.Registry, kafkaEnabled, reddbEnabled bool) 
 	return eb, nil
 }
 
+// Subscribe registers a subscriber for the given event types. If types is empty,
+// all events are delivered. The returned cancel function must be invoked to
+// release resources.
+func (eb *EventBus) Subscribe(types []string) (<-chan Event, func()) {
+	eb.subMux.Lock()
+	defer eb.subMux.Unlock()
+	if eb.subscribers == nil {
+		eb.subscribers = make(map[int64]*eventSubscriber)
+	}
+
+	filters := make(map[string]struct{})
+	for _, t := range types {
+		if t == "" {
+			continue
+		}
+		filters[t] = struct{}{}
+	}
+
+	id := eb.nextSubID
+	eb.nextSubID++
+
+	ch := make(chan Event, 64)
+	eb.subscribers[id] = &eventSubscriber{ch: ch, filters: filters}
+
+	cancel := func() {
+		eb.subMux.Lock()
+		if sub, ok := eb.subscribers[id]; ok {
+			delete(eb.subscribers, id)
+			close(sub.ch)
+		}
+		eb.subMux.Unlock()
+	}
+
+	return ch, cancel
+}
+
 // PublishTaskSubmitted publishes a task submitted event.
 func (eb *EventBus) PublishTaskSubmitted(ctx context.Context, taskID string, taskData map[string]interface{}) error {
+	data := map[string]interface{}{
+		"task_id": taskID,
+	}
+	for k, v := range taskData {
+		data[k] = v
+	}
 	return eb.publishEvent(ctx, Event{
 		Type:      "task_submitted",
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
-			"task_id":   taskID,
-			"task_data": taskData,
-		},
-		Source: "orchestrator",
+		Data:      data,
+		Source:    "orchestrator",
 	})
 }
 
@@ -116,6 +163,22 @@ func (eb *EventBus) PublishTaskFailed(ctx context.Context, taskID string, failur
 			"error":   failure,
 		},
 		Source: "orchestrator",
+	})
+}
+
+// PublishTaskStarted emits a task_started event when execution begins.
+func (eb *EventBus) PublishTaskStarted(ctx context.Context, taskID string, payload map[string]interface{}) error {
+	data := map[string]interface{}{
+		"task_id": taskID,
+	}
+	for k, v := range payload {
+		data[k] = v
+	}
+	return eb.publishEvent(ctx, Event{
+		Type:      "task_started",
+		Timestamp: time.Now(),
+		Data:      data,
+		Source:    "runner",
 	})
 }
 
@@ -162,6 +225,7 @@ func (eb *EventBus) PublishVectorizedMessage(ctx context.Context, key string, pa
 }
 
 func (eb *EventBus) publishEvent(ctx context.Context, event Event) error {
+	ensureResourceID(&event)
 	if err := eb.logToFile(event); err != nil {
 		return fmt.Errorf("log event: %w", err)
 	}
@@ -182,7 +246,41 @@ func (eb *EventBus) publishEvent(ctx context.Context, event Event) error {
 		}
 	}
 	eb.registry.Counter("events_published_total").Inc()
+	eb.broadcast(event)
 	return nil
+}
+
+func ensureResourceID(event *Event) {
+	if event.Data == nil {
+		return
+	}
+	if _, ok := event.Data["resource_id"]; ok {
+		return
+	}
+	for _, key := range []string{"task_id", "run_id", "workflow_id", "job_id"} {
+		if val, ok := event.Data[key]; ok {
+			if v := fmt.Sprint(val); v != "" {
+				event.Data["resource_id"] = v
+				return
+			}
+		}
+	}
+}
+
+func (eb *EventBus) broadcast(event Event) {
+	eb.subMux.RLock()
+	defer eb.subMux.RUnlock()
+	for _, sub := range eb.subscribers {
+		if len(sub.filters) > 0 {
+			if _, ok := sub.filters[event.Type]; !ok {
+				continue
+			}
+		}
+		select {
+		case sub.ch <- event:
+		default:
+		}
+	}
 }
 
 func (eb *EventBus) logToFile(event Event) error {
@@ -218,8 +316,16 @@ func (eb *EventBus) publishToRedDB(ctx context.Context, event Event) error {
 // Close releases event bus resources.
 func (eb *EventBus) Close() error {
 	if eb.logFile != nil {
-		return eb.logFile.Close()
+		if err := eb.logFile.Close(); err != nil {
+			return err
+		}
 	}
+	eb.subMux.Lock()
+	for id, sub := range eb.subscribers {
+		close(sub.ch)
+		delete(eb.subscribers, id)
+	}
+	eb.subMux.Unlock()
 	return nil
 }
 

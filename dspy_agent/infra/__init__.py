@@ -20,6 +20,14 @@ Example:
 
 from .agent_infra import AgentInfra
 from .grpc_client import OrchestratorClient, orchestrator_client
+from .runtime import ensure_infra, ensure_infra_sync, shutdown_infra, use_infra
 
-__all__ = ["AgentInfra", "OrchestratorClient", "orchestrator_client"]
-
+__all__ = [
+    "AgentInfra",
+    "OrchestratorClient",
+    "orchestrator_client",
+    "ensure_infra",
+    "ensure_infra_sync",
+    "shutdown_infra",
+    "use_infra",
+]

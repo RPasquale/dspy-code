@@ -222,5 +222,37 @@ pub struct ImagePullProgress {
     #[prost(int32, tag="5")]
     pub progress_percent: i32,
 }
+/// Log streaming
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamLogsRequest {
+    /// required
+    #[prost(string, tag="1")]
+    pub service_name: ::prost::alloc::string::String,
+    /// continue streaming new logs
+    #[prost(bool, tag="2")]
+    pub follow: bool,
+    /// number of lines from end (0 = all)
+    #[prost(int32, tag="3")]
+    pub tail: i32,
+    /// Unix timestamp to start from
+    #[prost(int64, tag="4")]
+    pub since_timestamp: i64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogEntry {
+    #[prost(string, tag="1")]
+    pub service_name: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub container_id: ::prost::alloc::string::String,
+    /// stdout or stderr
+    #[prost(string, tag="3")]
+    pub stream: ::prost::alloc::string::String,
+    #[prost(string, tag="4")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, tag="5")]
+    pub timestamp: i64,
+}
 include!("env_manager.v1.tonic.rs");
 // @@protoc_insertion_point(module)

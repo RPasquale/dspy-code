@@ -8,7 +8,6 @@ use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine;
 use chrono::Utc;
 use env_runner_rs::hardware::{detect, recommended_inflight, HardwareSnapshot};
-use env_runner_rs::infermesh::{InferMeshClient, InferMeshConfig};
 use env_runner_rs::metrics::{EnvRunnerMetrics, MetricsServer};
 use env_runner_rs::pb;
 use env_runner_rs::streaming::{
@@ -144,44 +143,7 @@ impl WorkerTelemetry {
     }
 }
 
-fn infermesh_config_from_env() -> InferMeshConfig {
-    let mut cfg = InferMeshConfig::default();
-    if let Ok(url) = std::env::var("INFERMESH_BASE_URL") {
-        cfg.base_url = url.trim().trim_end_matches('/').to_string();
-    }
-    if let Ok(model) = std::env::var("INFERMESH_MODEL") {
-        if !model.trim().is_empty() {
-            cfg.model = model;
-        }
-    }
-    if let Ok(api_key) = std::env::var("INFERMESH_API_KEY") {
-        if !api_key.trim().is_empty() {
-            cfg.api_key = Some(api_key);
-        }
-    }
-    if let Ok(val) = std::env::var("INFERMESH_TIMEOUT_SECS") {
-        if let Ok(parsed) = val.parse::<u64>() {
-            cfg.timeout_secs = parsed.max(5);
-        }
-    }
-    if let Ok(val) = std::env::var("INFERMESH_BATCH_SIZE") {
-        if let Ok(parsed) = val.parse::<usize>() {
-            cfg.batch_size = parsed.max(1);
-        }
-    }
-    if let Ok(val) = std::env::var("INFERMESH_MAX_CONCURRENCY") {
-        if let Ok(parsed) = val.parse::<usize>() {
-            cfg.max_concurrent_requests = parsed.max(1);
-        }
-    }
-    if let Ok(val) = std::env::var("INFERMESH_CONNECTION_POOL") {
-        if let Ok(parsed) = val.parse::<usize>() {
-            cfg.connection_pool_size = parsed.max(4);
-        }
-    }
-    cfg
-}
-
+#[allow(dead_code)]
 fn spawn_hardware_refresh(hardware: Arc<RwLock<HardwareSnapshot>>) {
     tokio::spawn(async move {
         loop {
@@ -572,36 +534,49 @@ async fn main() -> Result<()> {
     spawn_hardware_refresh(hardware_state.clone());
 
     let metrics_state = Arc::new(EnvRunnerMetrics::new());
-    let infermesh_cfg = infermesh_config_from_env();
-    let infer_client =
-        Arc::new(InferMeshClient::new(infermesh_cfg).context("create infermesh client")?);
     let metrics_port = std::env::var("ENV_RUNNER_HTTP_PORT")
         .ok()
         .and_then(|val| val.parse::<u16>().ok())
         .unwrap_or(8083);
-    let metrics_server = MetricsServer::new(
+    let metrics_server = Arc::new(MetricsServer::new(
         metrics_state.clone(),
-        infer_client.clone(),
         hardware_state.clone(),
         metrics_port,
-    );
+    ));
+    let server_handle = metrics_server.clone();
     tokio::spawn(async move {
-        if let Err(err) = metrics_server.start().await {
+        if let Err(err) = server_handle.start().await {
             error!(port = metrics_port, error = %err, "metrics server terminated");
         }
     });
 
-    let mut cfg = WorkerConfig::from_env();
-    if cfg.max_inflight == 0 || std::env::var("MAX_INFLIGHT").is_err() {
-        if let Ok(snapshot) = hardware_state.read() {
-            cfg.max_inflight = recommended_inflight(&snapshot);
-        }
-    }
+    let supervisor_enabled = std::env::var("ENABLE_SUPERVISOR")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
-    if cfg.mesh_endpoint.is_some() {
-        run_mesh_worker(cfg, hardware_state.clone()).await
+    if supervisor_enabled {
+        let mut cfg = WorkerConfig::from_env();
+        if cfg.max_inflight == 0 || std::env::var("MAX_INFLIGHT").is_err() {
+            if let Ok(snapshot) = hardware_state.read() {
+                cfg.max_inflight = recommended_inflight(&snapshot);
+            }
+        }
+
+        if cfg.mesh_endpoint.is_some() {
+            run_mesh_worker(cfg, hardware_state.clone()).await
+        } else {
+            run_kafka_worker(cfg, hardware_state.clone()).await
+        }
     } else {
-        run_kafka_worker(cfg, hardware_state.clone()).await
+        info!(
+            port = metrics_port,
+            "env-runner started in HTTP execution mode"
+        );
+        tokio::signal::ctrl_c()
+            .await
+            .context("await ctrl-c signal")?;
+        metrics_server.shutdown().await;
+        Ok(())
     }
 }
 

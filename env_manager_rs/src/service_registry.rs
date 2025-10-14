@@ -44,18 +44,18 @@ impl ServiceRegistry {
             network: Some("lightweight_default".to_string()),
         });
 
-        // RedDB - Lightweight database  
+        // RedDB - Lightweight database
         self.register(ServiceDefinition {
-            name: "reddb".to_string(),
+            name: "redb".to_string(),
             image: "dspy-lightweight:latest".to_string(),
             ports: Self::create_port_binding("8080", "8082"),
             environment: vec![
-                "REDDB_DATA_DIR=/data".to_string(),
-                "REDDB_HOST=0.0.0.0".to_string(),
-                "REDDB_PORT=8080".to_string(),
-                "REDDB_NAMESPACE=dspy".to_string(),
+                "REDB_DATA_DIR=/data".to_string(),
+                "REDB_HOST=0.0.0.0".to_string(),
+                "REDB_PORT=8080".to_string(),
+                "REDB_NAMESPACE=dspy".to_string(),
             ],
-            volumes: vec!["reddb_data:/data".to_string()],
+            volumes: vec!["redb_data:/data".to_string()],
             depends_on: vec![],
             health_check_url: Some("http://localhost:8082/health".to_string()),
             health_check_interval_secs: 2,
@@ -68,9 +68,7 @@ impl ServiceRegistry {
             name: "ollama".to_string(),
             image: "ollama/ollama:latest".to_string(),
             ports: Self::create_port_binding("11434", "11435"),
-            environment: vec![
-                "OLLAMA_HOST=0.0.0.0:11434".to_string(),
-            ],
+            environment: vec!["OLLAMA_HOST=0.0.0.0:11434".to_string()],
             volumes: vec!["ollama_data:/root/.ollama".to_string()],
             depends_on: vec![],
             health_check_url: Some("http://localhost:11435/api/tags".to_string()),
@@ -127,7 +125,10 @@ impl ServiceRegistry {
                 "REDIS_URL=redis://redis:6379".to_string(),
             ],
             volumes: vec![],
-            depends_on: vec!["infermesh-node-a".to_string(), "infermesh-node-b".to_string()],
+            depends_on: vec![
+                "infermesh-node-a".to_string(),
+                "infermesh-node-b".to_string(),
+            ],
             health_check_url: Some("http://localhost:19000/health".to_string()),
             health_check_interval_secs: 3,
             required: false,
@@ -207,7 +208,10 @@ impl ServiceRegistry {
         // });
     }
 
-    fn create_port_binding(container_port: &str, host_port: &str) -> HashMap<String, Vec<PortBinding>> {
+    fn create_port_binding(
+        container_port: &str,
+        host_port: &str,
+    ) -> HashMap<String, Vec<PortBinding>> {
         let mut ports = HashMap::new();
         ports.insert(
             format!("{}/tcp", container_port),

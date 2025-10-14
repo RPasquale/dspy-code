@@ -24,6 +24,8 @@ vendor/
 *.out
 go.work
 go.work.sum
+cmd/dspy-agent/go.mod
+cmd/dspy-agent/go.sum
 
 # Rust
 target/
@@ -53,6 +55,7 @@ target/
 
 # Binary executables and build artifacts
 orchestrator-linux
+stream_supervisor-linux
 cmd/dspy-agent/dspy-agent
 *.tar.gz
 go1.*.linux-amd64.tar.gz

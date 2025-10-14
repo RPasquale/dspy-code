@@ -28,8 +28,8 @@ impl HealthChecker {
 
     /// Check Redis health using PING command
     pub async fn check_redis(&self, host: &str, port: u16) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
-        use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
         let addr = format!("{}:{}", host, port);
         match TcpStream::connect(&addr).await {
@@ -60,11 +60,17 @@ impl HealthChecker {
         service_name: &str,
         check_url: Option<&str>,
         max_attempts: u32,
+        timeout_secs: u64,
     ) -> Result<()> {
         info!("Waiting for {} to become healthy", service_name);
 
         let mut attempt = 0;
         let mut delay = Duration::from_millis(500);
+        let deadline = if timeout_secs == 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + Duration::from_secs(timeout_secs))
+        };
 
         while attempt < max_attempts {
             attempt += 1;
@@ -84,6 +90,12 @@ impl HealthChecker {
             if healthy {
                 info!("✓ {} is healthy", service_name);
                 return Ok(());
+            }
+
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
             }
 
             warn!(
@@ -110,4 +122,3 @@ impl Default for HealthChecker {
         Self::new()
     }
 }
-

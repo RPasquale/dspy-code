@@ -306,6 +306,33 @@ pub mod env_manager_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn stream_logs(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StreamLogsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::LogEntry>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/env_manager.v1.EnvManagerService/StreamLogs",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("env_manager.v1.EnvManagerService", "StreamLogs"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -386,6 +413,16 @@ pub mod env_manager_service_server {
             &self,
             request: tonic::Request<super::PullImagesRequest>,
         ) -> std::result::Result<tonic::Response<Self::PullImagesStream>, tonic::Status>;
+        /// Server streaming response type for the StreamLogs method.
+        type StreamLogsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::LogEntry, tonic::Status>,
+            >
+            + Send
+            + 'static;
+        async fn stream_logs(
+            &self,
+            request: tonic::Request<super::StreamLogsRequest>,
+        ) -> std::result::Result<tonic::Response<Self::StreamLogsStream>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct EnvManagerServiceServer<T: EnvManagerService> {
@@ -826,6 +863,52 @@ pub mod env_manager_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = PullImagesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/env_manager.v1.EnvManagerService/StreamLogs" => {
+                    #[allow(non_camel_case_types)]
+                    struct StreamLogsSvc<T: EnvManagerService>(pub Arc<T>);
+                    impl<
+                        T: EnvManagerService,
+                    > tonic::server::ServerStreamingService<super::StreamLogsRequest>
+                    for StreamLogsSvc<T> {
+                        type Response = super::LogEntry;
+                        type ResponseStream = T::StreamLogsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StreamLogsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as EnvManagerService>::stream_logs(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StreamLogsSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

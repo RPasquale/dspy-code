@@ -5,6 +5,7 @@ This module provides bulletproof PufferLib integration that works in ALL situati
 with fallbacks for any PufferLib version and environment.
 """
 
+import asyncio
 import os
 import sys
 import logging
@@ -59,6 +60,7 @@ except ImportError:
 # Local imports
 from ..streaming.streamkit import LocalBus
 from ..agents.knowledge import KnowledgeAgent
+from ..infra.runtime import ensure_infra, ensure_infra_sync
 from .rl_tracking import get_rl_tracker, RLTrackingSystem
 
 # Try to import LLM with fallback
@@ -162,6 +164,11 @@ class UniversalPufferTrainer:
         self.config = config
         self.bus = bus
         self.logger = logging.getLogger(__name__)
+
+        try:
+            ensure_infra_sync()
+        except RuntimeError:
+            asyncio.get_running_loop().create_task(ensure_infra(auto_start_services=True))
         
         # Initialize components
         self.knowledge_base = KnowledgeAgent(workspace=Path("."))

@@ -1,12 +1,3 @@
-FROM golang:1.20-alpine AS go-builder
-RUN apk add --no-cache git
-WORKDIR /src
-COPY orchestrator/go.mod orchestrator/go.sum ./orchestrator/
-RUN cd orchestrator && go mod download
-COPY orchestrator/ ./orchestrator
-RUN cd orchestrator && CGO_ENABLED=0 GOOS=linux go build -o /out/orchestrator ./cmd/orchestrator
-RUN cd orchestrator && CGO_ENABLED=0 GOOS=linux go build -o /out/stream_supervisor ./cmd/stream_supervisor
-
 FROM rust:1.82 AS rust-builder
 
 # Resource limits to prevent system crashes
@@ -161,8 +152,8 @@ RUN set -eux; \
       echo "[warn] Skipping RL extras on $arch"; \
     fi
 
-COPY --from=go-builder /out/orchestrator /usr/local/bin/orchestrator
-COPY --from=go-builder /out/stream_supervisor /usr/local/bin/stream_supervisor
+COPY orchestrator-linux /usr/local/bin/orchestrator
+COPY stream_supervisor-linux /usr/local/bin/stream_supervisor
 COPY --from=rust-builder /src/env_runner_rs/target/release/env_runner /usr/local/bin/env_runner
 COPY --from=rust-builder /src/reddb_rs/target/release/reddb /usr/local/bin/reddb
 

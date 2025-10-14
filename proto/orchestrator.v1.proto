@@ -12,6 +12,9 @@ service OrchestratorService {
   // Stream task results as they complete
   rpc StreamTaskResults(StreamTaskResultsRequest) returns (stream TaskResult);
   
+  // Get the current status of a submitted task
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+  
   // Create a workflow
   rpc CreateWorkflow(CreateWorkflowRequest) returns (CreateWorkflowResponse);
   
@@ -59,6 +62,17 @@ message TaskResult {
   string error = 4;
   double duration_ms = 5;
   int64 completed_at = 6;
+}
+
+message GetTaskStatusRequest {
+  string task_id = 1;
+}
+
+message GetTaskStatusResponse {
+  string task_id = 1;
+  string status = 2;
+  map<string, string> result = 3;
+  string error = 4;
 }
 
 // Workflow management

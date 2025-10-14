@@ -5,7 +5,7 @@ High-performance container lifecycle manager for DSPy agent infrastructure.
 ## Purpose
 
 `env_manager_rs` is responsible for:
-- Managing Docker containers (RedDB, Redis, InferMesh, Ollama, etc.)
+- Managing Docker containers (RedB, Redis, InferMesh, Ollama, etc.)
 - Health checking and dependency resolution
 - Providing gRPC API for orchestrator communication
 - Replacing docker-compose with embedded service definitions
@@ -40,7 +40,9 @@ DOCKER_HOST=unix:///var/run/docker.sock ./target/release/env-manager
 ## Environment Variables
 
 - `ENV_MANAGER_GRPC_ADDR`: gRPC server address (default: `0.0.0.0:50100`)
+- `ENV_MANAGER_METRICS_ADDR`: HTTP metrics/health address (default: `0.0.0.0:50101`)
 - `DOCKER_HOST`: Docker socket/endpoint (default: system default)
+- `ENV_MANAGER_CONFIG`: Optional TOML file to override service definitions (tenants, images, mounts)
 - `RUST_LOG`: Logging level (default: `info`)
 
 ## gRPC API
@@ -57,7 +59,7 @@ Key services:
 ## Service Registry
 
 Embedded service definitions for:
-- **RedDB**: Lightweight database (port 8080)
+- **RedB**: Lightweight database (port 8080)
 - **Redis**: Cache and pub/sub (port 6379)
 - **InferMesh Nodes**: Inference services (ports 19001, 19002)
 - **InferMesh Router**: Load balancer (port 19000)
@@ -74,4 +76,13 @@ env_manager_rs
 ├── grpc_server.rs     # gRPC API implementation
 └── main.rs           # Entry point
 ```
+
+## Metrics & Health
+
+`env-manager` exposes two HTTP endpoints (defaults to `0.0.0.0:50101`):
+
+- `GET /health` – readiness/liveness probe used by systemd/Kubernetes.
+- `GET /metrics` – Prometheus-friendly JSON (queue depth, active services, Docker timings).
+
+Service startups are reported with Docker API duration histograms (`docker_api_duration_seconds`) and `active_services` gauge, which keep the orchestrator and dashboards in sync.
 

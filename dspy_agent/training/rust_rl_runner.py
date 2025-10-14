@@ -21,6 +21,7 @@ import numpy as np
 # Local imports
 from .universal_pufferlib import UniversalPufferTrainer, UniversalPufferConfig
 from .rl_tracking import get_rl_tracker
+from ..infra.runtime import ensure_infra, ensure_infra_sync
 from ..streaming.streamkit import LocalBus
 
 
@@ -248,6 +249,11 @@ class RustRLRunner:
     def __init__(self, config: RustRLConfig):
         self.config = config
         self.logger = logging.getLogger(__name__)
+
+        try:
+            ensure_infra_sync()
+        except RuntimeError:
+            asyncio.get_running_loop().create_task(ensure_infra(auto_start_services=True))
         
         # Environment management
         self.envs: Dict[str, RustRLEnvironment] = {}

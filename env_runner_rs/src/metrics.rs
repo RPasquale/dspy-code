@@ -1,5 +1,5 @@
+use crate::executor::execute_task;
 use crate::hardware::HardwareSnapshot;
-use crate::infermesh::InferMeshClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -165,7 +165,6 @@ struct ErrorResponse {
 /// HTTP metrics and task execution server for the Rust environment runner.
 pub struct MetricsServer {
     metrics: Arc<EnvRunnerMetrics>,
-    client: Arc<InferMeshClient>,
     hardware: Arc<RwLock<HardwareSnapshot>>,
     port: u16,
     shutdown: Arc<Notify>,
@@ -174,13 +173,11 @@ pub struct MetricsServer {
 impl MetricsServer {
     pub fn new(
         metrics: Arc<EnvRunnerMetrics>,
-        client: Arc<InferMeshClient>,
         hardware: Arc<RwLock<HardwareSnapshot>>,
         port: u16,
     ) -> Self {
         Self {
             metrics,
-            client,
             hardware,
             port,
             shutdown: Arc::new(Notify::new()),
@@ -193,7 +190,6 @@ impl MetricsServer {
         let hardware_for_metrics = self.hardware.clone();
         let hardware_for_prometheus = self.hardware.clone();
         let hardware_for_endpoint = self.hardware.clone();
-        let client = self.client.clone();
         let shutdown = self.shutdown.clone();
 
         let health = warp::path("health")
@@ -280,9 +276,7 @@ impl MetricsServer {
         let tasks = warp::path("tasks")
             .and(warp::path("execute"))
             .and(warp::post())
-            .and(with_client(client))
             .and(with_metrics(self.metrics.clone()))
-            .and(with_hardware(self.hardware.clone()))
             .and(warp::body::json())
             .and_then(handle_task_request)
             .boxed();
@@ -311,81 +305,56 @@ impl MetricsServer {
     }
 }
 
-fn with_client(
-    client: Arc<InferMeshClient>,
-) -> impl Filter<Extract = (Arc<InferMeshClient>,), Error = Infallible> + Clone {
-    warp::any().map(move || client.clone())
-}
-
 fn with_metrics(
     metrics: Arc<EnvRunnerMetrics>,
 ) -> impl Filter<Extract = (Arc<EnvRunnerMetrics>,), Error = Infallible> + Clone {
     warp::any().map(move || metrics.clone())
 }
 
-fn with_hardware(
-    hardware: Arc<RwLock<HardwareSnapshot>>,
-) -> impl Filter<Extract = (Arc<RwLock<HardwareSnapshot>>,), Error = Infallible> + Clone {
-    warp::any().map(move || hardware.clone())
-}
-
 async fn handle_task_request(
-    client: Arc<InferMeshClient>,
     metrics: Arc<EnvRunnerMetrics>,
-    hardware: Arc<RwLock<HardwareSnapshot>>,
     request: TaskRequest,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    let inputs = match extract_inputs(&request.payload) {
-        Ok(inputs) => inputs,
-        Err(err) => {
-            let body = warp::reply::json(&ErrorResponse { error: err });
-            return Ok(warp::reply::with_status(body, StatusCode::BAD_REQUEST));
-        }
-    };
+    let class = request
+        .class
+        .clone()
+        .unwrap_or_else(|| "cpu_short".to_string());
 
     let started = Instant::now();
-    metrics.update_queue_depth(inputs.len() as u64);
-
-    let result = client.embed(inputs.clone()).await;
-
-    metrics.update_queue_depth(0);
-
-    match result {
-        Ok(vectors) => {
+    match execute_task(&request.id, &class, &request.payload).await {
+        Ok(result) if result.success => {
             metrics.increment_tasks_processed();
-            metrics.record_task_duration(started.elapsed());
-            metrics.update_gpu_utilization(0.8); // Placeholder for real GPU metrics
+            metrics.record_task_duration(result.duration);
+            metrics.update_queue_depth(0);
 
-            let embeddings: Vec<Vec<f64>> = vectors
-                .into_iter()
-                .map(|vec| vec.into_iter().map(|f| f as f64).collect())
-                .collect();
+            if class.to_ascii_lowercase().contains("gpu") {
+                metrics.update_gpu_utilization(0.85);
+            }
 
-            let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-            let hardware_snapshot = hardware.read().ok().map(|snapshot| snapshot.clone());
-            let metadata = build_workflow_metadata(
-                &request.payload,
-                latency_ms,
-                embeddings.len(),
-                hardware_snapshot,
-            );
             let response = TaskExecutionResponse {
                 id: request.id,
-                embeddings,
-                latency_ms,
-                metadata,
+                embeddings: Vec::new(),
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                metadata: Some(result.metadata),
             };
 
             let body = warp::reply::json(&response);
             Ok(warp::reply::with_status(body, StatusCode::OK))
         }
+        Ok(result) => {
+            metrics.increment_error(&class);
+            let body = warp::reply::json(&ErrorResponse {
+                error: result
+                    .error
+                    .unwrap_or_else(|| "task execution failed".into()),
+            });
+            Ok(warp::reply::with_status(
+                body,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
         Err(err) => {
-            let class = request
-                .class
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            let label = enrich_error_label(&request.payload, &class);
-            metrics.increment_error(&label);
+            metrics.increment_error(&class);
             let body = warp::reply::json(&ErrorResponse {
                 error: err.to_string(),
             });
@@ -394,88 +363,5 @@ async fn handle_task_request(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
-    }
-}
-
-fn extract_inputs(payload: &Value) -> Result<Vec<String>, String> {
-    let inputs = payload
-        .get("inputs")
-        .ok_or_else(|| "payload missing 'inputs'".to_string())?
-        .as_array()
-        .ok_or_else(|| "payload 'inputs' must be an array".to_string())?;
-
-    let mut out = Vec::with_capacity(inputs.len());
-    for item in inputs {
-        match item.as_str() {
-            Some(s) if !s.trim().is_empty() => out.push(s.to_string()),
-            _ => return Err("payload 'inputs' must be non-empty strings".to_string()),
-        }
-    }
-
-    if out.is_empty() {
-        return Err("payload 'inputs' cannot be empty".to_string());
-    }
-
-    Ok(out)
-}
-
-fn build_workflow_metadata(
-    payload: &Value,
-    latency_ms: f64,
-    embedding_count: usize,
-    hardware: Option<HardwareSnapshot>,
-) -> Option<Value> {
-    let ctx = payload.get("workflow_context")?.clone();
-    let mut meta = serde_json::Map::new();
-    meta.insert("workflow_context".to_string(), ctx);
-    if let Some(inputs) = payload.get("inputs").and_then(|v| v.as_array()) {
-        meta.insert("input_count".to_string(), Value::from(inputs.len()));
-    }
-    meta.insert("embedding_count".to_string(), Value::from(embedding_count));
-    meta.insert("latency_ms".to_string(), Value::from(latency_ms));
-    if let Some(hw) = hardware {
-        if let Ok(value) = serde_json::to_value(hw) {
-            meta.insert("hardware".to_string(), value);
-        }
-    }
-    Some(Value::Object(meta))
-}
-
-fn enrich_error_label(payload: &Value, base: &str) -> String {
-    if let Some(ctx) = payload.get("workflow_context") {
-        if let Some(id) = ctx.get("id").and_then(Value::as_str) {
-            if !id.is_empty() {
-                return format!("{}::{}", base, id);
-            }
-        }
-    }
-    base.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn metadata_includes_workflow_context() {
-        let payload = json!({
-            "inputs": ["a"],
-            "workflow_context": {"id": "wf-123", "name": "demo"}
-        });
-        let hw = HardwareSnapshot::default();
-        let meta = build_workflow_metadata(&payload, 42.0, 1, Some(hw)).expect("metadata");
-        assert_eq!(meta["workflow_context"]["id"], "wf-123");
-        assert_eq!(meta["embedding_count"], 1);
-        assert!(meta.get("hardware").is_some());
-    }
-
-    #[test]
-    fn error_label_appends_workflow_id() {
-        let payload = json!({
-            "workflow_context": {"id": "wf-xyz"}
-        });
-        let label = enrich_error_label(&payload, "training");
-        assert_eq!(label, "training::wf-xyz");
     }
 }

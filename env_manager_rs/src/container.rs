@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
-use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, StartContainerOptions, StopContainerOptions,
-    RemoveContainerOptions, ListContainersOptions, Stats, StatsOptions,
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    StartContainerOptions, Stats, StatsOptions, StopContainerOptions,
 };
 use bollard::models::{ContainerStateStatusEnum, HostConfig, PortBinding};
+use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::default::Default;
-use tracing::{info, error};
+use tracing::{error, info};
 
 pub struct ContainerManager {
-    docker: Docker,
+    pub docker: Docker,
 }
 
 impl ContainerManager {
@@ -33,14 +33,17 @@ impl ContainerManager {
 
         // Check if container already exists
         if let Ok(Some(container_id)) = self.get_container_id(name).await {
-            info!("Container {} already exists with ID: {}", name, container_id);
-            
+            info!(
+                "Container {} already exists with ID: {}",
+                name, container_id
+            );
+
             // Check if it's running
             if self.is_running(&container_id).await? {
                 info!("Container {} is already running", name);
                 return Ok(container_id);
             }
-            
+
             // Start existing container
             info!("Starting existing container {}", name);
             self.start(&container_id).await?;
@@ -52,11 +55,9 @@ impl ContainerManager {
 
         // Create container configuration
         // Convert ports HashMap to the correct type expected by Bollard
-        let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = ports
-            .into_iter()
-            .map(|(k, v)| (k, Some(v)))
-            .collect();
-        
+        let port_bindings: HashMap<String, Option<Vec<PortBinding>>> =
+            ports.into_iter().map(|(k, v)| (k, Some(v))).collect();
+
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
             binds: Some(volumes),
@@ -72,8 +73,12 @@ impl ContainerManager {
         };
 
         // Create container
-        let create_options = CreateContainerOptions { name, ..Default::default() };
-        let container = self.docker
+        let create_options = CreateContainerOptions {
+            name,
+            ..Default::default()
+        };
+        let container = self
+            .docker
             .create_container(Some(create_options), config)
             .await
             .with_context(|| format!("Failed to create container {}", name))?;
@@ -131,7 +136,8 @@ impl ContainerManager {
 
     /// Check if a container is running
     pub async fn is_running(&self, container_id: &str) -> Result<bool> {
-        let inspect = self.docker
+        let inspect = self
+            .docker
             .inspect_container(container_id, None)
             .await
             .with_context(|| format!("Failed to inspect container {}", container_id))?;
@@ -168,21 +174,25 @@ impl ContainerManager {
         };
 
         let mut stats_stream = self.docker.stats(container_id, Some(options));
-        
+
         if let Some(stats_result) = stats_stream.next().await {
-            return stats_result.with_context(|| format!("Failed to get stats for {}", container_id));
+            return stats_result
+                .with_context(|| format!("Failed to get stats for {}", container_id));
         }
 
-        Err(anyhow::anyhow!("No stats available for container {}", container_id))
+        Err(anyhow::anyhow!(
+            "No stats available for container {}",
+            container_id
+        ))
     }
 
     /// Ensure image is pulled
     async fn ensure_image(&self, image: &str) -> Result<()> {
         use bollard::image::ListImagesOptions;
-        
+
         let mut filters = HashMap::new();
         filters.insert("reference".to_string(), vec![image.to_string()]);
-        
+
         let options = ListImagesOptions {
             filters,
             ..Default::default()
@@ -229,4 +239,3 @@ impl ContainerManager {
         Ok(())
     }
 }
-

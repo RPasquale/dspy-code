@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod executor;
 pub mod hardware;
 pub mod infermesh;
 pub mod metrics;

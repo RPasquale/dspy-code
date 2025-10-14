@@ -1,0 +1,53 @@
+[Unit]
+Description=DSPy Orchestrator (Go)
+Documentation=https://github.com/dspy/orchestrator
+After=env-manager.service docker.service kafka.service redis.service
+Requires=env-manager.service
+PartOf=dspy-agent.target
+
+[Service]
+Type=simple
+User=dspy
+Group=dspy
+WorkingDirectory=/opt/dspy-agent
+
+# Environment configuration
+Environment="ORCHESTRATOR_GRPC_ADDR=:50052"
+Environment="ENV_MANAGER_ADDR=localhost:50100"
+Environment="WORKFLOW_STORE_DIR=/opt/dspy-agent/data/workflows"
+Environment="WORKFLOW_RUN_DIR=/opt/dspy-agent/data/workflow_runs"
+Environment="ENV_QUEUE_DIR=/opt/dspy-agent/logs/env_queue"
+Environment="ENV_RUNNER_URL=http://localhost:8081"
+
+# Security hardening
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/dspy-agent/data /opt/dspy-agent/logs /var/log/dspy-agent
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=8192
+MemoryLimit=1G
+CPUQuota=400%
+
+# Service execution
+ExecStart=/opt/dspy-agent/bin/orchestrator-linux
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+
+# Health check
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do curl -sf http://localhost:9097/queue/status && exit 0 || sleep 1; done; exit 1'
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orchestrator
+
+[Install]
+WantedBy=dspy-agent.target
+

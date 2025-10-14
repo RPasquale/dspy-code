@@ -29,6 +29,9 @@ service EnvManagerService {
   
   // Pull container images
   rpc PullImages(PullImagesRequest) returns (stream ImagePullProgress);
+  
+  // Stream logs from a service
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogEntry);
 }
 
 // Service startup
@@ -156,5 +159,21 @@ message ImagePullProgress {
   int64 current = 3;
   int64 total = 4;
   int32 progress_percent = 5;
+}
+
+// Log streaming
+message StreamLogsRequest {
+  string service_name = 1; // required
+  bool follow = 2; // continue streaming new logs
+  int32 tail = 3; // number of lines from end (0 = all)
+  int64 since_timestamp = 4; // Unix timestamp to start from
+}
+
+message LogEntry {
+  string service_name = 1;
+  string container_id = 2;
+  string stream = 3; // stdout or stderr
+  string message = 4;
+  int64 timestamp = 5;
 }
 

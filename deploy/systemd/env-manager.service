@@ -1,0 +1,54 @@
+[Unit]
+Description=DSPy Environment Manager (Rust)
+Documentation=https://github.com/dspy/orchestrator
+After=docker.service
+Requires=docker.service
+PartOf=dspy-agent.target
+
+[Service]
+Type=simple
+User=dspy
+Group=dspy
+WorkingDirectory=/opt/dspy-agent
+
+# Environment configuration
+Environment="ENV_MANAGER_GRPC_ADDR=0.0.0.0:50100"
+Environment="ENV_MANAGER_METRICS_ADDR=0.0.0.0:50101"
+Environment="DOCKER_HOST=unix:///var/run/docker.sock"
+Environment="ENV_MANAGER_VERBOSE=false"
+Environment="ENV_MANAGER_HEALTH_TIMEOUT=60"
+Environment="ENV_MANAGER_MAX_CONCURRENT=5"
+Environment="RUST_LOG=info"
+
+# Security hardening
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/dspy-agent/logs /var/log/dspy-agent
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryLimit=512M
+CPUQuota=200%
+
+# Service execution
+ExecStart=/opt/dspy-agent/bin/env-manager
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+
+# Health check
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do curl -sf http://localhost:50101/health && exit 0 || sleep 1; done; exit 1'
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=env-manager
+
+[Install]
+WantedBy=dspy-agent.target
+
