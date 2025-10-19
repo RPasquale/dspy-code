@@ -6,11 +6,11 @@ plugins:
   - plugin: buf.build/protocolbuffers/go
     out: orchestrator/internal/pb
     opt:
-      - paths=source_relative
+      - paths=import
   - plugin: buf.build/grpc/go
     out: orchestrator/internal/pb
     opt:
-      - paths=source_relative
+      - paths=import
   # Python plugins
   - plugin: buf.build/protocolbuffers/python
     out: dspy_agent/infra/pb

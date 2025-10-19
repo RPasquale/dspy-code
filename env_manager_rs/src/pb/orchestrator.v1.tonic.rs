@@ -141,6 +141,36 @@ pub mod orchestrator_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn get_task_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetTaskStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetTaskStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/orchestrator.v1.OrchestratorService/GetTaskStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "orchestrator.v1.OrchestratorService",
+                        "GetTaskStatus",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn create_workflow(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateWorkflowRequest>,
@@ -339,6 +369,13 @@ pub mod orchestrator_service_server {
             request: tonic::Request<super::StreamTaskResultsRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::StreamTaskResultsStream>,
+            tonic::Status,
+        >;
+        async fn get_task_status(
+            &self,
+            request: tonic::Request<super::GetTaskStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetTaskStatusResponse>,
             tonic::Status,
         >;
         async fn create_workflow(
@@ -559,6 +596,52 @@ pub mod orchestrator_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/orchestrator.v1.OrchestratorService/GetTaskStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetTaskStatusSvc<T: OrchestratorService>(pub Arc<T>);
+                    impl<
+                        T: OrchestratorService,
+                    > tonic::server::UnaryService<super::GetTaskStatusRequest>
+                    for GetTaskStatusSvc<T> {
+                        type Response = super::GetTaskStatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetTaskStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as OrchestratorService>::get_task_status(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetTaskStatusSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

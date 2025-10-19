@@ -172,6 +172,7 @@ scripts/publish_package.sh
 # Generated files during development
 transformer.py
 .docker/
+.wsl-docker-home/
 
 # Spark metadata and auxiliary files
 **/_spark_metadata/

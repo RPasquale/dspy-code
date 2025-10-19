@@ -53,6 +53,24 @@ pub struct TaskResult {
     #[prost(int64, tag="6")]
     pub completed_at: i64,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetTaskStatusRequest {
+    #[prost(string, tag="1")]
+    pub task_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetTaskStatusResponse {
+    #[prost(string, tag="1")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(map="string, string", tag="3")]
+    pub result: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(string, tag="4")]
+    pub error: ::prost::alloc::string::String,
+}
 /// Workflow management
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

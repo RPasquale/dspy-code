@@ -1,0 +1,67 @@
+services:
+  dspy-agent:
+    ports:
+      - "8765"
+  ollama:
+    ports:
+      - "11434"
+  zookeeper:
+    ports:
+      - "2181"
+  kafka:
+    ports:
+      - "29092"
+  mesh-hub:
+    ports:
+      - "50051"
+      - "9100"
+  mesh-worker:
+    ports:
+      - "50052"
+      - "9101"
+  mesh-trainer:
+    ports:
+      - "50053"
+      - "9102"
+  mesh-gateway:
+    ports:
+      - "50060"
+      - "9103"
+  prometheus:
+    ports:
+      - "9090"
+  redis:
+    ports:
+      - "6379"
+  reddb:
+    ports:
+      - "8080"
+  fastapi-backend:
+    ports:
+      - "8767"
+  dspy-embedder:
+    ports:
+      - "8080"
+  infermesh-router:
+    ports:
+      - "9000"
+  dashboard:
+    ports:
+      - "8081"
+  embed-worker:
+    ports:
+      - "9100"
+  spark-vectorizer:
+    ports:
+      - "4040"
+  go-orchestrator:
+    ports:
+      - "9097"
+      - "50052"
+  stream-supervisor:
+    ports:
+      - "7000"
+      - "9098"
+  rust-env-runner:
+    ports:
+      - "8083"

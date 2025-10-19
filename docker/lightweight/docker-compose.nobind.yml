@@ -60,7 +60,7 @@ services:
         - dspy-cache:/home/agent/.dspy_cache:rw
         - ./mesh-services.json:/etc/dspy/mesh-services.json:ro
       ports:
-        - "127.0.0.1:${DSPY_AGENT_HOST_PORT:-8765}:8765"
+        - "127.0.0.1::8765"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
@@ -96,7 +96,7 @@ services:
       image: ollama/ollama:latest
       entrypoint: ["/bin/sh", "/entrypoints/run_ollama.sh"]
       ports:
-        - "127.0.0.1:${OLLAMA_HOST_PORT:-11435}:11434"
+        - "127.0.0.1::11434"
       volumes:
         - ollama:/root/.ollama
         - ./entrypoints:/entrypoints:ro
@@ -134,7 +134,7 @@ services:
         - ZOOKEEPER_SYNC_LIMIT=2
         - ZOOKEEPER_4LW_COMMANDS_WHITELIST=srvr,ruok
       ports:
-        - "127.0.0.1:${ZOOKEEPER_HOST_PORT:-2181}:2181"
+        - "127.0.0.1::2181"
       healthcheck:
         test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep Mode"]
         interval: 10s
@@ -168,7 +168,7 @@ services:
         - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
         - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
       ports:
-        - "127.0.0.1:${KAFKA_HOST_PORT:-9092}:29092"
+        - "127.0.0.1::29092"
       healthcheck:
         test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
         interval: 15s
@@ -198,8 +198,8 @@ services:
         - MESH_PEERS=
         - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS:-}
       ports:
-        - "127.0.0.1:${MESH_HUB_GRPC_HOST_PORT:-50051}:50051"
-        - "127.0.0.1:${MESH_HUB_METRICS_HOST_PORT:-9100}:9100"
+        - "127.0.0.1::50051"
+        - "127.0.0.1::9100"
       healthcheck:
         test: ["CMD-SHELL", "nc -z localhost 50051"]
         interval: 10s
@@ -229,8 +229,8 @@ services:
         - MESH_PEERS=mesh-hub:7000
         - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS:-}
       ports:
-        - "127.0.0.1:${MESH_WORKER_GRPC_HOST_PORT:-50052}:50052"
-        - "127.0.0.1:${MESH_WORKER_METRICS_HOST_PORT:-9101}:9101"
+        - "127.0.0.1::50052"
+        - "127.0.0.1::9101"
       depends_on:
         mesh-hub:
           condition: service_healthy
@@ -263,8 +263,8 @@ services:
         - MESH_PEERS=mesh-hub:7000
         - MESH_EXTRA_ARGS=${MESH_EXTRA_ARGS:-}
       ports:
-        - "127.0.0.1:${MESH_TRAINER_GRPC_HOST_PORT:-50053}:50053"
-        - "127.0.0.1:${MESH_TRAINER_METRICS_HOST_PORT:-9102}:9102"
+        - "127.0.0.1::50053"
+        - "127.0.0.1::9102"
       depends_on:
         mesh-hub:
           condition: service_healthy
@@ -300,8 +300,8 @@ services:
         mesh-hub:
           condition: service_healthy
       ports:
-        - "127.0.0.1:${MESH_GATEWAY_GRPC_HOST_PORT:-50060}:50060"
-        - "127.0.0.1:${MESH_GATEWAY_METRICS_HOST_PORT:-9103}:9103"
+        - "127.0.0.1::50060"
+        - "127.0.0.1::9103"
       healthcheck:
         test: ["CMD-SHELL", "nc -z localhost 50060"]
         interval: 10s
@@ -322,7 +322,7 @@ services:
       volumes:
         - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       ports:
-        - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+        - "127.0.0.1::9090"
       depends_on:
         mesh-hub:
           condition: service_healthy
@@ -337,7 +337,7 @@ services:
       image: redis:7-alpine
       command: ["redis-server","--save","","--appendonly","no"]
       ports:
-        - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+        - "127.0.0.1::6379"
       volumes:
         - redis-data:/data
       healthcheck:
@@ -364,7 +364,7 @@ services:
       restart: unless-stopped
       user: root
       ports:
-        - "127.0.0.1:${REDDB_HOST_PORT:-8082}:8080"
+        - "127.0.0.1::8080"
       environment:
         - REDDB_ADMIN_TOKEN=${REDDB_ADMIN_TOKEN}
         - REDDB_DATA_DIR=/data
@@ -409,7 +409,7 @@ services:
         - ./entrypoints:/entrypoints:ro
         - ./logs:/app/logs:rw
       ports:
-        - "127.0.0.1:${FASTAPI_HOST_PORT:-8767}:8767"
+        - "127.0.0.1::8767"
       depends_on:
         reddb:
           condition: service_healthy
@@ -444,7 +444,7 @@ services:
       volumes:
         - ${WORKSPACE_DIR}:/workspace
       ports:
-        - "127.0.0.1:${DSPY_EMBEDDER_HOST_PORT:-18082}:8080"
+        - "127.0.0.1::8080"
       restart: unless-stopped
       healthcheck:
         test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
@@ -522,7 +522,7 @@ services:
         - ${WORKSPACE_DIR}:/workspace:rw
         - ./entrypoints:/entrypoints:ro
       ports:
-        - "127.0.0.1:${DASHBOARD_HOST_PORT:-18081}:8081"
+        - "127.0.0.1::8081"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
@@ -571,7 +571,7 @@ services:
         - hf-cache:/root/.cache/huggingface
       entrypoint: ["/bin/sh", "-lc", "sh /entrypoints/run_embed_worker.sh"]
       ports:
-        - "127.0.0.1:${EMBED_WORKER_METRICS_HOST_PORT:-19101}:9100"
+        - "127.0.0.1::9100"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
@@ -878,7 +878,7 @@ services:
         - ./entrypoints:/entrypoints:ro
       entrypoint: ["/bin/bash", "-lc", "source /entrypoints/run_spark_vectorizer.sh"]
       ports:
-        - "127.0.0.1:${SPARK_VECTORIZER_HOST_PORT:-4041}:4040"
+        - "127.0.0.1::4040"
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true
@@ -995,8 +995,8 @@ services:
         - ENV_QUEUE_DIR=/app/logs/env_queue
       entrypoint: ["/usr/local/bin/orchestrator"]
       ports:
-        - "127.0.0.1:${GO_ORCHESTRATOR_HTTP_PORT:-9097}:9097"
-        - "127.0.0.1:${GO_ORCHESTRATOR_GRPC_HOST_PORT:-50062}:50052"
+        - "127.0.0.1::9097"
+        - "127.0.0.1::50052"
       volumes:
         - ./logs:/app/logs
       depends_on:
@@ -1032,8 +1032,8 @@ services:
         - SUPERVISOR_METRICS_LISTEN=:9098
       entrypoint: ["/usr/local/bin/stream_supervisor"]
       ports:
-        - "127.0.0.1:${STREAM_SUPERVISOR_GRPC_HOST_PORT:-7000}:7000"
-        - "127.0.0.1:${STREAM_SUPERVISOR_METRICS_HOST_PORT:-9098}:9098"
+        - "127.0.0.1::7000"
+        - "127.0.0.1::9098"
       volumes:
         - ./logs:/app/logs
       depends_on:
@@ -1080,7 +1080,7 @@ services:
         - SUPERVISOR_GRPC_ADDR=http://stream-supervisor:7000
       entrypoint: ["/usr/local/bin/env_runner"]
       ports:
-        - "127.0.0.1:${ENV_RUNNER_METRICS_HOST_PORT:-8081}:8083"
+        - "127.0.0.1::8083"
       volumes:
         - ./logs:/app/logs
         - ./mesh-services.json:/etc/dspy/mesh-services.json:ro
