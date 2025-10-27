@@ -61,7 +61,7 @@ jobs:
           TAG="${{ github.ref_name }}"
           sed "s|ghcr.io/OWNER/dspy-lightweight:latest|ghcr.io/${OWNER}/dspy-lightweight:${TAG}|g" deploy/k8s/agent-deployment.yaml > deploy/k8s/rendered/agent-deployment.yaml
       - name: Upload rendered manifests
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: k8s-manifests
           path: deploy/k8s/rendered
